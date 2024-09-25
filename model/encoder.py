@@ -10,7 +10,8 @@ class Encoder():
                  input_shape,
                  conv_filters,
                  conv_kernels,
-                 conv_strides):
+                 conv_strides,
+                 latent_space_dim):
         
         self.input_shape = input_shape
         self.conv_filters = conv_filters
@@ -18,6 +19,8 @@ class Encoder():
         self.conv_strides = conv_strides
         
         self.num_conv_layers = len(conv_filters)
+        self.latent_space_dim = latent_space_dim
+        self._shape_before_bottleneck = None
 
         self.build_encoder()
 
@@ -28,7 +31,9 @@ class Encoder():
     def build_encoder(self):
         encoder_input = self.set_encoder_input(self.input_shape)
         conv_layers = self.set_conv_layers(self.num_conv_layers, encoder_input)
-        self.encoder = Model(encoder_input, conv_layers, name = "encoder")
+        bottleneck = self.set_bottleneck(conv_layers)
+        # self._model_input = encoder_input
+        self.encoder = Model(encoder_input, bottleneck, name = "encoder")
 
 
     def set_encoder_input(self, shape):
@@ -57,11 +62,20 @@ class Encoder():
 
         return x
     
+    def set_bottleneck(self, x):
+        "Output of the encoder. Flattens the data and add bottleneck (Dense layer)."
+        self._shape_before_bottleneck = K.int_shape(x)[1:]
+        x = Flatten()(x)
+        x = Dense(self.latent_space_dim, name="encoder_output")(x)
+
+        return x
+    
 if __name__ == "__main__":
     autoencoder = Encoder(
         input_shape=(28, 28, 1),
         conv_filters=(32, 64, 64, 64),
         conv_kernels=(3, 3, 3, 3),
-        conv_strides=(1, 2, 2, 1)
+        conv_strides=(1, 2, 2, 1),
+        latent_space_dim=2
     )
     autoencoder.summary()
