@@ -1,6 +1,6 @@
 from tensorflow.keras import Model
 from tensorflow.keras.layers import Input, Conv2D, ReLU, BatchNormalization, \
-    Flatten, Dense, Lambda, Conv2DTranspose
+    Flatten, Dense, Conv2DTranspose, Reshape
 from tensorflow.keras import backend as K
 import numpy as np
 
@@ -119,27 +119,34 @@ class Encoder():
         
         return dense_layer
 
+    def add_reshape_layer(self, x):
+        reshape_layer = Reshape(self.shape_before_bottleneck)(x)
+        
+        return reshape_layer
 
-    def set_dense_layers(self, x):
-        for index in range(self.num_conv_layers):
-           x = self.add_dense_layer(index, x)
+
+    def add_conv_transpose_layers(self, x):
+        "Conv blocks"
+        for index in reversed(range(self.num_conv_layers)):
+            x = self.add_conv_transpose_layer(index, x)
         
         return x
-
     
-    def add_dense_layer(self, index, x):
 
+    def add_conv_transpose_layer(self, index, x):
+        layer_num = self.num_conv_layers - index
         conv_layer = Conv2DTranspose(
             filters = self.conv_filters[index],
             kernel_size = self.conv_kernels[index],
             strides = self.conv_strides[index],
             padding = "same",
-            name = f"conv_layer_{index}"
+            name = f"decoder_conv_transpose_layer_{layer_num}"
         )
         x = conv_layer(x)
-        x = ReLU(name = f"decoder_relu_{index}")(x)
-        x = BatchNormalization(name=f"decoder_bn_f{index}")(x)
+        x = ReLU(name = f"decoder_relu_{layer_num}")(x)
+        x = BatchNormalization(name=f"decoder_bn_f{layer_num}")(x)
 
+        return x
 
         
 
