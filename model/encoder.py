@@ -24,30 +24,52 @@ class Encoder():
 
         self.build_encoder()
 
+
     def summary(self):
+        """
+        Summary the model with keras method
+        """
         self.encoder.summary()
     
 
     def build_encoder(self):
+        """
+        Builds the encoder with the keras model.
+        Uses the arguments passed when instantiating the class to create the input
+        layer and the convolutional layers. The bottleneck will be the output.        
+        """
         encoder_input = self.set_encoder_input(self.input_shape)
         conv_layers = self.set_conv_layers(self.num_conv_layers, encoder_input)
         bottleneck = self.set_bottleneck(conv_layers)
-        # self._model_input = encoder_input
         self.encoder = Model(encoder_input, bottleneck, name = "encoder")
 
 
     def set_encoder_input(self, shape):
+        """
+        Sets the encoder input using the Input method by Keras.
+        """
         input = self.input = Input(shape, name="encoder_input")
         return input
 
 
     def set_conv_layers(self, num_layers, x):
+        """
+        Loops over the number of desired layers and adds convolutional blocks.
+        """
+
         for index in range(num_layers):
            x = self.add_conv_layer(index, x)
+        
         return x
 
 
     def add_conv_layer(self, index, x):
+        """
+        Adds a convolutional block to a graph of layers. It has 3 parts:
+        A convolutional kernel over a 2D spatial dimension (Conv 2D);
+        Rectified linear activation unit (ReLU);
+        Batch normalization.
+        """
 
         conv_layer = Conv2D(
             filters = self.conv_filters[index],
@@ -62,14 +84,19 @@ class Encoder():
 
         return x
     
+
     def set_bottleneck(self, x):
-        "Output of the encoder. Flattens the data and add bottleneck (Dense layer)."
+        """
+        Output of the encoder. Flattens the data and add bottleneck (Dense layer).
+        """
+
         self._shape_before_bottleneck = K.int_shape(x)[1:]
         x = Flatten()(x)
         x = Dense(self.latent_space_dim, name="encoder_output")(x)
 
         return x
-    
+
+
 if __name__ == "__main__":
     autoencoder = Encoder(
         input_shape=(28, 28, 1),
