@@ -1,8 +1,8 @@
 from tensorflow.keras import Model
 from tensorflow.keras.layers import Input, Conv2D, ReLU, BatchNormalization, \
-    Flatten, Dense, Lambda
+    Flatten, Dense, Lambda, Conv2DTranspose
 from tensorflow.keras import backend as K
-
+import numpy as np
 
 class Encoder():
 
@@ -20,7 +20,7 @@ class Encoder():
         
         self.num_conv_layers = len(conv_filters)
         self.latent_space_dim = latent_space_dim
-        self._shape_before_bottleneck = None
+        self.shape_before_bottleneck = None
 
         self.build_encoder()
 
@@ -90,11 +90,58 @@ class Encoder():
         Output of the encoder. Flattens the data and add bottleneck (Dense layer).
         """
 
-        self._shape_before_bottleneck = K.int_shape(x)[1:]
+        self.shape_before_bottleneck = K.int_shape(x)[1:]
         x = Flatten()(x)
         x = Dense(self.latent_space_dim, name="encoder_output")(x)
 
         return x
+
+
+    def build_decoder(self, x):
+
+        decoder_input = self.set_decoder_input()
+        dense_layer = self.add_dense_layer(decoder_input)
+        reshaped_layer = self.add_reshape_layer(dense_layer)
+        conv_transpose_layers = self.add_conv_transpose_layers(reshaped_layer)
+        decoder_output = self.add_output_layer(conv_transpose_layers)
+        self.decoder = Model(decoder_input, decoder_output, name = "decoder")
+
+
+    def add_decoder_input(self):
+        input_layer = Input(shape = self.latent_space_dim, name = "decoder_input")
+        return input_layer
+    
+
+    def add_dense_layer(self, x):
+        
+        num_neurons = np.prod(self.shape_before_bottleneck) # [x, y, z] -> x*y*z
+        dense_layer = Dense(num_neurons, name="decoder_dense")(x)
+        
+        return dense_layer
+
+
+    def set_dense_layers(self, x):
+        for index in range(self.num_conv_layers):
+           x = self.add_dense_layer(index, x)
+        
+        return x
+
+    
+    def add_dense_layer(self, index, x):
+
+        conv_layer = Conv2DTranspose(
+            filters = self.conv_filters[index],
+            kernel_size = self.conv_kernels[index],
+            strides = self.conv_strides[index],
+            padding = "same",
+            name = f"conv_layer_{index}"
+        )
+        x = conv_layer(x)
+        x = ReLU(name = f"decoder_relu_{index}")(x)
+        x = BatchNormalization(name=f"decoder_bn_f{index}")(x)
+
+
+        
 
 
 if __name__ == "__main__":
