@@ -58,9 +58,21 @@ class Autoencoder():
         self.model.summary()
 
 
-    def compile(self, learning_rate=0.0001, optimizer=Adam(), loss=MeanSquaredError()):
-        optimizer = optimizer(learning_rate=learning_rate)
-        loss = loss()
+    def compile(self, learning_rate=0.0001, optimizer=None, loss=None):
+        """
+        Compiles the autoencoder model by setting the optimizer and loss function.
+        
+        Args:
+        - learning_rate: Learning rate for the optimizer.
+        - optimizer: Optimizer to use (default is Adam).
+        - loss: Loss function to use (default is MeanSquaredError).
+        """
+        if optimizer is None:
+            optimizer = Adam(learning_rate=learning_rate)
+        
+        if loss is None:
+            loss = MeanSquaredError()
+        
         self.model.compile(optimizer=optimizer, loss=loss)
 
 
@@ -72,7 +84,7 @@ class Autoencoder():
                        shuffle=True)
 
 
-    """--------ENCODER--------E"""
+    """--------ENCODER--------"""
 
     def build_encoder(self):
         """
