@@ -88,9 +88,14 @@ class Autoencoder():
 
 
     def save(self, folder="model"):
-        self.__create_folder(folder)
-        self.__save_parameters(folder)
-        self.__save_weights(folder)
+        try:
+            self.__create_folder(folder)
+            self.__save_parameters(folder)
+            self.__save_weights(folder)
+            print(f"Model saved successfully in folder: {folder}")
+        except Exception as e:
+            print(f"Error occurred while saving the model: {e}")
+
 
 
     def __create_folder(self, folder="model"):
@@ -113,9 +118,27 @@ class Autoencoder():
 
 
     def __save_weights(self, save_folder):
-        save_path = os.path.join(save_folder, "weights.h5")
+        save_path = os.path.join(save_folder, ".weights.h5")
+        print(f"Saving weights to {save_path}")  # Add this for debugging
         self.model.save_weights(save_path)
 
+
+    @classmethod
+    def load(cls, save_folder="."):
+        parameters_path = os.path.join(save_folder, "parameters.pkl")
+
+        with open(parameters_path, "rb") as f:
+            parameters = pickle.load(f)
+        print(save_folder) 
+        autoencoder = Autoencoder(*parameters)
+        weights_path = os.path.join(save_folder, ".weights.h5")
+        autoencoder.load_weights(weights_path) 
+        
+        return autoencoder
+    
+
+    def load_weights(self, weights_path):
+        self.model.load_weights(weights_path)
 
 
     """--------ENCODER--------"""
