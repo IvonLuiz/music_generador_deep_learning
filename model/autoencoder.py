@@ -2,9 +2,16 @@ from tensorflow.keras import Model
 from tensorflow.keras.layers import Input, Conv2D, ReLU, BatchNormalization, \
     Flatten, Dense, Conv2DTranspose, Reshape, Activation
 from tensorflow.keras import backend as K
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import MeanSquaredError
+
 import numpy as np
 
 class Autoencoder():
+    """
+    Autoencoder represents a Deep Convolutional autoencoder architecture with
+    mirrored encoder and decoder components.
+    """
 
     def __init__(self, 
                  input_shape,
@@ -31,12 +38,15 @@ class Autoencoder():
         self.num_conv_layers = len(conv_filters)
         self.latent_space_dim = latent_space_dim
         self.shape_before_bottleneck = None
-
+        self.model_input = None
+        
         self.encoder = None
         self.decoder = None
+        self.model = None
 
         self.build_encoder()
         self.build_decoder()
+        self.build_autoencoder()
 
 
     def summary(self):
@@ -45,9 +55,36 @@ class Autoencoder():
         """
         self.encoder.summary()
         self.decoder.summary()
+        self.model.summary()
 
 
-    """--------ENCODER--------E"""
+    def compile(self, learning_rate=0.0001, optimizer=None, loss=None):
+        """
+        Compiles the autoencoder model by setting the optimizer and loss function.
+        
+        Args:
+        - learning_rate: Learning rate for the optimizer.
+        - optimizer: Optimizer to use (default is Adam).
+        - loss: Loss function to use (default is MeanSquaredError).
+        """
+        if optimizer is None:
+            optimizer = Adam(learning_rate=learning_rate)
+        
+        if loss is None:
+            loss = MeanSquaredError()
+        
+        self.model.compile(optimizer=optimizer, loss=loss)
+
+
+    def train(self, x_train, batch_size, num_epochs):
+
+        self.model.fit(x=x_train, y=x_train,
+                       batch_size=batch_size, 
+                       epochs=num_epochs,
+                       shuffle=True)
+
+
+    """--------ENCODER--------"""
 
     def build_encoder(self):
         """
@@ -58,6 +95,8 @@ class Autoencoder():
         encoder_input = self.set_encoder_input(self.input_shape)
         conv_layers = self.set_conv_layers(self.num_conv_layers, encoder_input)
         bottleneck = self.set_bottleneck(conv_layers)
+
+        self.model_input = encoder_input
         self.encoder = Model(encoder_input, bottleneck, name = "encoder")
 
 
@@ -202,6 +241,13 @@ class Autoencoder():
         x = Activation("sigmoid", name="sigmoid_output")(x)
 
         return x
+
+
+    def build_autoencoder(self):
+        input = self.model_input
+        encoder = self.encoder(input)
+        decoder_output = self.decoder(encoder)
+        self.model = Model(input, decoder_output, name = "autoencoder")
 
 
 if __name__ == "__main__":
