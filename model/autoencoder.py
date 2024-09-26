@@ -6,6 +6,9 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import MeanSquaredError
 
 import numpy as np
+import os
+import pickle
+
 
 class Autoencoder():
     """
@@ -82,6 +85,37 @@ class Autoencoder():
                        batch_size=batch_size, 
                        epochs=num_epochs,
                        shuffle=True)
+
+
+    def save(self, folder="model"):
+        self.__create_folder(folder)
+        self.__save_parameters(folder)
+        self.__save_weights(folder)
+
+
+    def __create_folder(self, folder="model"):
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+
+
+    def __save_parameters(self, save_folder):
+        parameters = [
+            self.input_shape,
+            self.conv_filters,
+            self.conv_kernels,
+            self.conv_strides,
+            self.latent_space_dim
+        ]
+        save_path = os.path.join(save_folder, "parameters.pkl")
+
+        with open(save_path, "wb") as f:
+            pickle.dump(parameters, f)
+
+
+    def __save_weights(self, save_folder):
+        save_path = os.path.join(save_folder, "weights.h5")
+        self.model.save_weights(save_path)
+
 
 
     """--------ENCODER--------"""
@@ -248,14 +282,3 @@ class Autoencoder():
         encoder = self.encoder(input)
         decoder_output = self.decoder(encoder)
         self.model = Model(input, decoder_output, name = "autoencoder")
-
-
-if __name__ == "__main__":
-    autoencoder = Autoencoder(
-        input_shape=(28, 28, 1),
-        conv_filters=(32, 64, 64, 64),
-        conv_kernels=(3, 3, 3, 3),
-        conv_strides=(1, 2, 2, 1),
-        latent_space_dim=2
-    )
-    autoencoder.summary()
