@@ -47,9 +47,9 @@ class Autoencoder():
         self.decoder = None
         self.model = None
 
-        self.build_encoder()
-        self.build_decoder()
-        self.build_autoencoder()
+        self.__build_encoder()
+        self.__build_decoder()
+        self.__build_autoencoder()
 
 
     def summary(self):
@@ -132,32 +132,32 @@ class Autoencoder():
         print(save_folder) 
         autoencoder = Autoencoder(*parameters)
         weights_path = os.path.join(save_folder, ".weights.h5")
-        autoencoder.load_weights(weights_path) 
+        autoencoder.__load_weights(weights_path) 
         
         return autoencoder
     
 
-    def load_weights(self, weights_path):
+    def __load_weights(self, weights_path):
         self.model.load_weights(weights_path)
 
 
     """--------ENCODER--------"""
 
-    def build_encoder(self):
+    def __build_encoder(self):
         """
         Builds the encoder model, which maps the input to the latent space.
         Uses the arguments passed when instantiating the class to create the input
         layer and the convolutional layers. The bottleneck will be the output.        
         """
-        encoder_input = self.set_encoder_input(self.input_shape)
-        conv_layers = self.set_conv_layers(self.num_conv_layers, encoder_input)
-        bottleneck = self.set_bottleneck(conv_layers)
+        encoder_input = self.__set_encoder_input(self.input_shape)
+        conv_layers = self.__set_conv_layers(self.num_conv_layers, encoder_input)
+        bottleneck = self.__set_bottleneck(conv_layers)
 
         self.model_input = encoder_input
         self.encoder = Model(encoder_input, bottleneck, name = "encoder")
 
 
-    def set_encoder_input(self, shape):
+    def __set_encoder_input(self, shape):
         """
         Defines the input layer for the encoder using the Input method by Keras.
         """
@@ -165,17 +165,17 @@ class Autoencoder():
         return input
 
 
-    def set_conv_layers(self, num_layers, x):
+    def __set_conv_layers(self, num_layers, x):
         """
         Loops over the number of desired layers and adds convolutional blocks.
         """
         for index in range(num_layers):
-           x = self.add_conv_layer(index, x)
+           x = self.__add_conv_layer(index, x)
         
         return x
 
 
-    def add_conv_layer(self, index, x):
+    def __add_conv_layer(self, index, x):
         """
         Adds a convolutional block to a graph of layers. It has 3 parts:
         A convolutional kernel over a 2D spatial dimension (Conv 2D);
@@ -196,7 +196,7 @@ class Autoencoder():
         return x
     
 
-    def set_bottleneck(self, x):
+    def __set_bottleneck(self, x):
         """
         Output of the encoder. Defines the bottleneck layer by flattening the data
         and adding a dense layer.
@@ -211,19 +211,19 @@ class Autoencoder():
 
     """--------DECODER--------"""
 
-    def build_decoder(self):
+    def __build_decoder(self):
         """
         Builds the decoder model, which reconstructs the input from the latent space.
         """
-        decoder_input = self.add_decoder_input()
-        dense_layer = self.add_dense_layer(decoder_input)
-        reshaped_layer = self.add_reshape_layer(dense_layer)
-        conv_transpose_layers = self.add_conv_transpose_layers(reshaped_layer)
-        decoder_output = self.add_decoder_output(conv_transpose_layers)
+        decoder_input = self.__add_decoder_input()
+        dense_layer = self.__add_dense_layer(decoder_input)
+        reshaped_layer = self.__add_reshape_layer(dense_layer)
+        conv_transpose_layers = self.__add_conv_transpose_layers(reshaped_layer)
+        decoder_output = self.__add_DECODER_output(conv_transpose_layers)
         self.decoder = Model(decoder_input, decoder_output, name = "decoder")
 
 
-    def add_decoder_input(self):
+    def __add_decoder_input(self):
         """
         Defines the input layer for the decoder, which is the latent space.
         """
@@ -232,7 +232,7 @@ class Autoencoder():
         return input_layer
     
 
-    def add_dense_layer(self, x):
+    def __add_dense_layer(self, x):
         """
         Adds a dense layer to connect the latent space to the reshaped featured maps.
         """
@@ -242,7 +242,7 @@ class Autoencoder():
         return dense_layer
 
 
-    def add_reshape_layer(self, x):
+    def __add_reshape_layer(self, x):
         """
         Reshapes the dense output into the original feature map shape before convolution.
         """
@@ -251,19 +251,19 @@ class Autoencoder():
         return reshape_layer
 
 
-    def add_conv_transpose_layers(self, x):
+    def __add_conv_transpose_layers(self, x):
         """
         Adds all transpose convolution layers (up-sampling) in reverse order.
         Excludes the first layer for experimental purposes.
         """
         # Not implemeting te first layer (test later)
         for index in reversed(range(1, self.num_conv_layers)):
-            x = self.add_conv_transpose_layer(index, x)
+            x = self.__add_conv_transpose_layer(index, x)
         
         return x
     
 
-    def add_conv_transpose_layer(self, index, x):
+    def __add_conv_transpose_layer(self, index, x):
         """
         Adds a single Conv2DTranspose block (Conv2DTranspose, ReLU, BatchNorm).
         """
@@ -283,7 +283,7 @@ class Autoencoder():
         return x
 
 
-    def add_decoder_output(self, x):
+    def __add_DECODER_output(self, x):
         """
         Adds the final output layer to the decoder with a sigmoid activation.
         """
@@ -300,7 +300,7 @@ class Autoencoder():
         return x
 
 
-    def build_autoencoder(self):
+    def __build_autoencoder(self):
         input = self.model_input
         encoder = self.encoder(input)
         decoder_output = self.decoder(encoder)
