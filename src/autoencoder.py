@@ -98,6 +98,46 @@ class Autoencoder():
 
 
 
+    @classmethod
+    def load(cls, save_folder="."):
+        try:
+            # Construct paths for the parameters and weights
+            parameters_path = os.path.join(save_folder, "parameters.pkl")
+            weights_path = os.path.join(save_folder, ".weights.h5")
+
+            if not os.path.exists(parameters_path):
+                raise FileNotFoundError(f"Parameters file not found at: {parameters_path}")
+            
+            with open(parameters_path, "rb") as f:
+                parameters = pickle.load(f)
+
+            autoencoder = Autoencoder(*parameters)
+
+            if not os.path.exists(weights_path):
+                raise FileNotFoundError(f"Weights file not found at: {weights_path}")
+
+            autoencoder.__load_weights(weights_path)
+
+            return autoencoder
+
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+        except (pickle.UnpicklingError, IOError) as e:
+            print(f"Error loading parameters or weights: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+
+        return None
+    
+
+    def reconstruct(self, input):
+        latent_representations = self.encoder.predict(input)
+        reconstructed = self.decoder.predict(latent_representations)
+        
+        return reconstructed, latent_representations
+
+    # Private methods
+
     def __create_folder(self, folder="model"):
         if not os.path.exists(folder):
             os.makedirs(folder)
@@ -119,27 +159,12 @@ class Autoencoder():
 
     def __save_weights(self, save_folder):
         save_path = os.path.join(save_folder, ".weights.h5")
-        print(f"Saving weights to {save_path}")  # Add this for debugging
         self.model.save_weights(save_path)
 
 
-    @classmethod
-    def load(cls, save_folder="."):
-        parameters_path = os.path.join(save_folder, "parameters.pkl")
-
-        with open(parameters_path, "rb") as f:
-            parameters = pickle.load(f)
-        print(save_folder) 
-        autoencoder = Autoencoder(*parameters)
-        weights_path = os.path.join(save_folder, ".weights.h5")
-        autoencoder.__load_weights(weights_path) 
-        
-        return autoencoder
-    
-
     def __load_weights(self, weights_path):
         self.model.load_weights(weights_path)
-
+    
 
     """--------ENCODER--------"""
 
