@@ -23,3 +23,23 @@ class Loader:
         return signal
 
 
+class Padder:
+    """
+    Padder is responsible to apply padding to an array.
+    """
+
+    def __init__(self, mode="constant"):
+        self.mode = mode
+
+    def left_pad(self, array, num_missing_items):
+        padded_array = np.pad(array,
+                              (num_missing_items, 0),
+                              mode=self.mode)
+        return padded_array
+
+    def right_pad(self, array, num_missing_items):
+        padded_array = np.pad(array,
+                              (0, num_missing_items),
+                              mode=self.mode)
+        return padded_array
+
