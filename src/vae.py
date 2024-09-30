@@ -13,7 +13,8 @@ from keras import layers
 import numpy as np
 import os
 import pickle
-# Definindo as operações como funções
+
+
 def square_fn(x):
     return tf.square(x)
 
@@ -21,10 +22,12 @@ def exp_fn(x):
     return tf.exp(x)
 
 def reduce_sum_fn(x):
-    return tf.reduce_sum(x, axis=-1)
-    # Função para calcular a perda KL
+    return tf.reduce_sum(x, axis=1)
+
 def kl_loss(mu, log_var):
     return -0.5 * reduce_sum_fn(1 + log_var - square_fn(mu) - exp_fn(log_var))
+
+
 class Sampling(layers.Layer):
     """Uses (z_mean, z_log_var) to sample z, the vector encoding a digit."""
 
@@ -43,17 +46,6 @@ class Sampling(layers.Layer):
         
         return z_mean + ops.exp(0.5 * z_log_var) * epsilon
 
-
-class KLLossLayer(Layer):
-    def __init__(self, **kwargs):
-        super(KLLossLayer, self).__init__(**kwargs)
-
-    def call(self, inputs):
-        mu, log_var = inputs
-        kl_loss_fn = lambda mu, log_var: -0.5 * tf.reduce_sum(1 + log_var - tf.square(mu) - tf.exp(log_var), axis=-1)
-        kl_loss = kl_loss_fn(mu, log_var)
-        # kl_loss = -0.5 * tf.reduce_sum(1 + log_var - tf.square(mu) - tf.exp(log_var), axis=-1)
-        return kl_loss
 class VAE():
     """
     VAE represents a Deep Convolutional variational autoencoder architecture
@@ -94,13 +86,7 @@ class VAE():
 
         self.__build_encoder()
         self.__build_decoder()
-        self.__build_autoencoder()
-        
-        # self.total_loss_tracker = keras.metrics.Mean(name="total_loss")
-        # self.reconstruction_loss_tracker = keras.metrics.Mean(
-        #     name="reconstruction_loss"
-        # )
-        # self.kl_loss_tracker = keras.metrics.Mean(name="kl_loss")
+        self.__build_variational_autoencoder()
 
 
     def summary(self):
@@ -161,14 +147,14 @@ class VAE():
             with open(parameters_path, "rb") as f:
                 parameters = pickle.load(f)
 
-            autoencoder = VAE(*parameters)
+            variational_autoencoder = VAE(*parameters)
 
             if not os.path.exists(weights_path):
                 raise FileNotFoundError(f"Weights file not found at: {weights_path}")
 
-            autoencoder.__load_weights(weights_path)
+            variational_autoencoder.__load_weights(weights_path)
 
-            return autoencoder
+            return variational_autoencoder
 
         except FileNotFoundError as e:
             print(f"Error: {e}")
@@ -189,15 +175,20 @@ class VAE():
 
     # Private methods
 
-    def __calculate_reconstruction_loss(self, y_true, y_pred):
-        reconstruc_loss = ops.mean(
-            ops.sum(
-                keras.losses.binary_crossentropy(y_true, y_pred),
-                axis=(1, 2),
-            )
-        )
+    ## Loss calculations
+    # def __calculate_reconstruction_loss(self, y_true, y_pred):
+    #     reconstruc_loss = ops.mean(
+    #         ops.sum(
+    #             keras.losses.binary_crossentropy(y_true, y_pred),
+    #             axis=(1, 2),
+    #         )
+    #     )
 
-        return reconstruc_loss
+    #     return reconstruc_loss
+    def __calculate_reconstruction_loss(self, y_true, y_pred):
+        error = y_true - y_pred
+        reconstruction_loss = ops.mean(ops.square(error), axis=[1, 2, 3])
+        return reconstruction_loss
 
 
     def __calculate_kl_loss(self, y_true, y_pred):
@@ -210,11 +201,11 @@ class VAE():
 
         reconstructed_loss = self.__calculate_reconstruction_loss(y_true, y_pred)
         kl_loss = self.__calculate_kl_loss(y_true, y_pred)
-        combined_loss = reconstructed_loss + kl_loss
+        combined_loss = self.w_rec_loss * reconstructed_loss + kl_loss
 
         return combined_loss
 
-
+    # Methods to save/load model
     def __create_folder(self, folder="model"):
         if not os.path.exists(folder):
             os.makedirs(folder)
@@ -407,9 +398,9 @@ class VAE():
 
         return x
 
-
-    def __build_autoencoder(self):
+    # Full model
+    def __build_variational_autoencoder(self):
         input = self.model_input
         encoder = self.encoder(input)
         decoder_output = self.decoder(encoder)
-        self.model = Model(input, decoder_output, name = "autoencoder")
+        self.model = Model(input, decoder_output, name = "variational_autoencoder")
