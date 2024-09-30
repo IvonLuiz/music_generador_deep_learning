@@ -80,4 +80,36 @@ class MinMaxNormalizer:
         array = array * (original_max - original_min) + original_min
         return array
 
+class Saver:
+    """saver is responsible to save features, and the min max values."""
+
+    def __init__(self, feature_save_dir, min_max_values_save_dir):
+        self.feature_save_dir = feature_save_dir
+        self.min_max_values_save_dir = min_max_values_save_dir
+        print(self.feature_save_dir)
+        Path(self.feature_save_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.min_max_values_save_dir).mkdir(parents=True, exist_ok=True)
+
+
+    def save_feature(self, feature, file_path):
+        save_path = self._generate_save_path(file_path)
+        np.save(save_path, feature)
+
+
+    def save_min_max_values(self, min_max_values):
+        save_path = os.path.join(self.min_max_values_save_dir,
+                                 "min_max_values.pkl")
+        self._save(min_max_values, save_path)
+
+
+    @staticmethod
+    def _save(data, save_path):
+        with open(save_path, "wb") as f:
+            pickle.dump(data, f)
+
+
+    def _generate_save_path(self, file_path):
+        file_name = os.path.split(file_path)[1]
+        save_path = os.path.join(self.feature_save_dir, file_name + ".npy")
+        return save_path
 
