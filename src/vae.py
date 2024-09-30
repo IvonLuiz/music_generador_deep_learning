@@ -3,13 +3,44 @@ from tensorflow.keras.layers import Input, Conv2D, ReLU, BatchNormalization, \
     Flatten, Dense, Conv2DTranspose, Reshape, Activation, Lambda
 from tensorflow.keras import backend as K
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.layers import Layer
+
 import tensorflow as tf
+import keras
+from keras import ops
+from keras import layers
 
 import numpy as np
 import os
 import pickle
 
+class Sampling(layers.Layer):
+    """Uses (z_mean, z_log_var) to sample z, the vector encoding a digit."""
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.seed_generator = keras.random.SeedGenerator(1337)
+
+    def call(self, inputs):
+        z_mean, z_log_var = inputs
+        batch = ops.shape(z_mean)[0]
+        dim = ops.shape(z_mean)[1]
+        epsilon = keras.random.normal(shape=(batch, dim), 
+                                  mean=0.,
+                                  stddev=1.,
+                                  seed=self.seed_generator)
+        
+        return z_mean + ops.exp(0.5 * z_log_var) * epsilon
+
+
+class KLLossLayer(Layer):
+    def __init__(self, **kwargs):
+        super(KLLossLayer, self).__init__(**kwargs)
+
+    def call(self, inputs):
+        mu, log_var = inputs
+        kl_loss = -0.5 * tf.reduce_sum(1 + log_var - tf.square(mu) - tf.exp(log_var), axis=-1)
+        return kl_loss
 class VAE():
     """
     VAE represents a Deep Convolutional variational autoencoder architecture
@@ -21,7 +52,8 @@ class VAE():
                  conv_filters,
                  conv_kernels,
                  conv_strides,
-                 latent_space_dim):
+                 latent_space_dim,
+                 **kwargs):
         """
         Initializes the variational autoencoder with the provided parameters.
         
@@ -32,7 +64,6 @@ class VAE():
         - conv_strides: List of strides for each convolutional layer.
         - latent_space_dim: Size of the latent space (bottleneck).
         """
-
         self.input_shape = input_shape
         self.conv_filters = conv_filters
         self.conv_kernels = conv_kernels
@@ -51,7 +82,12 @@ class VAE():
         self.__build_encoder()
         self.__build_decoder()
         self.__build_autoencoder()
-
+        
+        self.total_loss_tracker = keras.metrics.Mean(name="total_loss")
+        self.reconstruction_loss_tracker = keras.metrics.Mean(
+            name="reconstruction_loss"
+        )
+        self.kl_loss_tracker = keras.metrics.Mean(name="kl_loss")
 
     def summary(self):
         """
@@ -62,27 +98,37 @@ class VAE():
         self.model.summary()
 
 
-    def compile(self, learning_rate=0.0001, optimizer=None, loss=None):
-        """
-        Compiles the autoencoder model by setting the optimizer and loss function.
+    # def compile(self, learning_rate=0.0001, optimizer=None, loss=None):
+    #     """
+    #     Compiles the autoencoder model by setting the optimizer and loss function.
         
-        Args:
-        - learning_rate: Learning rate for the optimizer.
-        - optimizer: Optimizer to use (default is Adam).
-        - loss: Loss function to use (default is MeanSquaredError).
-        """
-        if optimizer is None:
-            optimizer = Adam(learning_rate=learning_rate)
-        
-        self.model.compile(optimizer=optimizer,
-                           loss=self.__calculate_combined_loss,
-                           metrics=[self.__calculate_reconstruction_loss,
-                                    self.__calculate_kl_loss])
+    #     Args:
+    #     - learning_rate: Learning rate for the optimizer.
+    #     - optimizer: Optimizer to use (default is Adam).
+    #     - loss: Loss function to use (default is MeanSquaredError).
+    #     """
+    #     if optimizer is None:
+    #         optimizer = Adam(learning_rate=learning_rate)
+    #     # self.optimizer = Adam(learning_rate=learning_rate) if optimizer is None else optimizer
 
+
+    #     self.model.compile(optimizer=optimizer,
+    #                        loss=self.__calculate_combined_loss,
+    #                        metrics=[self.__calculate_reconstruction_loss,
+    #                                 self.__calculate_kl_loss])
+
+    
+    def compile(self, learning_rate=0.0001, optimizer=None, loss=None):
+        optimizer = Adam(learning_rate=learning_rate)
+
+        self.model.compile(optimizer=optimizer,
+                    loss=self.__calculate_reconstruction_loss,
+                    metrics=([self.__calculate_reconstruction_loss]))
 
     def train(self, x_train, batch_size, num_epochs):
 
-        self.model.fit(x=x_train, y=x_train,
+        self.model.fit(x_train,
+                       x_train,
                        batch_size=batch_size, 
                        epochs=num_epochs,
                        shuffle=True)
@@ -139,24 +185,51 @@ class VAE():
 
     # Private methods
 
-    def __calculate_reconstruction_loss(self, y_target, y_pred):
-        error = y_target - y_pred
-        reconstructed_loss = K.mean(K.square(error),  axis=[1, 2, 3])
+    # def __calculate_reconstruction_loss(self, y_true, y_pred):
+    #     error = y_true - y_pred
+    #     reconstructed_loss = K.mean(K.square(error),  axis=[1, 2, 3])
 
-        return reconstructed_loss
+    #     # reconstructed_loss = tf.reduce_mean(tf.square(error))
+    #     # reconstructed_loss =ops.mean(ops.square(error))
+    #     print(reconstructed_loss.shape)
+    #     print(reconstructed_loss)
+    #     return reconstructed_loss
+
     
+    def __calculate_reconstruction_loss(self, y_true, y_pred):
+        reconstruc_loss = ops.mean(
+            ops.sum(
+                keras.losses.binary_crossentropy(y_true, y_pred),
+                axis=(1, 2),
+            )
+        )
+        print("\n Reconstruc loss shape")
+        print(reconstruc_loss.shape)
+        print(reconstruc_loss)
+        return reconstruc_loss
 
-    def __calculate_kl_loss(self, y_target, y_pred):
-        kl_loss = -1/2 * K.sum(1 + self.log_variance - K.square(self.mu)
-                               - K.exp(self.log_variance), axis=1)
+    def __calculate_kl_loss(self, y_true, y_pred):
+        return         -0.5 * tf.reduce_sum(1 + self.log_var - tf.square(self.mu) - tf.exp(self.log_var), axis=-1)
 
-        return kl_loss
+    # def __calculate_kl_loss(self, y_true, y_pred):
+    #     kl_loss = -0.5 * (1 + self.log_var - ops.square(self.mu) - ops.exp(self.log_var))
+    #     print("Shape do log_var e mu")
+    #     print(self.log_var.shape)
+    #     print(self.mu.shape)
+    #     kl_loss = ops.mean(ops.sum(kl_loss, axis=1))
+
+    #     print('\nShape kl_loss')
+    #     print(kl_loss.shape)
+    #     print(kl_loss)
+    #     return kl_loss
 
 
-    def __calculate_combined_loss(self, y_target, y_pred):
-        reconstructed_loss = self.__calculate_reconstruction_loss(y_target, y_pred)
-        kl_loss = self.__calculate_kl_loss(y_target, y_pred)
-        combined_loss = self.w_rec_loss * reconstructed_loss + kl_loss
+    def __calculate_combined_loss(self, y_true, y_pred):
+        reconstructed_loss = self.__calculate_reconstruction_loss(y_true, y_pred)
+        kl_loss = self.__calculate_kl_loss(y_true, y_pred)
+        print("\n Total loss comibnada")
+        combined_loss = reconstructed_loss + kl_loss
+        print(combined_loss)
 
         return combined_loss
 
@@ -202,14 +275,14 @@ class VAE():
         bottleneck = self.__add_bottleneck(conv_layers)
 
         self.model_input = encoder_input
-        self.encoder = Model(encoder_input, bottleneck, name = "encoder")
+        self.encoder = Model(encoder_input, bottleneck, name="encoder")
 
 
     def __add_encoder_input(self, shape):
         """
         Defines the input layer for the encoder using the Input method by Keras.
         """
-        input = self.input = Input(shape, name="encoder_input")
+        input = Input(shape, name="encoder_input")
         return input
 
 
@@ -252,22 +325,15 @@ class VAE():
         self.shape_before_bottleneck = K.int_shape(x)[1:]
         x = Flatten()(x)
         
-        self.mu = Dense(self.latent_space_dim, name="mu")(x)
-        self.log_variance = Dense(self.latent_space_dim, name="log_variance")(x)
+        self.mu = Dense(self.latent_space_dim, name="z_mu")(x)
+        self.log_var = Dense(self.latent_space_dim, name="z_log_variance")(x)
 
-        def sample_point_from_nd(args):
-            mu, log_variance = args
-            epsilon = K.random_normal(shape=K.shape(mu),
-                                      mean=0.,
-                                      stddev=1.)
-            sampled_point = mu + K.exp(log_variance/2) * epsilon
+        z = Sampling()([self.mu, self.log_var])
 
-            return sampled_point
-        
-        x = Lambda(sample_point_from_nd, name="encoder_output",
-        output_shape=(self.latent_space_dim,))([self.mu, self.log_variance])
+        # z = Lambda(Sampling, name="encoder_output",
+        #            output_shape=(self.latent_space_dim,))([self.mu, self.log_var])
 
-        return x
+        return z
 
 
     """--------DECODER--------"""
@@ -280,7 +346,7 @@ class VAE():
         dense_layer = self.__add_dense_layer(decoder_input)
         reshaped_layer = self.__add_reshape_layer(dense_layer)
         conv_transpose_layers = self.__add_conv_transpose_layers(reshaped_layer)
-        decoder_output = self.__add_DECODER_output(conv_transpose_layers)
+        decoder_output = self.__add_decoder_output(conv_transpose_layers)
         self.decoder = Model(decoder_input, decoder_output, name = "decoder")
 
 
@@ -344,7 +410,7 @@ class VAE():
         return x
 
 
-    def __add_DECODER_output(self, x):
+    def __add_decoder_output(self, x):
         """
         Adds the final output layer to the decoder with a sigmoid activation.
         """
@@ -366,16 +432,3 @@ class VAE():
         encoder = self.encoder(input)
         decoder_output = self.decoder(encoder)
         self.model = Model(input, decoder_output, name = "autoencoder")
-
-
-if __name__ == "__main__":
-    autoencoder = VAE(
-        input_shape=(28, 28, 1),
-        conv_filters=(32, 64, 64, 64),
-        conv_kernels=(3, 3, 3, 3),
-        conv_strides=(1, 2, 2, 1),
-        latent_space_dim=2
-    )
-    autoencoder.summary()
-
-
