@@ -43,3 +43,22 @@ class Padder:
                               mode=self.mode)
         return padded_array
 
+
+class LogSpectrogramExtractor:
+    """
+    LogSpectrogramExtractor extracts log spectrograms (in dB) from a
+    time-series signal.
+    """
+
+    def __init__(self, frame_size, hop_length):
+        self.frame_size = frame_size
+        self.hop_length = hop_length
+
+    def extract(self, signal):
+        stft = librosa.stft(signal,
+                            n_fft=self.frame_size,
+                            hop_length=self.hop_length)[:-1]
+        spectrogram = np.abs(stft)
+        log_spectrogram = librosa.amplitude_to_db(spectrogram)
+        return log_spectrogram
+
