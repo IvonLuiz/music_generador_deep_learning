@@ -112,32 +112,22 @@ class VAE():
         self.model.summary()
 
 
-    # def compile(self, learning_rate=0.0001, optimizer=None, loss=None):
-    #     """
-    #     Compiles the autoencoder model by setting the optimizer and loss function.
+    def compile(self, learning_rate=0.0001, optimizer=None):
+        """
+        Compiles the autoencoder model by setting the optimizer and loss function.
         
-    #     Args:
-    #     - learning_rate: Learning rate for the optimizer.
-    #     - optimizer: Optimizer to use (default is Adam).
-    #     - loss: Loss function to use (default is MeanSquaredError).
-    #     """
-    #     if optimizer is None:
-    #         optimizer = Adam(learning_rate=learning_rate)
-    #     # self.optimizer = Adam(learning_rate=learning_rate) if optimizer is None else optimizer
-
-
-    #     self.model.compile(optimizer=optimizer,
-    #                        loss=self.__calculate_combined_loss,
-    #                        metrics=[self.__calculate_reconstruction_loss,
-    #                                 self.__calculate_kl_loss])
-
-
-    def compile(self, learning_rate=0.0001, optimizer=None, loss=None):
-        optimizer = Adam(learning_rate=learning_rate)
+        Args:
+        - learning_rate: Learning rate for the optimizer.
+        - optimizer: Optimizer to use (default is Adam).
+        """
+        if optimizer is None:
+            optimizer = Adam(learning_rate=learning_rate)
 
         self.model.compile(optimizer=optimizer,
-                    loss=self.__calculate_combined_loss,
-                    metrics=([self.__calculate_reconstruction_loss]))
+                           loss=self.__calculate_combined_loss,
+                           metrics=[self.__calculate_reconstruction_loss,
+                                    self.__calculate_kl_loss])
+
 
     def train(self, x_train, batch_size, num_epochs):
 
@@ -199,17 +189,6 @@ class VAE():
 
     # Private methods
 
-    # def __calculate_reconstruction_loss(self, y_true, y_pred):
-    #     error = y_true - y_pred
-    #     reconstructed_loss = K.mean(K.square(error),  axis=[1, 2, 3])
-
-    #     # reconstructed_loss = tf.reduce_mean(tf.square(error))
-    #     # reconstructed_loss =ops.mean(ops.square(error))
-    #     print(reconstructed_loss.shape)
-    #     print(reconstructed_loss)
-    #     return reconstructed_loss
-
-    
     def __calculate_reconstruction_loss(self, y_true, y_pred):
         reconstruc_loss = ops.mean(
             ops.sum(
@@ -217,21 +196,9 @@ class VAE():
                 axis=(1, 2),
             )
         )
-        print("\n Reconstruc loss shape")
-        print(reconstruc_loss.shape)
-        print(reconstruc_loss)
+
         return reconstruc_loss
 
-    # def __calculate_kl_loss(self, y_true, y_pred):
-    #     return -0.5 * ops.sum(1 + self.log_var - ops.square(self.mu) - ops.exp(self.log_var), axis=-1)
-
-    # Função para calcular a perda KL usando Lambda
-    # def __calculate_kl_loss(self, y_true, y_pred):
-    #     log_var = self.log_var
-    #     mu = self.mu
-    #     return -0.5 * reduce_sum_fn(1 + log_var - square_fn(mu) - exp_fn(log_var))
-
-    # Usando a camada Lambda para encapsular a função de perda KL
 
     def __calculate_kl_loss(self, y_true, y_pred):
         return Lambda(lambda inputs: kl_loss(inputs[0], inputs[1]), 
@@ -239,43 +206,11 @@ class VAE():
                             output_shape=())([y_true, y_pred])
     
 
-
-    # Criando uma camada personalizada para a perda KL
-    class KLLossLayer(layers.Layer):
-        def call(self, inputs):
-            mu, log_var = inputs
-            return kl_loss(mu, log_var)
-
-
-
-# O resultado `kl_loss_layer` agora contém o valor da perda KL
-
-  
-    # def __calculate_kl_loss(self, y_true, y_pred):
-    #     kl_loss = -0.5 * (1 + self.log_var - ops.square(self.mu) - ops.exp(self.log_var))
-    #     print("Shape do log_var e mu")
-    #     print(self.log_var.shape)
-    #     print(self.mu.shape)
-    #     kl_loss = ops.mean(ops.sum(kl_loss, axis=1))
-
-    #     print('\nShape kl_loss')
-    #     print(kl_loss.shape)
-    #     print(kl_loss)
-    #     return kl_loss
-
-
     def __calculate_combined_loss(self, y_true, y_pred):
 
         reconstructed_loss = self.__calculate_reconstruction_loss(y_true, y_pred)
         kl_loss = self.__calculate_kl_loss(y_true, y_pred)
-        print()
-        print(tf.get_static_value(reconstructed_loss) )
-        print("klloss")
-        print(tf.get_static_value(kl_loss) )
-        print(kl_loss)
-        print("\n Total loss comibnada")
         combined_loss = reconstructed_loss + kl_loss
-        print(combined_loss)
 
         return combined_loss
 
