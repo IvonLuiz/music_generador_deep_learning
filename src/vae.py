@@ -13,7 +13,18 @@ from keras import layers
 import numpy as np
 import os
 import pickle
+# Definindo as operações como funções
+def square_fn(x):
+    return tf.square(x)
 
+def exp_fn(x):
+    return tf.exp(x)
+
+def reduce_sum_fn(x):
+    return tf.reduce_sum(x, axis=-1)
+    # Função para calcular a perda KL
+def kl_loss(mu, log_var):
+    return -0.5 * reduce_sum_fn(1 + log_var - square_fn(mu) - exp_fn(log_var))
 class Sampling(layers.Layer):
     """Uses (z_mean, z_log_var) to sample z, the vector encoding a digit."""
 
@@ -39,7 +50,9 @@ class KLLossLayer(Layer):
 
     def call(self, inputs):
         mu, log_var = inputs
-        kl_loss = -0.5 * tf.reduce_sum(1 + log_var - tf.square(mu) - tf.exp(log_var), axis=-1)
+        kl_loss_fn = lambda mu, log_var: -0.5 * tf.reduce_sum(1 + log_var - tf.square(mu) - tf.exp(log_var), axis=-1)
+        kl_loss = kl_loss_fn(mu, log_var)
+        # kl_loss = -0.5 * tf.reduce_sum(1 + log_var - tf.square(mu) - tf.exp(log_var), axis=-1)
         return kl_loss
 class VAE():
     """
@@ -83,11 +96,12 @@ class VAE():
         self.__build_decoder()
         self.__build_autoencoder()
         
-        self.total_loss_tracker = keras.metrics.Mean(name="total_loss")
-        self.reconstruction_loss_tracker = keras.metrics.Mean(
-            name="reconstruction_loss"
-        )
-        self.kl_loss_tracker = keras.metrics.Mean(name="kl_loss")
+        # self.total_loss_tracker = keras.metrics.Mean(name="total_loss")
+        # self.reconstruction_loss_tracker = keras.metrics.Mean(
+        #     name="reconstruction_loss"
+        # )
+        # self.kl_loss_tracker = keras.metrics.Mean(name="kl_loss")
+
 
     def summary(self):
         """
@@ -117,12 +131,12 @@ class VAE():
     #                        metrics=[self.__calculate_reconstruction_loss,
     #                                 self.__calculate_kl_loss])
 
-    
+
     def compile(self, learning_rate=0.0001, optimizer=None, loss=None):
         optimizer = Adam(learning_rate=learning_rate)
 
         self.model.compile(optimizer=optimizer,
-                    loss=self.__calculate_reconstruction_loss,
+                    loss=self.__calculate_combined_loss,
                     metrics=([self.__calculate_reconstruction_loss]))
 
     def train(self, x_train, batch_size, num_epochs):
@@ -208,9 +222,35 @@ class VAE():
         print(reconstruc_loss)
         return reconstruc_loss
 
-    def __calculate_kl_loss(self, y_true, y_pred):
-        return         -0.5 * tf.reduce_sum(1 + self.log_var - tf.square(self.mu) - tf.exp(self.log_var), axis=-1)
+    # def __calculate_kl_loss(self, y_true, y_pred):
+    #     return -0.5 * ops.sum(1 + self.log_var - ops.square(self.mu) - ops.exp(self.log_var), axis=-1)
 
+    # Função para calcular a perda KL usando Lambda
+    # def __calculate_kl_loss(self, y_true, y_pred):
+    #     log_var = self.log_var
+    #     mu = self.mu
+    #     return -0.5 * reduce_sum_fn(1 + log_var - square_fn(mu) - exp_fn(log_var))
+
+    # Usando a camada Lambda para encapsular a função de perda KL
+
+    def __calculate_kl_loss(self, y_true, y_pred):
+        return Lambda(lambda inputs: kl_loss(inputs[0], inputs[1]), 
+                            name="kl_loss_output",
+                            output_shape=())([y_true, y_pred])
+    
+
+
+    # Criando uma camada personalizada para a perda KL
+    class KLLossLayer(layers.Layer):
+        def call(self, inputs):
+            mu, log_var = inputs
+            return kl_loss(mu, log_var)
+
+
+
+# O resultado `kl_loss_layer` agora contém o valor da perda KL
+
+  
     # def __calculate_kl_loss(self, y_true, y_pred):
     #     kl_loss = -0.5 * (1 + self.log_var - ops.square(self.mu) - ops.exp(self.log_var))
     #     print("Shape do log_var e mu")
@@ -225,8 +265,14 @@ class VAE():
 
 
     def __calculate_combined_loss(self, y_true, y_pred):
+
         reconstructed_loss = self.__calculate_reconstruction_loss(y_true, y_pred)
         kl_loss = self.__calculate_kl_loss(y_true, y_pred)
+        print()
+        print(tf.get_static_value(reconstructed_loss) )
+        print("klloss")
+        print(tf.get_static_value(kl_loss) )
+        print(kl_loss)
         print("\n Total loss comibnada")
         combined_loss = reconstructed_loss + kl_loss
         print(combined_loss)
