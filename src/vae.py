@@ -14,6 +14,20 @@ import numpy as np
 import os
 import pickle
 
+
+def square_fn(x):
+    return tf.square(x)
+
+def exp_fn(x):
+    return tf.exp(x)
+
+def reduce_sum_fn(x):
+    return tf.reduce_sum(x, axis=1)
+
+def kl_loss(mu, log_var):
+    return -0.5 * reduce_sum_fn(1 + log_var - square_fn(mu) - exp_fn(log_var))
+
+
 class Sampling(layers.Layer):
     """Uses (z_mean, z_log_var) to sample z, the vector encoding a digit."""
 
@@ -32,15 +46,6 @@ class Sampling(layers.Layer):
         
         return z_mean + ops.exp(0.5 * z_log_var) * epsilon
 
-
-class KLLossLayer(Layer):
-    def __init__(self, **kwargs):
-        super(KLLossLayer, self).__init__(**kwargs)
-
-    def call(self, inputs):
-        mu, log_var = inputs
-        kl_loss = -0.5 * tf.reduce_sum(1 + log_var - tf.square(mu) - tf.exp(log_var), axis=-1)
-        return kl_loss
 class VAE():
     """
     VAE represents a Deep Convolutional variational autoencoder architecture
@@ -71,7 +76,7 @@ class VAE():
         
         self.num_conv_layers = len(conv_filters)
         self.latent_space_dim = latent_space_dim
-        self.w_rec_loss = 1000
+        self.w_rec_loss = 1000000
         self.shape_before_bottleneck = None
         self.model_input = None
         
@@ -81,13 +86,8 @@ class VAE():
 
         self.__build_encoder()
         self.__build_decoder()
-        self.__build_autoencoder()
-        
-        self.total_loss_tracker = keras.metrics.Mean(name="total_loss")
-        self.reconstruction_loss_tracker = keras.metrics.Mean(
-            name="reconstruction_loss"
-        )
-        self.kl_loss_tracker = keras.metrics.Mean(name="kl_loss")
+        self.__build_variational_autoencoder()
+
 
     def summary(self):
         """
@@ -98,32 +98,22 @@ class VAE():
         self.model.summary()
 
 
-    # def compile(self, learning_rate=0.0001, optimizer=None, loss=None):
-    #     """
-    #     Compiles the autoencoder model by setting the optimizer and loss function.
+    def compile(self, learning_rate=0.0001, optimizer=None):
+        """
+        Compiles the autoencoder model by setting the optimizer and loss function.
         
-    #     Args:
-    #     - learning_rate: Learning rate for the optimizer.
-    #     - optimizer: Optimizer to use (default is Adam).
-    #     - loss: Loss function to use (default is MeanSquaredError).
-    #     """
-    #     if optimizer is None:
-    #         optimizer = Adam(learning_rate=learning_rate)
-    #     # self.optimizer = Adam(learning_rate=learning_rate) if optimizer is None else optimizer
-
-
-    #     self.model.compile(optimizer=optimizer,
-    #                        loss=self.__calculate_combined_loss,
-    #                        metrics=[self.__calculate_reconstruction_loss,
-    #                                 self.__calculate_kl_loss])
-
-    
-    def compile(self, learning_rate=0.0001, optimizer=None, loss=None):
-        optimizer = Adam(learning_rate=learning_rate)
+        Args:
+        - learning_rate: Learning rate for the optimizer.
+        - optimizer: Optimizer to use (default is Adam).
+        """
+        if optimizer is None:
+            optimizer = Adam(learning_rate=learning_rate)
 
         self.model.compile(optimizer=optimizer,
-                    loss=self.__calculate_reconstruction_loss,
-                    metrics=([self.__calculate_reconstruction_loss]))
+                           loss=self.__calculate_combined_loss,
+                           metrics=[self.__calculate_reconstruction_loss,
+                                    self.__calculate_kl_loss])
+
 
     def train(self, x_train, batch_size, num_epochs):
 
@@ -157,14 +147,14 @@ class VAE():
             with open(parameters_path, "rb") as f:
                 parameters = pickle.load(f)
 
-            autoencoder = VAE(*parameters)
+            variational_autoencoder = VAE(*parameters)
 
             if not os.path.exists(weights_path):
                 raise FileNotFoundError(f"Weights file not found at: {weights_path}")
 
-            autoencoder.__load_weights(weights_path)
+            variational_autoencoder.__load_weights(weights_path)
 
-            return autoencoder
+            return variational_autoencoder
 
         except FileNotFoundError as e:
             print(f"Error: {e}")
@@ -185,55 +175,37 @@ class VAE():
 
     # Private methods
 
+    ## Loss calculations
     # def __calculate_reconstruction_loss(self, y_true, y_pred):
-    #     error = y_true - y_pred
-    #     reconstructed_loss = K.mean(K.square(error),  axis=[1, 2, 3])
+    #     reconstruc_loss = ops.mean(
+    #         ops.sum(
+    #             keras.losses.binary_crossentropy(y_true, y_pred),
+    #             axis=(1, 2),
+    #         )
+    #     )
 
-    #     # reconstructed_loss = tf.reduce_mean(tf.square(error))
-    #     # reconstructed_loss =ops.mean(ops.square(error))
-    #     print(reconstructed_loss.shape)
-    #     print(reconstructed_loss)
-    #     return reconstructed_loss
-
-    
+    #     return reconstruc_loss
     def __calculate_reconstruction_loss(self, y_true, y_pred):
-        reconstruc_loss = ops.mean(
-            ops.sum(
-                keras.losses.binary_crossentropy(y_true, y_pred),
-                axis=(1, 2),
-            )
-        )
-        print("\n Reconstruc loss shape")
-        print(reconstruc_loss.shape)
-        print(reconstruc_loss)
-        return reconstruc_loss
+        error = y_true - y_pred
+        reconstruction_loss = ops.mean(ops.square(error), axis=[1, 2, 3])
+        return reconstruction_loss
+
 
     def __calculate_kl_loss(self, y_true, y_pred):
-        return         -0.5 * tf.reduce_sum(1 + self.log_var - tf.square(self.mu) - tf.exp(self.log_var), axis=-1)
-
-    # def __calculate_kl_loss(self, y_true, y_pred):
-    #     kl_loss = -0.5 * (1 + self.log_var - ops.square(self.mu) - ops.exp(self.log_var))
-    #     print("Shape do log_var e mu")
-    #     print(self.log_var.shape)
-    #     print(self.mu.shape)
-    #     kl_loss = ops.mean(ops.sum(kl_loss, axis=1))
-
-    #     print('\nShape kl_loss')
-    #     print(kl_loss.shape)
-    #     print(kl_loss)
-    #     return kl_loss
-
+        return Lambda(lambda inputs: kl_loss(inputs[0], inputs[1]), 
+                            name="kl_loss_output",
+                            output_shape=())([y_true, y_pred])
+    
 
     def __calculate_combined_loss(self, y_true, y_pred):
+
         reconstructed_loss = self.__calculate_reconstruction_loss(y_true, y_pred)
         kl_loss = self.__calculate_kl_loss(y_true, y_pred)
-        print("\n Total loss comibnada")
-        combined_loss = reconstructed_loss + kl_loss
-        print(combined_loss)
+        combined_loss = self.w_rec_loss * reconstructed_loss + kl_loss
 
         return combined_loss
 
-
+    # Methods to save/load model
     def __create_folder(self, folder="model"):
         if not os.path.exists(folder):
             os.makedirs(folder)
@@ -426,9 +398,9 @@ class VAE():
 
         return x
 
-
-    def __build_autoencoder(self):
+    # Full model
+    def __build_variational_autoencoder(self):
         input = self.model_input
         encoder = self.encoder(input)
         decoder_output = self.decoder(encoder)
-        self.model = Model(input, decoder_output, name = "autoencoder")
+        self.model = Model(input, decoder_output, name = "variational_autoencoder")
