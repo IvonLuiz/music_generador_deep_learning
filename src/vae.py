@@ -76,7 +76,7 @@ class VAE():
         
         self.num_conv_layers = len(conv_filters)
         self.latent_space_dim = latent_space_dim
-        self.w_rec_loss = 1000
+        self.w_rec_loss = 1000000
         self.shape_before_bottleneck = None
         self.model_input = None
         
