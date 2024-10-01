@@ -9,6 +9,9 @@ LEARNING_RATE = 0.0005
 BATCH_SIZE = 64
 EPOCHS = 150
 
+SPECTROGRAMS_PATH = "./data/fsdd/spectrograms/"
+
+
 def load_mnist():
     (x_train, y_train), (x_test, y_test) = mnist.load_data()
 
@@ -23,14 +26,15 @@ def load_mnist():
 def load_fsdd(path):
     x_train = []
     
-    for root, _, file_names in os.walk():
+    for root, _, file_names in os.walk(path):
         for file_name in file_names:
-            file_path = os.path.join(root, file_name)
-            spectrogram = np.load(file_path)
-            x_train.append(spectrogram)
+            if file_name.endswith(".npy"):
+                file_path = os.path.join(root, file_name)
+                spectrogram = np.load(file_path) # (n_bins, n_frames, 1)
+                x_train.append(spectrogram)
     
     x_train = np.array(x_train)
-    x_train = x_train[..., np.newaxis]
+    x_train = x_train[..., np.newaxis] # -> (3000, 256, 64, 1)
 
     return x_train
 
@@ -52,6 +56,6 @@ def train(x_train, learning_rate, batch_size, epochs):
 
 
 if __name__ == "__main__":
-    x_train, _, _, _ = load_mnist()
+    x_train = load_fsdd(SPECTROGRAMS_PATH)
     VAE = train(x_train, LEARNING_RATE, BATCH_SIZE, EPOCHS)
     VAE.save("model")
