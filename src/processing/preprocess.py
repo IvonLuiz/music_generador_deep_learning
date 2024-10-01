@@ -113,3 +113,67 @@ class Saver:
         save_path = os.path.join(self.feature_save_dir, file_name + ".npy")
         return save_path
 
+
+class PreprocessingPipeline:
+    """PreprocessingPipeline processes audio files in a directory, applying
+    the following steps to each file:
+        1- load a file
+        2- pad the signal (if necessary)
+        3- extracting log spectrogram from signal
+        4- normalize spectrogram
+        5- save the normalized spectrogram
+
+    Storing the min max values for all the log spectrograms.
+    """
+
+    def __init__(self):
+        self.padder = None
+        self.extractor = None
+        self.normalizer = None
+        self.saver = None
+        self.min_max_values = {}
+        self._loader = None
+        self._num_expected_samples = None
+
+    @property
+    def loader(self):
+        return self._loader
+
+    @loader.setter
+    def loader(self, loader):
+        self._loader = loader
+        self._num_expected_samples = int(loader.sample_rate * loader.duration)
+
+    def process(self, audio_files_dir):
+        for root, _, files in os.walk(audio_files_dir):
+            for file in files:
+                if file.endswith(".wav"):
+                    file_path = os.path.join(root, file)
+                    self._process_file(file_path)
+                    print(f"Processed file {file_path}")
+        self.saver.save_min_max_values(self.min_max_values)
+
+    def _process_file(self, file_path):
+        signal = self.loader.load(file_path)
+        if self._is_padding_necessary(signal):
+            signal = self._apply_padding(signal)
+        feature = self.extractor.extract(signal)
+        norm_feature = self.normalizer.normalize(feature)
+        save_path = self.saver.save_feature(norm_feature, file_path)
+        self._store_min_max_value(save_path, feature.min(), feature.max())
+
+    def _is_padding_necessary(self, signal):
+        if len(signal) < self._num_expected_samples:
+            return True
+        return False
+
+    def _apply_padding(self, signal):
+        num_missing_samples = self._num_expected_samples - len(signal)
+        padded_signal = self.padder.right_pad(signal, num_missing_samples)
+        return padded_signal
+
+    def _store_min_max_value(self, save_path, min_val, max_val):
+        self.min_max_values[save_path] = {
+            "min": min_val,
+            "max": max_val
+        }
