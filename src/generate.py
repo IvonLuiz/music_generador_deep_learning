@@ -5,8 +5,8 @@ import numpy as np
 import soundfile as sf
 
 from soundgenerator import SoundGenerator
-from vae import VAE
-from train import SPECTROGRAMS_PATH, load_fsdd
+from modeling.vae import VAE
+from modeling.train import SPECTROGRAMS_PATH, load_fsdd
 
 
 HOP_LENGTH = 256

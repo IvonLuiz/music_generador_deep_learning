@@ -25,18 +25,20 @@ def load_mnist():
 
 def load_fsdd(path):
     x_train = []
-    
+    file_paths = []
+
     for root, _, file_names in os.walk(path):
         for file_name in file_names:
             if file_name.endswith(".npy"):
                 file_path = os.path.join(root, file_name)
                 spectrogram = np.load(file_path) # (n_bins, n_frames, 1)
                 x_train.append(spectrogram)
+                file_paths.append(file_path)
     
     x_train = np.array(x_train)
     x_train = x_train[..., np.newaxis] # -> (3000, 256, 64, 1)
 
-    return x_train
+    return x_train, file_paths
 
 
 
@@ -56,6 +58,6 @@ def train(x_train, learning_rate, batch_size, epochs):
 
 
 if __name__ == "__main__":
-    x_train = load_fsdd(SPECTROGRAMS_PATH)
+    x_train, _ = load_fsdd(SPECTROGRAMS_PATH)
     VAE = train(x_train, LEARNING_RATE, BATCH_SIZE, EPOCHS)
     VAE.save("model")

@@ -43,17 +43,17 @@ def plot_images_encoded_in_latent_space(latent_representations, sample_labels):
 if __name__ == "__main__":
     autoencoder = VAE.load("model")
     autoencoder.summary()
-    x_train, y_train, x_test, y_test = load_mnist()
+    # x_train, y_train, x_test, y_test = load_mnist()
 
-    num_sample_images_to_show = 8
-    sample_images, _ = select_images(x_test, y_test, num_sample_images_to_show)
-    reconstructed_images, _ = autoencoder.reconstruct(sample_images)
-    plot_reconstructed_images(sample_images, reconstructed_images)
+    # num_sample_images_to_show = 8
+    # sample_images, _ = select_images(x_test, y_test, num_sample_images_to_show)
+    # reconstructed_images, _ = autoencoder.reconstruct(sample_images)
+    # plot_reconstructed_images(sample_images, reconstructed_images)
 
-    num_images = 6000
-    sample_images, sample_labels = select_images(x_test, y_test, num_images)
-    _, latent_representations = autoencoder.reconstruct(sample_images)
-    plot_images_encoded_in_latent_space(latent_representations, sample_labels)
+    # num_images = 6000
+    # sample_images, sample_labels = select_images(x_test, y_test, num_images)
+    # _, latent_representations = autoencoder.reconstruct(sample_images)
+    # plot_images_encoded_in_latent_space(latent_representations, sample_labels)
 
 
 
