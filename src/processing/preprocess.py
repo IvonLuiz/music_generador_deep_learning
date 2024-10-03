@@ -54,6 +54,7 @@ class LogSpectrogramExtractor:
         self.frame_size = frame_size
         self.hop_length = hop_length
 
+
     def extract(self, signal):
         stft = librosa.stft(signal,
                             n_fft=self.frame_size,
@@ -86,7 +87,6 @@ class Saver:
     def __init__(self, feature_save_dir, min_max_values_save_dir):
         self.feature_save_dir = feature_save_dir
         self.min_max_values_save_dir = min_max_values_save_dir
-        print(self.feature_save_dir)
         Path(self.feature_save_dir).mkdir(parents=True, exist_ok=True)
         Path(self.min_max_values_save_dir).mkdir(parents=True, exist_ok=True)
 
@@ -94,7 +94,8 @@ class Saver:
     def save_feature(self, feature, file_path):
         save_path = self._generate_save_path(file_path)
         np.save(save_path, feature)
-
+        
+        return save_path
 
     def save_min_max_values(self, min_max_values):
         save_path = os.path.join(self.min_max_values_save_dir,
@@ -111,6 +112,7 @@ class Saver:
     def _generate_save_path(self, file_path):
         file_name = os.path.split(file_path)[1]
         save_path = os.path.join(self.feature_save_dir, file_name + ".npy")
+        
         return save_path
 
 
