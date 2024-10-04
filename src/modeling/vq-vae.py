@@ -1,8 +1,11 @@
 from tensorflow.keras import Model
 from tensorflow.keras.layers import Input, Conv2D, ReLU, BatchNormalization, \
-    Flatten, Dense, Conv2DTranspose, Reshape, Activation, Lambda
+    Flatten, Dense, Conv2DTranspose, Reshape, Activation, Lambda, Embedding
 from tensorflow.keras import backend as K
 from tensorflow.keras.optimizers import Adam
+
+import numpy as np
+
 
 class VQ_VAE():
 
@@ -29,6 +32,15 @@ class VQ_VAE():
         
         # VQ-VAE specifics
         # From paper:
+        
+        """We define a latent embedding space e ∈RK×D where K is the size of the discrete latent space (i.e.,
+        a K-way categorical), and D is the dimensionality of each latent embedding vector ei. Note that
+        there are K embedding vectors ei ∈RD, i ∈1,2,...,K"""
+        self.__embedding_size = 3 # K
+        self.__embedding_dim = 2 # D
+
+        self.codebook = None
+
         """We found the resulting algorithm to be quite robust to β, as 
         the results did not vary for values of β ranging from 0.1 to 2.0.
         We use β = 0.25 in all our experiments, although in general this
@@ -36,8 +48,6 @@ class VQ_VAE():
         a uniform prior for z, the KL term that usually appears in the ELBO
         is constant w.r.t. the encoder parameters and can thus be ignored
         for training."""
-
-        self.codebook = None
         self.beta = 0.2
         
         self.__build_codebook()
@@ -45,9 +55,10 @@ class VQ_VAE():
         self.__build_decoder()
         self.__build_variational_autoencoder()
     
-    # def forward(self, x):
-    #     encoder_output = self.encoder(x)
-        
+
+    def forward(self, x):
+        encoder_output = self.encoder(x)
+        quant_input = self.preencoder_output 
 
 
     # <------------------------Private Methods------------------------->
@@ -62,10 +73,9 @@ class VQ_VAE():
         """
         encoder_input = self.__add_encoder_input(self.input_shape)
         conv_layers = self.__add_conv_layers(self.num_conv_layers, encoder_input)
-        bottleneck = self.__add_bottleneck(conv_layers)
 
         self.model_input = encoder_input
-        self.encoder = Model(encoder_input, bottleneck, name="encoder")
+        self.encoder = Model(encoder_input, conv_layers, name="encoder")
 
 
     def __add_encoder_input(self, shape):
@@ -107,14 +117,8 @@ class VQ_VAE():
 
         return x
     
-
-    def __build_codebook(self, K, M):
-
-        self.codebook = []
-        rand
-
-
-    def __add_bottleneck(self, x):
+    # CODEBOOK
+    def __build_codebook(self, x):
         """
         Output of the encoder. Defines the bottleneck layer by flattening the data
         and adding a bottleneck with Gaussian sampling dense layer.
@@ -122,10 +126,29 @@ class VQ_VAE():
         self.shape_before_bottleneck = K.int_shape(x)[1:]
         # x = Flatten()(x)
 
+        pre_quant_conv_layer = Conv2D(
+            filters = self.conv_filters[-1],
+            kernel_size = self.conv_kernels[-1],
+            # strides = self.conv_strides[index],
+            padding = "same",
+            name = f"pre_quant_conv_layer"
+        )
+        x = pre_quant_conv_layer(x)
 
+        self.embedding = Embedding(input_dim=self.__embedding_size,
+                                   output_dim=self.__embedding_dim,
+                                   name="embedding_layer")
+        x = self.embedding(x)
 
-
-        fnp.argmin()
+        post_quant_conv_layer = Conv2D(
+            filters = self.conv_filters[-1],
+            kernel_size = self.conv_kernels[-1],
+            # strides = self.conv_strides[index],
+            padding = "same",
+            name = f"post_quant_conv_layer"
+        )
+        x = post_quant_conv_layer(x)
+        
         # self.mu = Dense(self.latent_space_dim, name="z_mu")(x)
         # self.log_var = Dense(self.latent_space_dim, name="z_log_variance")(x)
 
@@ -134,7 +157,7 @@ class VQ_VAE():
         # z = Lambda(Sampling, name="encoder_output",
         #            output_shape=(self.latent_space_dim,))([self.mu, self.log_var])
 
-        return z
+        # return x
 
 
     # DECODER:
