@@ -1,8 +1,11 @@
+import encodings
 from tensorflow.keras import Model
 from tensorflow.keras.layers import Input, Conv2D, ReLU, BatchNormalization, \
-    Flatten, Dense, Conv2DTranspose, Reshape, Activation, Lambda, Embedding
+    Flatten, Dense, Conv2DTranspose, Reshape, Activation, Lambda, Embedding, VectorQuantizer
 from tensorflow.keras import backend as K
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import MSE
+import tensorflow as tf
 
 import numpy as np
 
@@ -31,6 +34,10 @@ class VQ_VAE():
         self.model = None
         
         # VQ-VAE specifics
+        self.pre_quant_conv_layer = None
+        self.post_quant_conv_layer = None
+        self.vq = None
+
         # From paper:
         
         """We define a latent embedding space e ∈RK×D where K is the size of the discrete latent space (i.e.,
@@ -50,15 +57,24 @@ class VQ_VAE():
         for training."""
         self.beta = 0.2
         
-        self.__build_codebook()
+        # self.__build_codebook()
         self.__build_encoder()
+        self.__build_quant_layer()
         self.__build_decoder()
-        self.__build_variational_autoencoder()
+        self.__build_vq_vae()
     
 
     def forward(self, x):
-        encoder_output = self.encoder(x)
-        quant_input = self.preencoder_output 
+        input = self.model_input
+        encoder_output = self.encoder(input)
+        quant_input = self.pre_quant_conv_layer(encoder_output)
+
+        # Quantization
+        B, C, H, W = quant_input.shape
+        decoder_output = self.decoder(encoder)
+        self.model = Model(input, decoder_output, name = "variational_autoencoder")
+
+
 
 
     # <------------------------Private Methods------------------------->
@@ -73,9 +89,10 @@ class VQ_VAE():
         """
         encoder_input = self.__add_encoder_input(self.input_shape)
         conv_layers = self.__add_conv_layers(self.num_conv_layers, encoder_input)
+        bottleneck = self.__add_bottleneck(self, conv_layers)
 
         self.model_input = encoder_input
-        self.encoder = Model(encoder_input, conv_layers, name="encoder")
+        self.encoder = Model(encoder_input, bottleneck, name="encoder")
 
 
     def __add_encoder_input(self, shape):
@@ -117,48 +134,45 @@ class VQ_VAE():
 
         return x
     
+    
+    def __add_bottleneck(self, x):
+        self.shape_before_bottleneck = K.int_shape(x)[1:]
+        x = Conv2D(self.latent_space_dim, 1, padding="same")(x)
+
+        return x
+    
+
     # CODEBOOK
-    def __build_codebook(self, x):
+    def __build_quant_layer(self):
         """
         Output of the encoder. Defines the bottleneck layer by flattening the data
         and adding a bottleneck with Gaussian sampling dense layer.
         """
-        self.shape_before_bottleneck = K.int_shape(x)[1:]
-        # x = Flatten()(x)
-
-        pre_quant_conv_layer = Conv2D(
+        self.pre_quant_conv_layer = Conv2D(
             filters = self.conv_filters[-1],
-            kernel_size = self.conv_kernels[-1],
-            # strides = self.conv_strides[index],
+            kernel_size = 1,
+            strides = 1,
             padding = "same",
             name = f"pre_quant_conv_layer"
         )
-        x = pre_quant_conv_layer(x)
+        self.vq = VectorQuantizer(self.__embedding_dim, self.__embedding_size)
 
-        self.embedding = Embedding(input_dim=self.__embedding_size,
-                                   output_dim=self.__embedding_dim,
-                                   name="embedding_layer")
-        x = self.embedding(x)
+        # x = pre_quant_conv_layer(x)
 
-        post_quant_conv_layer = Conv2D(
-            filters = self.conv_filters[-1],
-            kernel_size = self.conv_kernels[-1],
-            # strides = self.conv_strides[index],
-            padding = "same",
-            name = f"post_quant_conv_layer"
-        )
-        x = post_quant_conv_layer(x)
+        # self.embedding = Embedding(input_dim=self.__embedding_size,
+        #                            output_dim=self.__embedding_dim,
+        #                            name="embedding_layer")
+        # x = self.embedding(x)
+
+        # self.post_quant_conv_layer = Conv2D(
+        #     filters = self.conv_filters[-1],
+        #     kernel_size = self.conv_kernels[-1],
+        #     # strides = self.conv_strides[index],
+        #     padding = "same",
+        #     name = f"post_quant_conv_layer"
+        # )
+        # x = post_quant_conv_layer(x)
         
-        # self.mu = Dense(self.latent_space_dim, name="z_mu")(x)
-        # self.log_var = Dense(self.latent_space_dim, name="z_log_variance")(x)
-
-        # z = Sampling()([self.mu, self.log_var])
-
-        # z = Lambda(Sampling, name="encoder_output",
-        #            output_shape=(self.latent_space_dim,))([self.mu, self.log_var])
-
-        # return x
-
 
     # DECODER:
 
@@ -207,7 +221,7 @@ class VQ_VAE():
         Adds all transpose convolution layers (up-sampling) in reverse order.
         Excludes the first layer for experimental purposes.
         """
-        # Not implemeting te first layer (test later)
+        # Not implementing te first layer (test later)
         for index in reversed(range(1, self.num_conv_layers)):
             x = self.__add_conv_transpose_layer(index, x)
         
@@ -250,10 +264,71 @@ class VQ_VAE():
 
         return x
 
+
     # Full model
-    def __build_variational_autoencoder(self):
+    def __build_vq_vae(self):
         input = self.model_input
         encoder = self.encoder(input)
-        decoder_output = self.decoder(encoder)
+        vq = self.vq(encoder)
+        decoder_output = self.decoder(vq)
+        
         self.model = Model(input, decoder_output, name = "variational_autoencoder")
 
+
+class VectorQuantizer(tf.Module):
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost):
+        super(VectorQuantizer, self).__init__()
+        
+        self._embedding_dim = embedding_dim     # D
+        self._num_embeddings = num_embeddings   # K
+        
+        # Initialize embeddings with inform random values in interval (-1/K, 1/K)
+        initializer = tf.random_uniform_initializer(minval=-1/self._num_embeddings,
+                                                    maxval=1/self._num_embeddings)
+        self._embedding = tf.Variable(
+            initializer(shape=(self._num_embeddings, self._embedding_dim)),
+            trainable=True,
+            name="embedding_vectors"
+        )
+        # self._embedding = Embedding(self._num_embeddings, self._embedding_dim)
+        # self._embedding.weight.data.uniform_(-1/self._num_embeddings, 1/self._num_embeddings)
+        self._commitment_cost = commitment_cost
+
+    def forward(self, inputs):
+        # convert inputs from BCHW -> BHWC
+        inputs = tf.transpose(inputs, perm=[0, 2, 3, 1])
+        input_shape = inputs.shape
+        
+        # Flatten input
+        flat_input = tf.reshape(inputs, [-1, self._embedding_dim])
+        
+        # Calculate distances
+        distances = (
+            tf.reduce_sum(flat_input**2, axis=1, keepdims=True)
+            + tf.reduce_sum(tf.pow(self._embedding.weights))
+            - 2 * tf.matmul(flat_input, self._embedding.weights)
+        )
+
+        # Encoding
+        encoding_indices = tf.expand_dims(tf.argmin(distances, axis=1), axis=1)
+        encodings = tf.zeros((tf.shape(encoding_indices)[0], self._num_embeddings))
+        encodings = tf.one_hot(tf.squeeze(encoding_indices, axis=1), depth=self._num_embeddings)
+
+        # Quantize and unflatten
+        quantized = tf.matmul(encodings, self._embedding.weights)
+        quantized = tf.reshape(quantized, input_shape)
+
+        # Loss
+        # Maybe use tf.reduce_sum idk
+        e_latent_loss = MSE(tf.stop_gradient(quantized), inputs)
+        q_latent_loss = MSE(quantized, tf.stop_gradient(inputs))
+        loss = q_latent_loss + self._commitment_cost * e_latent_loss
+        
+        quantized = inputs + tf.stop_gradient(quantized - inputs)
+        avg_probs = tf.reduce_mean(encodings, axis=0)
+        perplexity = tf.exp(-tf.reduce_sum(avg_probs * tf.math.log(avg_probs + 1e-10)))
+        
+        # Convert quantized back from BHWC to BCHW
+        quantized = tf.transpose(quantized, perm=[0, 3, 1, 2])
+
+        return loss, quantized, perplexity, encodings
