@@ -74,7 +74,89 @@ class VQ_VAE():
         self.decoder.summary()
         self.model.summary()
 
+    def compile(self, learning_rate=0.0001, optimizer=None):
+        """
+        Compiles the autoencoder model by setting the optimizer and loss function.
+        
+        Args:
+        - learning_rate: Learning rate for the optimizer.
+        - optimizer: Optimizer to use (default is Adam).
+        """
+        if optimizer is None:
+            optimizer = Adam(learning_rate=learning_rate)
 
+        self.model.compile(optimizer=optimizer)
+    
+    
+    def train(self, x_train, batch_size, num_epochs):
+
+        self.model.fit(x_train,
+                       x_train,
+                       batch_size=batch_size, 
+                       epochs=num_epochs,
+                       shuffle=True)
+    
+
+    def set_loss_tracker(self, data_variance):
+        self.data_variance = data_variance
+        self.total_loss_tracker = tf.keras.metrics.Mean(name="total_loss")
+        self.reconstruction_loss_tracker = tf.keras.metrics.Mean(
+            name="reconstruction_loss"
+        )
+        self.vq_loss_tracker = tf.keras.metrics.Mean(name="vq_loss")
+    
+
+    @property
+    def metrics(self):
+        return [
+            self.total_loss_tracker,
+            self.reconstruction_loss_tracker,
+            self.vq_loss_tracker,
+        ]
+
+    def train_step(self, x):
+        with tf.GradientTape() as tape:
+            # Outputs from the VQ-VAE.
+            reconstructions, _ = self.reconstruct(x)
+
+            # Calculate the losses.
+            reconstruction_loss = (
+                tf.reduce_mean((x - reconstructions) ** 2) / self.data_variance
+            )
+            total_loss = reconstruction_loss + sum(self.losses)
+
+        # Backpropagation.
+        grads = tape.gradient(total_loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
+
+        # Loss tracking.
+        self.total_loss_tracker.update_state(total_loss)
+        self.reconstruction_loss_tracker.update_state(reconstruction_loss)
+        self.vq_loss_tracker.update_state(sum(self.losses))
+
+        # Log results.
+        return {
+            "loss": self.total_loss_tracker.result(),
+            "reconstruction_loss": self.reconstruction_loss_tracker.result(),
+            "vqvae_loss": self.vq_loss_tracker.result(),
+        }
+    # def __calculate_loss(self):
+    #     self.total_loss_tracker = tf.keras.metrics.Mean(name="total_loss")
+    #     self.reconstruction_loss_tracker = keras.metrics.Mean(
+    #         name="reconstruction_loss"
+    #     )
+    #     self.vq_loss_tracker = keras.metrics.Mean(name="vq_loss")
+    
+    
+    def reconstruct(self, input):
+        encoder_outputs = self.encoder.predict(input)
+        quantized_latents = self.vq(encoder_outputs)
+        reconstructed = self.decoder.predict(quantized_latents)
+        
+        return reconstructed, quantized_latents
+    
+    
+    
     # <------------------------Private Methods------------------------->
 
     # <------------------ Encoder ------------------>
@@ -191,7 +273,7 @@ class VQ_VAE():
         """
         Defines the input layer for the decoder, which is the latent space.
         """
-        input_layer = Input(shape = (self.__embedding_dim,), name = "decoder_input")
+        input_layer = Input(shape = (self.latent_space_dim,), name = "decoder_input")
 
         return input_layer
     
@@ -337,6 +419,9 @@ class VectorQuantizer(tf.keras.layers.Layer):
 
 
 if __name__ == "__main__":
+    LEARNING_RATE = 0.0005
+    BATCH_SIZE = 64
+    EPOCHS = 150
     vae = VQ_VAE(
         input_shape=(256, 64, 1),
         conv_filters=(512, 256, 128, 64, 32),
@@ -345,3 +430,4 @@ if __name__ == "__main__":
         latent_space_dim=1024
     )
     vae.summary()
+    vae.compile(learning_rate=LEARNING_RATE)
