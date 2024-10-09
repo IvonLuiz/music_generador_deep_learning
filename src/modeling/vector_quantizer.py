@@ -8,6 +8,7 @@ class VectorQuantizer(tf.keras.layers.Layer):
         
         self._embedding_dim = embedding_dim     # D
         self._num_embeddings = num_embeddings   # K
+        self.loss = None
         
         # Initialize embeddings with inform random values in interval (-1/K, 1/K)
         initializer = tf.random_uniform_initializer(minval=-1/self._num_embeddings,
@@ -17,7 +18,7 @@ class VectorQuantizer(tf.keras.layers.Layer):
             trainable=True,
             name="embedding_vectors"
         )
-        print(tf.shape(self._embedding))
+        # print(tf.shape(self._embedding))
         self._commitment_cost = commitment_cost
 
     def call(self, inputs):
@@ -48,7 +49,7 @@ class VectorQuantizer(tf.keras.layers.Layer):
         # Maybe use tf.reduce_sum idk
         e_latent_loss = MSE(tf.stop_gradient(quantized), inputs)
         q_latent_loss = MSE(quantized, tf.stop_gradient(inputs))
-        loss = q_latent_loss + self._commitment_cost * e_latent_loss
+        self.loss = q_latent_loss + self._commitment_cost * e_latent_loss
         
         quantized = inputs + tf.stop_gradient(quantized - inputs)
         avg_probs = tf.reduce_mean(encodings, axis=0)
@@ -57,4 +58,8 @@ class VectorQuantizer(tf.keras.layers.Layer):
         # Convert quantized back from BHWC to BCHW
         quantized = tf.transpose(quantized, perm=[0, 3, 1, 2])
 
-        return loss, quantized, perplexity, encodings
+        return quantized
+
+    def get_loss(self):
+        return self.loss
+    
