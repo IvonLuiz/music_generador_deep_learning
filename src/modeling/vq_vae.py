@@ -81,37 +81,18 @@ class VQ_VAE(Model):
 
     
     def compile(self, learning_rate=0.0001):
-        super(VQ_VAE, self).compile()
         self.optimizer = Adam(learning_rate=learning_rate)
-        self.reconstruction_loss_fn = MeanSquaredError()
-    
-
-    # def compile(self, learning_rate=0.0001, optimizer=None):
-    #     """
-    #     Compiles the autoencoder model by setting the optimizer and loss function.
-        
-    #     Args:
-    #     - learning_rate: Learning rate for the optimizer.
-    #     - optimizer: Optimizer to use (default is Adam).
-    #     """
-    #     if optimizer is None:
-    #         optimizer = Adam(learning_rate=learning_rate)
-
-        # self.model.compile(optimizer=optimizer,
-        #                      loss=self.__calculate_reconstruction_loss,
-        #                      metrics=self.metrics)
+        super(VQ_VAE, self).compile(self.optimizer)
     
 
     def call(self, inputs):
-        if isinstance(inputs, (tuple, list)) and len(inputs) == 2:
-            inputs = inputs[0]  # Use only the first input if it’s a tuple of two tensors
-        print(f"Input shape: {inputs}")
         encoder_outputs = self.encoder(inputs)
-        quantization_loss, quantized_latents, perplexity, encodings = self.vq(encoder_outputs)
         
-        # quantized_latents = Flatten()(quantized_latents)
-        reconstructions = self.decoder(quantized_latents)
+        quantized_latents = self.vq(encoder_outputs)
+        quantization_loss = self.vq.get_loss()
         self.add_loss(quantization_loss)
+
+        reconstructions = self.decoder(quantized_latents)
 
         return reconstructions
     
@@ -119,7 +100,6 @@ class VQ_VAE(Model):
     def train(self, x_train, batch_size, num_epochs):
 
         self.fit(x_train,
-                 x_train,
                  batch_size=batch_size, 
                  epochs=num_epochs,
                  shuffle=True)
@@ -139,7 +119,6 @@ class VQ_VAE(Model):
             reconstructions = self(x)
 
             # Calculate the losses.
-            # reconstruction_loss = self.reconstruction_loss_fn(x, reconstructions)
             reconstruction_loss = (
                 tf.reduce_mean((x - reconstructions) ** 2) / self.data_variance
             )
@@ -156,7 +135,7 @@ class VQ_VAE(Model):
 
         # Log results.
         return {
-            "loss": self.loss_tracker["total_loss"].result(),
+            "total_loss": self.loss_tracker["total_loss"].result(),
             "reconstruction_loss": self.loss_tracker["reconstruction_loss"].result(),
             "vq_loss": self.loss_tracker["vq_loss"].result(),
         }
@@ -328,8 +307,7 @@ class VQ_VAE(Model):
     def __build_vq_vae(self):
         input = self.model_input
         encoder_output = self.encoder(input)
-        loss, quantized_output, perplexity, _ = self.vq(encoder_output)
-        
+        quantized_output = self.vq(encoder_output)
         decoder_output = self.decoder(quantized_output)
         
         self.model = Model(input, decoder_output, name = "variational_autoencoder")
