@@ -137,7 +137,10 @@ class VQ_VAE(Model):
             reconstructions = self(x)
 
             # Calculate the losses.
-            reconstruction_loss = self.reconstruction_loss_fn(x, reconstructions)
+            # reconstruction_loss = self.reconstruction_loss_fn(x, reconstructions)
+            reconstruction_loss = (
+                tf.reduce_mean((x - reconstructions) ** 2) / self.data_variance
+            )
             total_loss = reconstruction_loss + sum(self.losses)
 
         # Backpropagation.
