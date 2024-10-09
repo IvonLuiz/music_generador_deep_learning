@@ -244,7 +244,7 @@ class Autoencoder():
         dense_layer = self.__add_dense_layer(decoder_input)
         reshaped_layer = self.__add_reshape_layer(dense_layer)
         conv_transpose_layers = self.__add_conv_transpose_layers(reshaped_layer)
-        decoder_output = self.__add_DECODER_output(conv_transpose_layers)
+        decoder_output = self.__add_decoder_output(conv_transpose_layers)
         self.decoder = Model(decoder_input, decoder_output, name = "decoder")
 
 
@@ -308,7 +308,7 @@ class Autoencoder():
         return x
 
 
-    def __add_DECODER_output(self, x):
+    def __add_decoder_output(self, x):
         """
         Adds the final output layer to the decoder with a sigmoid activation.
         """
