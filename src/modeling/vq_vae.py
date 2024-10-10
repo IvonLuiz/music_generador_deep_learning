@@ -1,37 +1,31 @@
+import encodings
 from tensorflow.keras import Model
 from tensorflow.keras.layers import Input, Conv2D, ReLU, BatchNormalization, \
-    Flatten, Dense, Conv2DTranspose, Reshape, Activation
+    Flatten, Dense, Conv2DTranspose, Reshape, Activation, Lambda, Embedding
 from tensorflow.keras import backend as K
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import MSE
 from tensorflow.keras.losses import MeanSquaredError
+import tensorflow as tf
 
 import numpy as np
-import os
-import pickle
+
+from vector_quantizer import VectorQuantizer
 
 
-class Autoencoder():
-    """
-    Autoencoder represents a Deep Convolutional autoencoder architecture with
-    mirrored encoder and decoder components.
-    """
+class VQ_VAE(Model):
 
     def __init__(self, 
                  input_shape,
                  conv_filters,
                  conv_kernels,
                  conv_strides,
-                 latent_space_dim):
-        """
-        Initializes the Autoencoder with the provided parameters.
+                 latent_space_dim,
+                 data_variance,
+                 embeddings_size=128,
+                 beta=0.25) -> None:
         
-        Arguments:
-        - input_shape: Shape of the input image.
-        - conv_filters: List of filters for each convolutional layer.
-        - conv_kernels: List of kernel sizes for each convolutional layer.
-        - conv_strides: List of strides for each convolutional layer.
-        - latent_space_dim: Size of the latent space (bottleneck).
-        """
+        super(VQ_VAE, self).__init__()
 
         self.input_shape = input_shape
         self.conv_filters = conv_filters
@@ -44,12 +38,39 @@ class Autoencoder():
         self.model_input = None
         
         self.encoder = None
+        self.vq = None
         self.decoder = None
         self.model = None
+        
+        # VQ-VAE specifics
+        self.data_variance = data_variance
+        # self.pre_quant_conv_layer = None
+        # self.post_quant_conv_layer = None
 
+        # From paper:
+        
+        """We define a latent embedding space e ∈RK×D where K is the size of the discrete latent space (i.e.,
+        a K-way categorical), and D is the dimensionality of each latent embedding vector ei. Note that
+        there are K embedding vectors ei ∈RD, i ∈1,2,...,K"""
+        self._embedding_size = embeddings_size  # K
+        self._embedding_dim = latent_space_dim  # D
+
+        """We found the resulting algorithm to be quite robust to β, as 
+        the results did not vary for values of β ranging from 0.1 to 2.0.
+        We use β = 0.25 in all our experiments, although in general this
+        would depend on the scale of reconstruction loss. Since we assume
+        a uniform prior for z, the KL term that usually appears in the ELBO
+        is constant w.r.t. the encoder parameters and can thus be ignored
+        for training."""
+        # VQ-VAE commitment parameter
+        self._beta = beta
+        
+        # self.__build_codebook()
+        self.set_loss_tracker()
         self.__build_encoder()
+        self.__build_quant_layer()
         self.__build_decoder()
-        self.__build_autoencoder()
+        self.__build_vq_vae()
 
 
     def summary(self):
@@ -57,140 +78,115 @@ class Autoencoder():
         Summarizes the encoder and decoder models using Keras' built-in method.
         """
         self.encoder.summary()
+        # self.vq.summary()
         self.decoder.summary()
         self.model.summary()
-
-
-    def compile(self, learning_rate=0.0001, optimizer=None, loss=None):
+        
+    
+    def compile(self, learning_rate=0.0001, optimizer=None):
         """
         Compiles the autoencoder model by setting the optimizer and loss function.
         
         Args:
         - learning_rate: Learning rate for the optimizer.
         - optimizer: Optimizer to use (default is Adam).
-        - loss: Loss function to use (default is MeanSquaredError).
         """
         if optimizer is None:
             optimizer = Adam(learning_rate=learning_rate)
         
-        if loss is None:
-            loss = MeanSquaredError()
-        
-        self.model.compile(optimizer=optimizer, loss=loss)
+        self.optimizer = optimizer
+        super(VQ_VAE, self).compile(self.optimizer)
+    
 
+    def call(self, inputs):
+        encoder_outputs = self.encoder(inputs)
+        quantized_latents = self.vq(encoder_outputs)
+        reconstructions = self.decoder(quantized_latents)
+
+        return reconstructions
+    
 
     def train(self, x_train, batch_size, num_epochs):
 
-        self.model.fit(x=x_train, y=x_train,
-                       batch_size=batch_size, 
-                       epochs=num_epochs,
-                       shuffle=True)
-
-
-    def save(self, folder="model"):
-        try:
-            self.__create_folder(folder)
-            self.__save_parameters(folder)
-            self.__save_weights(folder)
-            print(f"Model saved successfully in folder: {folder}")
-        except Exception as e:
-            print(f"Error occurred while saving the model: {e}")
-
-
-
-    @classmethod
-    def load(cls, save_folder="."):
-        try:
-            # Construct paths for the parameters and weights
-            parameters_path = os.path.join(save_folder, "parameters.pkl")
-            weights_path = os.path.join(save_folder, ".weights.h5")
-
-            if not os.path.exists(parameters_path):
-                raise FileNotFoundError(f"Parameters file not found at: {parameters_path}")
-            
-            with open(parameters_path, "rb") as f:
-                parameters = pickle.load(f)
-
-            autoencoder = Autoencoder(*parameters)
-
-            if not os.path.exists(weights_path):
-                raise FileNotFoundError(f"Weights file not found at: {weights_path}")
-
-            autoencoder.__load_weights(weights_path)
-
-            return autoencoder
-
-        except FileNotFoundError as e:
-            print(f"Error: {e}")
-        except (pickle.UnpicklingError, IOError) as e:
-            print(f"Error loading parameters or weights: {e}")
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
-
-        return None
+        self.fit(x_train,
+                 batch_size=batch_size, 
+                 epochs=num_epochs,
+                 shuffle=True)
     
 
+    def set_loss_tracker(self):
+        self.loss_tracker = {
+            "total_loss": tf.keras.metrics.Mean(name="total_loss"),
+            "reconstruction_loss": tf.keras.metrics.Mean(name="reconstruction_loss"),
+            "vq_loss": tf.keras.metrics.Mean(name="vq_loss"),
+        }
+
+
+    def train_step(self, x):
+        with tf.GradientTape() as tape:
+            # Outputs from the VQ-VAE.
+            reconstructions = self(x)
+
+            # Calculate the losses.
+            reconstruction_loss = (
+                tf.reduce_mean((x - reconstructions) ** 2) / self.data_variance
+            )
+            total_loss = reconstruction_loss + sum(self.losses)
+
+        # Backpropagation.
+        grads = tape.gradient(total_loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
+
+        # Loss tracking.
+        self.loss_tracker["total_loss"].update_state(total_loss)
+        self.loss_tracker["reconstruction_loss"].update_state(reconstruction_loss)
+        self.loss_tracker["vq_loss"].update_state(sum(self.losses))
+
+        # Log results.
+        return {
+            "total_loss": self.loss_tracker["total_loss"].result(),
+            "reconstruction_loss": self.loss_tracker["reconstruction_loss"].result(),
+            "vq_loss": self.loss_tracker["vq_loss"].result(),
+        }
+    
+    
     def reconstruct(self, input):
-        latent_representations = self.encoder.predict(input)
-        reconstructed = self.decoder.predict(latent_representations)
+        encoder_outputs = self.encoder.predict(input)
+        quantized_latents = self.vq(encoder_outputs)
+        reconstructed = self.decoder.predict(quantized_latents)
         
-        return reconstructed, latent_representations
-
-    # Private methods
-
-    def __create_folder(self, folder="model"):
-        if not os.path.exists(folder):
-            os.makedirs(folder)
-
-
-    def __save_parameters(self, save_folder):
-        parameters = [
-            self.input_shape,
-            self.conv_filters,
-            self.conv_kernels,
-            self.conv_strides,
-            self.latent_space_dim
-        ]
-        save_path = os.path.join(save_folder, "parameters.pkl")
-
-        with open(save_path, "wb") as f:
-            pickle.dump(parameters, f)
-
-
-    def __save_weights(self, save_folder):
-        save_path = os.path.join(save_folder, ".weights.h5")
-        self.model.save_weights(save_path)
-
-
-    def __load_weights(self, weights_path):
-        self.model.load_weights(weights_path)
+        return reconstructed, quantized_latents
     
+    
+    
+    # <------------------------Private Methods------------------------->
 
-    """--------ENCODER--------"""
-
+    # <------------------ Encoder ------------------>
+    
     def __build_encoder(self):
         """
         Builds the encoder model, which maps the input to the latent space.
         Uses the arguments passed when instantiating the class to create the input
         layer and the convolutional layers. The bottleneck will be the output.        
         """
-        encoder_input = self.__set_encoder_input(self.input_shape)
-        conv_layers = self.__set_conv_layers(self.num_conv_layers, encoder_input)
-        bottleneck = self.__set_bottleneck(conv_layers)
+        encoder_input = self.__add_encoder_input(self.input_shape)
+        conv_layers = self.__add_conv_layers(self.num_conv_layers, encoder_input)
+        bottleneck = self.__add_bottleneck(conv_layers)
 
         self.model_input = encoder_input
-        self.encoder = Model(encoder_input, bottleneck, name = "encoder")
+        self.encoder = Model(encoder_input, bottleneck, name="encoder")
 
 
-    def __set_encoder_input(self, shape):
+    def __add_encoder_input(self, shape):
         """
         Defines the input layer for the encoder using the Input method by Keras.
         """
-        input = self.input = Input(shape, name="encoder_input")
+        input = Input(shape, name="encoder_input")
+
         return input
 
 
-    def __set_conv_layers(self, num_layers, x):
+    def __add_conv_layers(self, num_layers, x):
         """
         Loops over the number of desired layers and adds convolutional blocks.
         """
@@ -220,30 +216,30 @@ class Autoencoder():
 
         return x
     
-
-    def __set_bottleneck(self, x):
+    def __add_bottleneck(self, x):
         """
         Output of the encoder. Defines the bottleneck layer by flattening the data
-        and adding a dense layer.
+        and adding a bottleneck with Gaussian sampling dense layer.
         """
-
         self.shape_before_bottleneck = K.int_shape(x)[1:]
-        x = Flatten()(x)
-        x = Dense(self.latent_space_dim, name="encoder_output")(x)
+        encoder_outputs = Conv2D(self.latent_space_dim, 1, padding="same")(x)
 
-        return x
+        return encoder_outputs
+    
 
+    # <------------------ Quantization Layer ------------------>
+    def __build_quant_layer(self):
+        self.vq = VectorQuantizer(self._embedding_size, self._embedding_dim, self._beta)
+        
 
-    """--------DECODER--------"""
-
+    # <------------------ Decoder ------------------>
     def __build_decoder(self):
         """
         Builds the decoder model, which reconstructs the input from the latent space.
         """
         decoder_input = self.__add_decoder_input()
-        dense_layer = self.__add_dense_layer(decoder_input)
-        reshaped_layer = self.__add_reshape_layer(dense_layer)
-        conv_transpose_layers = self.__add_conv_transpose_layers(reshaped_layer)
+        # dense_layer = self.__add_dense_layer(decoder_input)
+        conv_transpose_layers = self.__add_conv_transpose_layers(decoder_input)
         decoder_output = self.__add_decoder_output(conv_transpose_layers)
         self.decoder = Model(decoder_input, decoder_output, name = "decoder")
 
@@ -252,7 +248,7 @@ class Autoencoder():
         """
         Defines the input layer for the decoder, which is the latent space.
         """
-        input_layer = Input(shape = (self.latent_space_dim,), name = "decoder_input")
+        input_layer = Input(shape = self.encoder.output.shape[1:], name = "decoder_input")
 
         return input_layer
     
@@ -267,21 +263,12 @@ class Autoencoder():
         return dense_layer
 
 
-    def __add_reshape_layer(self, x):
-        """
-        Reshapes the dense output into the original feature map shape before convolution.
-        """
-        reshape_layer = Reshape(self.shape_before_bottleneck)(x)
-        
-        return reshape_layer
-
-
     def __add_conv_transpose_layers(self, x):
         """
         Adds all transpose convolution layers (up-sampling) in reverse order.
         Excludes the first layer for experimental purposes.
         """
-        # Not implemeting te first layer (test later)
+        # Not implementing te first layer (test later)
         for index in reversed(range(1, self.num_conv_layers)):
             x = self.__add_conv_transpose_layer(index, x)
         
@@ -325,8 +312,12 @@ class Autoencoder():
         return x
 
 
-    def __build_autoencoder(self):
+    # <------------------ VQ-VAE Model ------------------>
+    def __build_vq_vae(self):
         input = self.model_input
-        encoder = self.encoder(input)
-        decoder_output = self.decoder(encoder)
-        self.model = Model(input, decoder_output, name = "autoencoder")
+        encoder_output = self.encoder(input)
+        quantized_output = self.vq(encoder_output)
+        decoder_output = self.decoder(quantized_output)
+        
+        self.model = Model(input, decoder_output, name = "variational_autoencoder")
+
