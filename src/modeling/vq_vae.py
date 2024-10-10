@@ -22,8 +22,11 @@ class VQ_VAE(Model):
                  conv_strides,
                  latent_space_dim,
                  data_variance,
+                 embeddings_size=128,
                  beta=0.25) -> None:
+        
         super(VQ_VAE, self).__init__()
+
         self.input_shape = input_shape
         self.conv_filters = conv_filters
         self.conv_kernels = conv_kernels
@@ -35,6 +38,7 @@ class VQ_VAE(Model):
         self.model_input = None
         
         self.encoder = None
+        self.vq = None
         self.decoder = None
         self.model = None
         
@@ -42,15 +46,14 @@ class VQ_VAE(Model):
         self.data_variance = data_variance
         # self.pre_quant_conv_layer = None
         # self.post_quant_conv_layer = None
-        # self.vq = None
 
         # From paper:
         
         """We define a latent embedding space e ∈RK×D where K is the size of the discrete latent space (i.e.,
         a K-way categorical), and D is the dimensionality of each latent embedding vector ei. Note that
         there are K embedding vectors ei ∈RD, i ∈1,2,...,K"""
-        self.__embedding_size = 128  # K
-        self.__embedding_dim = latent_space_dim  # D
+        self._embedding_size = embeddings_size  # K
+        self._embedding_dim = latent_space_dim  # D
 
         """We found the resulting algorithm to be quite robust to β, as 
         the results did not vary for values of β ranging from 0.1 to 2.0.
@@ -60,7 +63,7 @@ class VQ_VAE(Model):
         is constant w.r.t. the encoder parameters and can thus be ignored
         for training."""
         # VQ-VAE commitment parameter
-        self.beta = beta
+        self._beta = beta
         
         # self.__build_codebook()
         self.set_loss_tracker()
@@ -78,20 +81,26 @@ class VQ_VAE(Model):
         # self.vq.summary()
         self.decoder.summary()
         self.model.summary()
-
+        
     
-    def compile(self, learning_rate=0.0001):
-        self.optimizer = Adam(learning_rate=learning_rate)
+    def compile(self, learning_rate=0.0001, optimizer=None):
+        """
+        Compiles the autoencoder model by setting the optimizer and loss function.
+        
+        Args:
+        - learning_rate: Learning rate for the optimizer.
+        - optimizer: Optimizer to use (default is Adam).
+        """
+        if optimizer is None:
+            optimizer = Adam(learning_rate=learning_rate)
+        
+        self.optimizer = optimizer
         super(VQ_VAE, self).compile(self.optimizer)
     
 
     def call(self, inputs):
         encoder_outputs = self.encoder(inputs)
-        
         quantized_latents = self.vq(encoder_outputs)
-        quantization_loss = self.vq.get_loss()
-        self.add_loss(quantization_loss)
-
         reconstructions = self.decoder(quantized_latents)
 
         return reconstructions
@@ -220,7 +229,7 @@ class VQ_VAE(Model):
 
     # <------------------ Quantization Layer ------------------>
     def __build_quant_layer(self):
-        self.vq = VectorQuantizer(self.__embedding_size, self.__embedding_dim, self.beta)
+        self.vq = VectorQuantizer(self._embedding_size, self._embedding_dim, self._beta)
         
 
     # <------------------ Decoder ------------------>
@@ -229,8 +238,8 @@ class VQ_VAE(Model):
         Builds the decoder model, which reconstructs the input from the latent space.
         """
         decoder_input = self.__add_decoder_input()
-        dense_layer = self.__add_dense_layer(decoder_input)
-        conv_transpose_layers = self.__add_conv_transpose_layers(dense_layer)
+        # dense_layer = self.__add_dense_layer(decoder_input)
+        conv_transpose_layers = self.__add_conv_transpose_layers(decoder_input)
         decoder_output = self.__add_decoder_output(conv_transpose_layers)
         self.decoder = Model(decoder_input, decoder_output, name = "decoder")
 
