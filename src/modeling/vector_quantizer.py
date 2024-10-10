@@ -3,30 +3,27 @@ from tensorflow.keras.losses import MSE
 
 
 class VectorQuantizer(tf.keras.layers.Layer):
-    def __init__(self, num_embeddings, embedding_dim, commitment_cost, **kwargs):
-        super(VectorQuantizer, self).__init__(**kwargs)
+    def __init__(self, num_embeddings, embedding_dim, beta=0.25, **kwargs):
+        super().__init__(**kwargs)
         
-        self._embedding_dim = embedding_dim     # D
-        self._num_embeddings = num_embeddings   # K
-        self.loss = None
+        self._embedding_dim = embedding_dim      # D
+        self._num_embeddings = num_embeddings    # K
+
+        # The `beta` parameter is best kept between [0.25, 2] as per the paper.
+        self._beta = beta
         
-        # Initialize embeddings with inform random values in interval (-1/K, 1/K)
-        initializer = tf.random_uniform_initializer(minval=-1/self._num_embeddings,
-                                                    maxval=1/self._num_embeddings)
+        # Initialize embeddings with inform random values
+        initializer = tf.random_uniform_initializer()
         self._embedding = tf.Variable(
-            initializer(shape=(self._num_embeddings, self._embedding_dim)),
+            initializer(shape=(self._num_embeddings, self._embedding_dim), dtype="float32"),
             trainable=True,
             name="embedding_vectors"
         )
-        # print(tf.shape(self._embedding))
-        self._commitment_cost = commitment_cost
 
     def call(self, inputs):
-        # convert inputs from BCHW -> BHWC
-        inputs = tf.transpose(inputs, perm=[0, 2, 3, 1])
         input_shape = tf.shape(inputs)
         
-        # Flatten input
+        # Flatten input keeping `embedding_dim` intact.
         flat_input = tf.reshape(inputs, [-1, self._embedding_dim])
         
         # Calculate distances
@@ -47,19 +44,11 @@ class VectorQuantizer(tf.keras.layers.Layer):
 
         # Loss
         # Maybe use tf.reduce_sum idk
-        e_latent_loss = MSE(tf.stop_gradient(quantized), inputs)
-        q_latent_loss = MSE(quantized, tf.stop_gradient(inputs))
-        self.loss = q_latent_loss + self._commitment_cost * e_latent_loss
+        commitment_loss = MSE(tf.stop_gradient(quantized), inputs)
+        codebook_loss = MSE(quantized, tf.stop_gradient(inputs))
+        self.add_loss(codebook_loss + self._beta * commitment_loss)
         
         quantized = inputs + tf.stop_gradient(quantized - inputs)
-        avg_probs = tf.reduce_mean(encodings, axis=0)
-        perplexity = tf.exp(-tf.reduce_sum(avg_probs * tf.math.log(avg_probs + 1e-10)))
-        
-        # Convert quantized back from BHWC to BCHW
-        quantized = tf.transpose(quantized, perm=[0, 3, 1, 2])
 
         return quantized
 
-    def get_loss(self):
-        return self.loss
-    
