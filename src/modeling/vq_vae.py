@@ -4,11 +4,12 @@ from tensorflow.keras.layers import Input, Conv2D, ReLU, BatchNormalization, \
     Flatten, Dense, Conv2DTranspose, Reshape, Activation, Lambda, Embedding
 from tensorflow.keras import backend as K
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.losses import MSE
-from tensorflow.keras.losses import MeanSquaredError
+
 import tensorflow as tf
 
 import numpy as np
+import pickle
+import os 
 
 from vector_quantizer import VectorQuantizer
 
@@ -157,7 +158,48 @@ class VQ_VAE(Model):
         
         return reconstructed, quantized_latents
     
+    def save(self, folder="model"):
+        try:
+            self.__create_folder(folder)
+            self.__save_parameters(folder)
+            self.__save_weights(folder)
+            print(f"Model saved successfully in folder: {folder}")
+        except Exception as e:
+            print(f"Error occurred while saving the model: {e}")
+
+
+    @classmethod
+    def load(cls, save_folder="."):
+        try:
+            # Construct paths for the parameters and weights
+            parameters_path = os.path.join(save_folder, "parameters.pkl")
+            weights_path = os.path.join(save_folder, ".weights.h5")
+
+            if not os.path.exists(parameters_path):
+                raise FileNotFoundError(f"Parameters file not found at: {parameters_path}")
+            
+            with open(parameters_path, "rb") as f:
+                parameters = pickle.load(f)
+
+            variational_autoencoder = VQ_VAE(*parameters)
+
+            if not os.path.exists(weights_path):
+                raise FileNotFoundError(f"Weights file not found at: {weights_path}")
+
+            variational_autoencoder.__load_weights(weights_path)
+
+            return variational_autoencoder
+
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+        except (pickle.UnpicklingError, IOError) as e:
+            print(f"Error loading parameters or weights: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+
+        return None
     
+   
     
     # <------------------------Private Methods------------------------->
 
@@ -321,3 +363,32 @@ class VQ_VAE(Model):
         
         self.model = Model(input, decoder_output, name = "variational_autoencoder")
 
+
+    # <------------------ Save/load model ------------------>
+
+    def __create_folder(self, folder="model"):
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+
+
+    def __save_parameters(self, save_folder):
+        parameters = [
+            self.input_shape,
+            self.conv_filters,
+            self.conv_kernels,
+            self.conv_strides,
+            self.latent_space_dim
+        ]
+        save_path = os.path.join(save_folder, "parameters.pkl")
+
+        with open(save_path, "wb") as f:
+            pickle.dump(parameters, f)
+
+
+    def __save_weights(self, save_folder):
+        save_path = os.path.join(save_folder, ".weights.h5")
+        self.model.save_weights(save_path)
+
+
+    def __load_weights(self, weights_path):
+        self.model.load_weights(weights_path)
