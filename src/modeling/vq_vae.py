@@ -45,8 +45,6 @@ class VQ_VAE(Model):
         
         # VQ-VAE specifics
         self.data_variance = data_variance
-        # self.pre_quant_conv_layer = None
-        # self.post_quant_conv_layer = None
 
         # From paper:
         
@@ -63,10 +61,10 @@ class VQ_VAE(Model):
         a uniform prior for z, the KL term that usually appears in the ELBO
         is constant w.r.t. the encoder parameters and can thus be ignored
         for training."""
+
         # VQ-VAE commitment parameter
         self._beta = beta
         
-        # self.__build_codebook()
         self.set_loss_tracker()
         self.__build_encoder()
         self.__build_quant_layer()
@@ -100,6 +98,11 @@ class VQ_VAE(Model):
     
 
     def call(self, inputs):
+        """
+        Defines the forward pass of the model. Encodes the input, performs
+        vector quantization, and decodes the quantized latent vectors back into
+        reconstructions.
+        """
         encoder_outputs = self.encoder(inputs)
         quantized_latents = self.vq(encoder_outputs)
         reconstructions = self.decoder(quantized_latents)
@@ -108,7 +111,9 @@ class VQ_VAE(Model):
     
 
     def train(self, x_train, batch_size, num_epochs):
-
+        """
+        Trains the VQ-VAE model on the given data.
+        """
         self.fit(x_train,
                  batch_size=batch_size, 
                  epochs=num_epochs,
@@ -116,6 +121,10 @@ class VQ_VAE(Model):
     
 
     def set_loss_tracker(self):
+        """
+        Initializes loss tracking metrics to monitor during training.
+        Tracks total loss, reconstruction loss, and VQ loss.
+        """
         self.loss_tracker = {
             "total_loss": tf.keras.metrics.Mean(name="total_loss"),
             "reconstruction_loss": tf.keras.metrics.Mean(name="reconstruction_loss"),
@@ -124,6 +133,10 @@ class VQ_VAE(Model):
 
 
     def train_step(self, x):
+        """
+        Defines the logic for each training step. Computes losses, applies gradients,
+        and updates the loss metrics.
+        """
         with tf.GradientTape() as tape:
             # Outputs from the VQ-VAE.
             reconstructions = self(x)
@@ -152,13 +165,21 @@ class VQ_VAE(Model):
     
     
     def reconstruct(self, input):
+        """
+        Reconstructs the input data by passing it through the encoder, 
+        quantizer, and decoder sequentially.
+        """
         encoder_outputs = self.encoder.predict(input)
         quantized_latents = self.vq(encoder_outputs)
         reconstructed = self.decoder.predict(quantized_latents)
         
         return reconstructed, quantized_latents
     
+
     def save(self, folder="model"):
+        """
+        Saves the model architecture and weights to the specified folder.
+        """
         try:
             self.__create_folder(folder)
             self.__save_parameters(folder)
@@ -170,6 +191,9 @@ class VQ_VAE(Model):
 
     @classmethod
     def load(cls, save_folder="."):
+        """
+        Loads the model architecture and weights from the specified folder.
+        """
         try:
             # Construct paths for the parameters and weights
             parameters_path = os.path.join(save_folder, "parameters.pkl")
