@@ -184,9 +184,10 @@ if __name__ == "__main__":
     FRAME_SIZE = 512
     HOP_LENGTH = 256
     # duration that works divisible by 256: 20.8
-    DURATION = 10.12  # in seconds
+    DURATION = 10.11  # in seconds
 
-    SAMPLE_RATE = 22050
+    # SAMPLE_RATE = 22050
+    SAMPLE_RATE = 32000
     MONO = True
 
     # SPECTROGRAMS_SAVE_DIR = "./data/fsdd/spectrograms/"
