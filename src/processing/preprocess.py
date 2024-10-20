@@ -183,13 +183,19 @@ class PreprocessingPipeline:
 if __name__ == "__main__":
     FRAME_SIZE = 512
     HOP_LENGTH = 256
-    DURATION = 0.74  # in seconds
+    # duration that works divisible by 256: 20.8
+    DURATION = 10.12  # in seconds
+
     SAMPLE_RATE = 22050
     MONO = True
 
-    SPECTROGRAMS_SAVE_DIR = "./data/fsdd/spectrograms/"
-    MIN_MAX_VALUES_SAVE_DIR = "./data/fsdd/"
-    FILES_DIR = "./data/fsdd/audio/"
+    # SPECTROGRAMS_SAVE_DIR = "./data/fsdd/spectrograms/"
+    # MIN_MAX_VALUES_SAVE_DIR = "./data/fsdd/"
+    # FILES_DIR = "./data/fsdd/audio/"
+    
+    FILES_DIR = "./data/raw/maestro-v3.0.0/2011"
+    SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro_spectrograms/"
+    MIN_MAX_VALUES_SAVE_DIR = "./data/raw/maestro-v3.0.0/2011/"
     
     # instantiate all objects
     loader = Loader(SAMPLE_RATE, DURATION, MONO)
