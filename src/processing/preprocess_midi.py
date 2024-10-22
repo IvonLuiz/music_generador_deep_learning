@@ -36,11 +36,24 @@ class ProcessingPipeline():
 
             # Transpose songs to Cmaj/Amin
             song_transposed = self.__transpose_song(song)
-            self.songs[song_idx] = song_transposed 
 
             # encode songs with music time series representation
+            song_encoded = self.__encode_song(song_transposed, time_step=0.25)
 
             # save songs to text file
+            self.save_song(song_encoded, song_idx)
+            self.songs[song_idx] = song_encoded 
+
+    
+    def save_song(self, song: m21.stream.Score, name_to_save):
+        save_path = current_path + "\\..\\..\\data\\processed\\maestro\\"
+        file_path = os.path.join(save_path, str(name_to_save))
+        
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+
+        with open(file_path, "w") as fp:
+            fp.write(song)
 
 
     def load_songs(self, dataset_path):
@@ -55,7 +68,7 @@ class ProcessingPipeline():
                     truncated_song = song.measures(0, 16)
                     self.songs.append(truncated_song)
                     
-                    if (len(self.songs) > 10):
+                    if (len(self.songs) > 3):
                         break
     
 
@@ -81,6 +94,29 @@ class ProcessingPipeline():
         
         return song_new
     
+    def __encode_song(self, song: m21.stream.Score, time_step):
+        
+        encoded_song = []
+
+        for event in song.flatten().notesAndRests:
+            # Check if is a note or rest
+            if isinstance(event, m21.note.Note):
+                symbol = event.pitch.midi
+
+            elif isinstance(event, m21.note.Rest):
+                symbol = "r"
+
+            steps = int(event.duration.quarterLength / time_step)
+            print(steps)
+            for step in range(steps):
+                if step == 0:
+                    encoded_song.append(symbol)
+                    continue
+                encoded_song.append("_")
+
+        encoded_song = " ".join(map(str, encoded_song))
+        return encoded_song
+
 
     def get_songs(self):
         return self.songs
@@ -98,6 +134,7 @@ if __name__ == "__main__":
 
     songs = p.get_songs()
     song = songs[0]
+    print(songs)
 #     for song in songs:
 #         print(f"Has acceptable duration? {p.has_acceptable_durations(song)}")
 #         if p.has_acceptable_durations(song)==True:
