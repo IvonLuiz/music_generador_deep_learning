@@ -1,5 +1,7 @@
 import os
 import music21 as m21
+import json
+
 
 current_path = os.path.dirname(os.path.realpath(__file__))
 DATASET_PATH = current_path + "/../../data/raw/maestro-v3.0.0/2018"
@@ -30,7 +32,7 @@ class ProcessingPipeline():
 
     def run(self, dataset_path, save_path):
         print("Loading songs...")
-        self.load_songs(dataset_path)
+        self.load_songs(dataset_path, file_extension=(".midi", "mid"))
         print(f"Loaded {len(self.songs)} songs.")
 
         for song_idx, song in enumerate(self.songs):
@@ -46,7 +48,9 @@ class ProcessingPipeline():
 
             # save songs to text file
             self.save_song(song_encoded, save_path, song_idx)
-            self.songs[song_idx] = song_encoded 
+            self.songs[song_idx] = song_encoded
+        
+        self.map_symbols(save_path + "\\mapping.json")
 
     
     def save_song(self, song: m21.stream.Score, save_path, name_to_save):
@@ -59,19 +63,19 @@ class ProcessingPipeline():
             fp.write(song)
 
 
-    def load_songs(self, dataset_path):
+    def load_songs(self, dataset_path, file_extension):
         """
         Can handle kern, midi, musicXML files
         """
         for path, subdir, files in os.walk(dataset_path):
             for file in files:
-                if file.endswith(('.midi', '.mid')):
+                if file.endswith(file_extension):
                     print(file)
                     song = m21.converter.parse(os.path.join(path, file))
                     truncated_song = song.measures(0, 16)
                     self.songs.append(truncated_song)
                     
-                    if (len(self.songs) > 3):
+                    if (len(self.songs) > 0):
                         break
     
 
@@ -100,8 +104,8 @@ class ProcessingPipeline():
     def __encode_song(self, song: m21.stream.Score, time_step):
         
         encoded_song_melody = []
-        encoded_song_chords = []
-
+        # parts = m21.instrument.partitionByInstrument(song)
+        
         for element in song.flatten().notesAndRests:
             # Check if is a note or chord or rest
             symbol = None
@@ -109,7 +113,7 @@ class ProcessingPipeline():
             if isinstance(element, m21.note.Note):
                 symbol = element.pitch.midi
             elif isinstance(element, m21.chord.Chord):
-                encoded_song_chords.append(element.normalOrder)
+                symbol = '.'.join(str(n) for n in element.normalOrder)
             elif isinstance(element, m21.note.Rest):
                 symbol = "r"
 
@@ -120,14 +124,30 @@ class ProcessingPipeline():
                     continue
                 encoded_song_melody.append("_")
 
-        print(encoded_song_chords)
         encoded_song_melody = " ".join(map(str, encoded_song_melody))
         return encoded_song_melody 
 
-        
-        
 
+    def map_symbols(self, mapping_path):
+        """
+        Creates a json file that maps the symbols in the song dataset onto integers
+        """
+        mappings = {}
 
+        # Identify vocabulary
+        songs_splited = self.songs
+        vocabulary = list(set(songs_splited))
+
+        # Create mappings
+        for i, symbol in enumerate(vocabulary):
+            mappings[symbol] = i
+        
+        # Save vocabulary to a json file
+        with open(mapping_path, "w") as fp:
+            json.dump(mappings, fp, indent=4)
+
+        print(mappings)
+        self.map = mappings          
 
     def get_songs(self):
         return self.songs
@@ -146,7 +166,7 @@ if __name__ == "__main__":
 
     songs = p.get_songs()
     song = songs[0]
-    print(song)
+    # print(song)
 #     for song in songs:
 #         print(f"Has acceptable duration? {p.has_acceptable_durations(song)}")
 #         if p.has_acceptable_durations(song)==True:
