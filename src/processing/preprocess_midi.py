@@ -75,7 +75,7 @@ class ProcessingPipeline():
                     truncated_song = song.measures(0, 16)
                     self.songs.append(truncated_song)
                     
-                    if (len(self.songs) > 0):
+                    if (len(self.songs) > 1):
                         break
     
 
@@ -135,14 +135,17 @@ class ProcessingPipeline():
         mappings = {}
 
         # Identify vocabulary
-        songs_splited = self.songs
-        vocabulary = list(set(songs_splited))
-
+        songs_splited = [song.split() for song in self.songs]
+        symbols = songs_splited[0]
+        vocabulary = list(set(symbols))
+        vocabulary = sorted(set(item for item in symbols))
+        
         # Create mappings
         for i, symbol in enumerate(vocabulary):
             mappings[symbol] = i
         
         # Save vocabulary to a json file
+        print(mapping_path)
         with open(mapping_path, "w") as fp:
             json.dump(mappings, fp, indent=4)
 
@@ -159,7 +162,7 @@ class ProcessingPipeline():
 
 if __name__ == "__main__":
     p = ProcessingPipeline()
-    p.run(DATASET_PATH, save_path=DATASET_PATH)
+    p.run(DATASET_PATH, save_path=SAVE_PATH)
 #     print(DATASET_PATH)
 #     p.load_songs(DATASET_PATH)
 #     # p.set_acceptable_durations(ACCEPTABLE_DURATIONS)
