@@ -3,8 +3,11 @@ import music21 as m21
 
 current_path = os.path.dirname(os.path.realpath(__file__))
 DATASET_PATH = current_path + "/../../data/raw/maestro-v3.0.0/2018"
+SAVE_PATH = current_path + "\\..\\..\\data\\processed\\maestro\\"
 m21.environment.set('musicxmlPath', 'C:/Program Files/MuseScore 4/bin/MuseScore4.exe')
 m21.environment.set('midiPath', 'C:/Program Files/MuseScore 4/bin/MuseScore4.exe')  # Atualize para o caminho correto do MuseScore
+SEQUENCE_LENGTH = 64
+
 ACCEPTABLE_DURATIONS = [
     0.25,   # sixteenth note 
     0.5,    # eighth note
@@ -22,9 +25,10 @@ class ProcessingPipeline():
     def __init__(self, songs=[], acceptable_durations=[]) -> None:
         self.songs = songs
         self.acceptable_durations = acceptable_durations 
+        self.song_dataset = None
 
 
-    def run(self, dataset_path):
+    def run(self, dataset_path, save_path):
         print("Loading songs...")
         self.load_songs(dataset_path)
         print(f"Loaded {len(self.songs)} songs.")
@@ -41,12 +45,11 @@ class ProcessingPipeline():
             song_encoded = self.__encode_song(song_transposed, time_step=0.25)
 
             # save songs to text file
-            self.save_song(song_encoded, song_idx)
+            self.save_song(song_encoded, save_path, song_idx)
             self.songs[song_idx] = song_encoded 
 
     
-    def save_song(self, song: m21.stream.Score, name_to_save):
-        save_path = current_path + "\\..\\..\\data\\processed\\maestro\\"
+    def save_song(self, song: m21.stream.Score, save_path, name_to_save):
         file_path = os.path.join(save_path, str(name_to_save))
         
         if not os.path.exists(save_path):
@@ -96,26 +99,34 @@ class ProcessingPipeline():
     
     def __encode_song(self, song: m21.stream.Score, time_step):
         
-        encoded_song = []
+        encoded_song_melody = []
+        encoded_song_chords = []
 
-        for event in song.flatten().notesAndRests:
-            # Check if is a note or rest
-            if isinstance(event, m21.note.Note):
-                symbol = event.pitch.midi
+        for element in song.flatten().notesAndRests:
+            # Check if is a note or chord or rest
+            symbol = None
 
-            elif isinstance(event, m21.note.Rest):
+            if isinstance(element, m21.note.Note):
+                symbol = element.pitch.midi
+            elif isinstance(element, m21.chord.Chord):
+                encoded_song_chords.append(element.normalOrder)
+            elif isinstance(element, m21.note.Rest):
                 symbol = "r"
 
-            steps = int(event.duration.quarterLength / time_step)
-            print(steps)
+            steps = int(element.duration.quarterLength / time_step)
             for step in range(steps):
                 if step == 0:
-                    encoded_song.append(symbol)
+                    encoded_song_melody.append(symbol)
                     continue
-                encoded_song.append("_")
+                encoded_song_melody.append("_")
 
-        encoded_song = " ".join(map(str, encoded_song))
-        return encoded_song
+        print(encoded_song_chords)
+        encoded_song_melody = " ".join(map(str, encoded_song_melody))
+        return encoded_song_melody 
+
+        
+        
+
 
 
     def get_songs(self):
@@ -125,16 +136,17 @@ class ProcessingPipeline():
         self.acceptable_durations = durations
 
 
+
 if __name__ == "__main__":
     p = ProcessingPipeline()
-    p.run(DATASET_PATH)
+    p.run(DATASET_PATH, save_path=DATASET_PATH)
 #     print(DATASET_PATH)
 #     p.load_songs(DATASET_PATH)
 #     # p.set_acceptable_durations(ACCEPTABLE_DURATIONS)
 
     songs = p.get_songs()
     song = songs[0]
-    print(songs)
+    print(song)
 #     for song in songs:
 #         print(f"Has acceptable duration? {p.has_acceptable_durations(song)}")
 #         if p.has_acceptable_durations(song)==True:
