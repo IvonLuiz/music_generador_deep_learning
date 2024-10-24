@@ -1,10 +1,13 @@
 import os
+import glob
 import music21 as m21
 import json
-
+import numpy as np
+import pandas as pd
+import pathlib
 
 current_path = os.path.dirname(os.path.realpath(__file__))
-DATASET_PATH = current_path + "/../../data/raw/maestro-v3.0.0/2018"
+DATASET_PATH = current_path + "/../../data/raw/maestro-v3.0.0"
 SAVE_PATH = current_path + "\\..\\..\\data\\processed\\maestro\\"
 m21.environment.set('musicxmlPath', 'C:/Program Files/MuseScore 4/bin/MuseScore4.exe')
 m21.environment.set('midiPath', 'C:/Program Files/MuseScore 4/bin/MuseScore4.exe')  # Atualize para o caminho correto do MuseScore
@@ -26,6 +29,7 @@ class ProcessingPipeline():
 
     def __init__(self, songs=[], acceptable_durations=[]) -> None:
         self.songs = songs
+        self.songs_encoded = []
         self.acceptable_durations = acceptable_durations 
         self.song_dataset = None
 
@@ -48,8 +52,8 @@ class ProcessingPipeline():
 
             # save songs to text file
             self.save_song(song_encoded, save_path, song_idx)
-            self.songs[song_idx] = song_encoded
-        
+            self.songs_encoded.append(song_encoded)
+
         self.map_symbols(save_path + "\\mapping.json")
 
     
@@ -63,7 +67,7 @@ class ProcessingPipeline():
             fp.write(song)
 
 
-    def load_songs(self, dataset_path, file_extension):
+    def load_songs(self, dataset_path, file_extension=".midi"):
         """
         Can handle kern, midi, musicXML files
         """
@@ -102,7 +106,6 @@ class ProcessingPipeline():
         return song_new
     
     def __encode_song(self, song: m21.stream.Score, time_step):
-        
         encoded_song_melody = []
         # parts = m21.instrument.partitionByInstrument(song)
         
@@ -127,6 +130,10 @@ class ProcessingPipeline():
         encoded_song_melody = " ".join(map(str, encoded_song_melody))
         return encoded_song_melody 
 
+    def create_dataset(self):
+        df = pd.DataFrame(self.songs_encoded)
+        return df
+
 
     def map_symbols(self, mapping_path):
         """
@@ -135,7 +142,7 @@ class ProcessingPipeline():
         mappings = {}
 
         # Identify vocabulary
-        songs_splited = [song.split() for song in self.songs]
+        songs_splited = [song.split() for song in self.songs_encoded]
         symbols = songs_splited[0]
         vocabulary = list(set(symbols))
         vocabulary = sorted(set(item for item in symbols))
@@ -152,8 +159,12 @@ class ProcessingPipeline():
         print(mappings)
         self.map = mappings          
 
-    def get_songs(self):
+
+    def get_songs_original(self):
         return self.songs
+
+    def get_songs_dataset(self):
+        return self.songs_encoded
 
     def set_acceptable_durations(self, durations):
         self.acceptable_durations = durations
@@ -163,18 +174,13 @@ class ProcessingPipeline():
 if __name__ == "__main__":
     p = ProcessingPipeline()
     p.run(DATASET_PATH, save_path=SAVE_PATH)
-#     print(DATASET_PATH)
-#     p.load_songs(DATASET_PATH)
 #     # p.set_acceptable_durations(ACCEPTABLE_DURATIONS)
 
-    songs = p.get_songs()
+    df = p.create_dataset()
+    print(df)
+    songs = p.get_songs_original()
+    songs_encoded = p.get_songs_dataset
+    print(songs_encoded)
     song = songs[0]
-    # print(song)
-#     for song in songs:
-#         print(f"Has acceptable duration? {p.has_acceptable_durations(song)}")
-#         if p.has_acceptable_durations(song)==True:
+    print(song)
     # song.show()
-
-# # MIDI-Unprocessed_Recital1-3_MID--AUDIO_02_R1_2018_wav--3.midi
-# # MIDI-Unprocessed_Recital1-3_MID--AUDIO_02_R1_2018_wav--4.midi
-# # MIDI-Unprocessed_Recital1-3_MID--AUDIO_03_R1_2018_wav--1.midi
