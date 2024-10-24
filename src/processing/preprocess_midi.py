@@ -32,11 +32,12 @@ class ProcessingPipeline():
         self.songs_encoded = []
         self.acceptable_durations = acceptable_durations 
         self.song_dataset = None
+        self.mappings = None
 
 
-    def run(self, dataset_path, save_path):
+    def run(self, dataset_path, save_path, num_songs=16):
         print("Loading songs...")
-        self.load_songs(dataset_path, file_extension=(".midi", "mid"))
+        self.load_songs(dataset_path, file_extension=(".midi", "mid"), song_limiter=num_songs)
         print(f"Loaded {len(self.songs)} songs.")
 
         for song_idx, song in enumerate(self.songs):
@@ -67,20 +68,21 @@ class ProcessingPipeline():
             fp.write(song)
 
 
-    def load_songs(self, dataset_path, file_extension=".midi"):
+    def load_songs(self, dataset_path, file_extension=(".midi", "mid"), measures_limiter=16, song_limiter=None):
         """
         Can handle kern, midi, musicXML files
         """
         for path, subdir, files in os.walk(dataset_path):
             for file in files:
+                
+                if (len(self.songs) >= song_limiter):
+                    break
+
                 if file.endswith(file_extension):
                     print(file)
                     song = m21.converter.parse(os.path.join(path, file))
-                    truncated_song = song.measures(0, 16)
+                    truncated_song = song.measures(0, measures_limiter) # Limit amount of measures per song
                     self.songs.append(truncated_song)
-                    
-                    if (len(self.songs) > 1):
-                        break
     
 
     def __has_acceptable_durations(self, song: m21.stream.Score):
@@ -134,7 +136,6 @@ class ProcessingPipeline():
         df = pd.DataFrame(self.songs_encoded)
         return df
 
-
     def map_symbols(self, mapping_path):
         """
         Creates a json file that maps the symbols in the song dataset onto integers
@@ -143,21 +144,24 @@ class ProcessingPipeline():
 
         # Identify vocabulary
         songs_splited = [song.split() for song in self.songs_encoded]
-        symbols = songs_splited[0]
-        vocabulary = list(set(symbols))
-        vocabulary = sorted(set(item for item in symbols))
+        all_symbols = []
+        for song in songs_splited:
+            all_symbols.extend(song)
+        
+        vocabulary = list(set(all_symbols))
+        vocabulary = sorted(set(item for item in all_symbols))
         
         # Create mappings
         for i, symbol in enumerate(vocabulary):
+            print(symbol)
             mappings[symbol] = i
         
         # Save vocabulary to a json file
-        print(mapping_path)
         with open(mapping_path, "w") as fp:
             json.dump(mappings, fp, indent=4)
 
-        print(mappings)
-        self.map = mappings          
+        print(f"Mappings of notes:\n {mappings}")
+        self.mappings = mappings          
 
 
     def get_songs_original(self):
@@ -173,8 +177,8 @@ class ProcessingPipeline():
 
 if __name__ == "__main__":
     p = ProcessingPipeline()
-    p.run(DATASET_PATH, save_path=SAVE_PATH)
-#     # p.set_acceptable_durations(ACCEPTABLE_DURATIONS)
+    p.run(DATASET_PATH, save_path=SAVE_PATH, num_songs=3)
+    # p.set_acceptable_durations(ACCEPTABLE_DURATIONS)
 
     df = p.create_dataset()
     print(df)
@@ -182,5 +186,6 @@ if __name__ == "__main__":
     songs_encoded = p.get_songs_dataset
     print(songs_encoded)
     song = songs[0]
-    print(song)
+    # print(song)
+    
     # song.show()
