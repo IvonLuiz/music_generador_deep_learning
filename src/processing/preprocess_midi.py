@@ -136,6 +136,17 @@ class ProcessingPipeline():
         df = pd.DataFrame(self.songs_encoded)
         return df
 
+    def get_songs_as_int(self):
+        int_songs = []
+        for song in self.songs_encoded:
+            song = song.split()
+            print(song)
+            for symbol in song:
+                print(symbol)
+                int_songs.append(self.mappings[symbol])
+
+        return int_songs
+
     def map_symbols(self, mapping_path):
         """
         Creates a json file that maps the symbols in the song dataset onto integers
