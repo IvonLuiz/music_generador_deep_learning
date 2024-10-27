@@ -1,0 +1,6 @@
+The models were trained using the maestro dataset. It can be found and dowloaded on: http://g.co/magenta/maestro-dataset. 
+To reproduce the results, one must only extract the files on this directory.
+
+It was used the V3.0.0 version. Some models used the .wav (encoders) and others the midi files (lstm).
+
+
