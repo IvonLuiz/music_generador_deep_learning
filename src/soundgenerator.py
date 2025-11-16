@@ -1,6 +1,6 @@
 import librosa
 
-from processing.preprocess import MinMaxNormalizer
+from processing.preprocess_audio import MinMaxNormalizer
 
 HOP_LENGTH = 256
 MIN_MAX_VALUES_PATH = "./data/fsdd/min_max_values.pkl"
