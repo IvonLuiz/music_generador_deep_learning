@@ -35,9 +35,9 @@ class ProcessingPipeline():
         self.mappings = None
 
 
-    def run(self, dataset_path, save_path, num_songs=16):
+    def run(self, dataset_path, save_path, num_songs=16, num_measures=3):
         print("Loading songs...")
-        self.load_songs(dataset_path, file_extension=(".midi", "mid"), song_limiter=num_songs)
+        self.load_songs(dataset_path, file_extension=(".midi", "mid"), song_limiter=num_songs, measures_limiter=num_measures)
         print(f"Loaded {len(self.songs)} songs.")
 
         for song_idx, song in enumerate(self.songs):
@@ -138,14 +138,46 @@ class ProcessingPipeline():
 
     def get_songs_as_int(self):
         int_songs = []
+
         for song in self.songs_encoded:
             song = song.split()
-            print(song)
+            int_song = []
             for symbol in song:
-                print(symbol)
-                int_songs.append(self.mappings[symbol])
+                int_song.append(self.mappings[symbol])
+            int_songs.append(int_song)
 
         return int_songs
+
+    def generating_training_sequences(self, sequence_length):
+        int_songs = self.get_songs_as_int()
+        print(int_songs)
+        inputs = []
+        targets = []
+        print()
+        # Generate training sequences
+        for int_song in int_songs:
+            num_sequences = len(int_song) - sequence_length -1
+            print(len(int_song))
+            print(num_sequences)
+            sequence_inputs = []
+            sequence_targets = []
+            for i in range(num_sequences):
+                sequence_inputs.append(int_song[i:i+sequence_length])
+                sequence_targets.append(int_song[i+sequence_length])
+            print(f"sequence {int_song}")
+            print(sequence_inputs)
+            inputs.append(sequence_inputs)
+            targets.append(sequence_targets)
+        
+        print("sequence")
+        print(inputs)
+        print(targets)
+        print(pd.DataFrame(inputs))
+        print(pd.DataFrame(targets))
+        # One-hot encode the sequences
+
+
+        pass
 
     def map_symbols(self, mapping_path):
         """
@@ -164,7 +196,6 @@ class ProcessingPipeline():
         
         # Create mappings
         for i, symbol in enumerate(vocabulary):
-            print(symbol)
             mappings[symbol] = i
         
         # Save vocabulary to a json file
@@ -172,7 +203,7 @@ class ProcessingPipeline():
             json.dump(mappings, fp, indent=4)
 
         print(f"Mappings of notes:\n {mappings}")
-        self.mappings = mappings          
+        self.mappings = mappings
 
 
     def get_songs_original(self):
@@ -188,15 +219,15 @@ class ProcessingPipeline():
 
 if __name__ == "__main__":
     p = ProcessingPipeline()
-    p.run(DATASET_PATH, save_path=SAVE_PATH, num_songs=3)
+    p.run(DATASET_PATH, save_path=SAVE_PATH, num_songs=3, num_measures=16)
     # p.set_acceptable_durations(ACCEPTABLE_DURATIONS)
 
-    df = p.create_dataset()
-    print(df)
+    # df = p.create_dataset()
+    # print(df)
     songs = p.get_songs_original()
-    songs_encoded = p.get_songs_dataset
-    print(songs_encoded)
+    # songs_encoded = p.get_songs_dataset
+    # print(songs_encoded)
     song = songs[0]
     # print(song)
-    
+    p.generating_training_sequences(10)
     # song.show()
