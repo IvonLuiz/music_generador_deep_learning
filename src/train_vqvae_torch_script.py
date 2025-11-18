@@ -1,9 +1,12 @@
+import datetime
 import torch
 import os
 
 from modeling.torch.vq_vae import VQ_VAE
 from modeling.torch.train_vq import *
 from generate import *
+from utils import load_maestro
+from processing.preprocess_audio import TARGET_TIME_FRAMES
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -21,58 +24,48 @@ if torch.cuda.is_available():
 # Variables
 SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro_spectrograms"
 SPECTROGRAMS_PATH = "./data/processed/maestro_spectrograms"
-MODEL_PATH = "./model/vq_vae_maestro2011/model.pth"
+MODEL_PATH = "./model/vq_vae_maestro2011"
 
 LEARNING_RATE = 1e-5
 BATCH_SIZE = 16  # this may need to be small due to memory constraints
 EPOCHS = 1000
+current_datetime = datetime.now()
+formatted_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 
+x_train, _ = load_maestro(SPECTROGRAMS_PATH, TARGET_TIME_FRAMES)
+print("Input shape: ", x_train.shape)
 
-def load_maestro(path):
-    x_train = []
-    file_paths = []
-    print("Loading spectrograms from:", path)
-    for root, _, file_names in os.walk(path):
-        print(root)
-        for file_name in file_names:
-            if file_name.endswith(".npy"):
-                file_path = os.path.join(root, file_name)
-                spectrogram = np.load(file_path) # (n_bins, n_frames, 1)
-                x_train.append(spectrogram)
-                file_paths.append(file_path)
-    
-    x_train = np.array(x_train)
-    x_train = x_train[..., np.newaxis] # -> (3000, 256, 64, 1)
+# Fix normalization - your preprocessing already normalizes to [0,1]
+data_variance = np.var(x_train)  # Remove the /255.0 division
+print(f"Data variance: {data_variance}")
 
-    return x_train, file_paths
+# Get the actual time dimension from your data
+time_frames = x_train.shape[2]
+print(f"Time frames detected: {time_frames}")
 
-x_train, _ = load_maestro(SPECTROGRAMS_PATH)
-print(x_train.shape)
-
-data_variance = np.var(x_train / 255.0)
-
-# Define VQ-VAE model
+# Define VQ-VAE model with actual dimensions
+# For 257 time frames, we need strides that work well with this dimension
 VQVAE = VQ_VAE(
-    input_shape=(256, x_train.shape[2], 1),
+    input_shape=(256, time_frames, 1),
     conv_filters=(256, 128, 64, 32),
     conv_kernels=(3, 3, 3, 3),
-    conv_strides=(2, 2, 2, (2, 1)),
-    #data_variance=data_variance,
+    conv_strides=((2, 2), (2, 2), (2, 2), (2, 1)),
     embeddings_size=256,    # K
     latent_space_dim=256    # D
 )
 
-# run_options = tf.compat.v1.RunOptions(report_tensor_allocations_upon_oom=True)
 # Train the model using the train_model function (with AMP to save memory)
+model_path = f"{MODEL_PATH}_{formatted_time}/model.pth"
 train_model(
     VQVAE,
     x_train,
     batch_size=BATCH_SIZE,
     epochs=EPOCHS,
     learning_rate=LEARNING_RATE,
-    data_variance=data_variance,
+    data_variance=float(data_variance),
     save_path=MODEL_PATH,
     amp=True,
     grad_accum_steps=1,
     max_grad_norm=None,
 )
+print("Model training complete. Model saved to:", MODEL_PATH)
