@@ -74,7 +74,7 @@ class VQ_VAE(nn.Module):
                  beta: float = 0.25):
         super().__init__()
         H, W, C = input_shape
-        assert C == 1, "Expected single-channel input (spectrogram)."
+        assert C == 1, "Expected single-channel for audio input (spectrogram)."
 
         self.encoder = Encoder(
             in_channels=C,

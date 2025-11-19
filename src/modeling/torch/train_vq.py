@@ -6,7 +6,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp.grad_scaler import GradScaler
+from torch.amp.autocast_mode import autocast
 
 from .vq_vae import VQ_VAE, vqvae_loss
 
@@ -154,7 +155,7 @@ def train_model(model: VQ_VAE,
         optimizer.zero_grad(set_to_none=True)
         for step, specs in enumerate(dl, start=1):
             specs = specs.to(device, non_blocking=True)
-            with autocast(enabled=scaler.is_enabled()):
+            with autocast(device_type=device.type, enabled=scaler.is_enabled()):
                 x_hat, _z, vq_loss = model(specs)
                 loss_full = vqvae_loss(specs, x_hat, vq_loss, variance=max(data_variance, 1e-6))
                 loss = loss_full / grad_accum_steps
