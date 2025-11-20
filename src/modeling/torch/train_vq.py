@@ -3,6 +3,7 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple, Optional
+from tqdm import tqdm
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -66,9 +67,10 @@ def train_vqvae(x_train: np.ndarray,
         model.train()
         running = 0.0
         optimizer.zero_grad(set_to_none=True)
-        for step, specs in enumerate(dl, start=1):
+        progress_bar = tqdm(dl, desc=f"Epoch {epoch:03d}/{epochs}")
+        for step, specs in enumerate(progress_bar, start=1):
             specs = specs.to(device, non_blocking=True)
-            with autocast(enabled=scaler.is_enabled()):
+            with autocast(device_type=device.type, enabled=scaler.is_enabled()):
                 x_hat, _z, vq_loss = model(specs)
                 loss_full = vqvae_loss(specs, x_hat, vq_loss, variance=max(data_variance, 1e-6))
                 loss = loss_full / grad_accum_steps
@@ -91,6 +93,7 @@ def train_vqvae(x_train: np.ndarray,
                     optimizer.zero_grad(set_to_none=True)
 
             running += loss_full.item() * specs.size(0)
+            progress_bar.set_postfix(loss=loss_full.item())
 
         avg = running / len(ds)
         print(f"Epoch {epoch:03d}/{epochs} - loss: {avg:.6f}")
@@ -157,7 +160,8 @@ def train_model(model: VQ_VAE,
         model.train()
         running = 0.0
         optimizer.zero_grad(set_to_none=True)
-        for step, specs in enumerate(dl, start=1):
+        progress_bar = tqdm(dl, desc=f"Epoch {epoch:03d}/{epochs}")
+        for step, specs in enumerate(progress_bar, start=1):
             specs = specs.to(device, non_blocking=True)
             with autocast(device_type=device.type, enabled=scaler.is_enabled()):
                 x_hat, _z, vq_loss = model(specs)
@@ -182,6 +186,7 @@ def train_model(model: VQ_VAE,
                     optimizer.zero_grad(set_to_none=True)
 
             running += loss_full.item() * specs.size(0)
+            progress_bar.set_postfix(loss=loss_full.item())
         
         avg = running / len(ds)
         train_losses.append(avg)

@@ -22,8 +22,8 @@ if torch.cuda.is_available():
     print("CUDA memory allocated (MB):", round(torch.cuda.memory_allocated(0)/1024**2, 2))
 
 # Variables
-SPECTROGRAMS_PATH = "./data/processed/maestro_spectrograms_test"
-MODEL_PATH = "./models/vq_vae_maestro2011"
+SPECTROGRAMS_PATH = "./data/processed/maestro_spectrograms_test/"
+MODEL_PATH = "./models/vq_vae_maestro2011/"
 
 LEARNING_RATE = 1e-5
 BATCH_SIZE = 16  # this may need to be small due to memory constraints
@@ -39,6 +39,11 @@ print("Data samples length:", x_train.shape[0])
 # Fix normalization - your preprocessing already normalizes to [0,1]
 data_variance = np.var(x_train) # data cines normalized from load_maestro
 print(f"Data variance: {data_variance}")
+
+# Stability fix: If variance is too small, the loss term (MSE / 2*var) becomes huge, causing exploding gradients.
+# We clamp the variance to a safe minimum (e.g. 0.05) or use 1.0 to rely on standard MSE.
+effective_variance = max(float(data_variance), 0.05)
+print(f"Effective variance used for training: {effective_variance}")
 
 # Get the actual time dimension from your data
 time_frames = x_train.shape[2]
@@ -63,10 +68,10 @@ train_model(
     batch_size=BATCH_SIZE,
     epochs=EPOCHS,
     learning_rate=LEARNING_RATE,
-    data_variance=float(data_variance),
+    data_variance=effective_variance,
     save_path=MODEL_PATH,
     amp=True,
     grad_accum_steps=1,
-    max_grad_norm=None,
+    max_grad_norm=1.0, # Add gradient clipping to prevent explosion
 )
 print("Model training complete. Model saved to:", MODEL_PATH)
