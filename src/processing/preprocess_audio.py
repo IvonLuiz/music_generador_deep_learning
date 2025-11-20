@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 
+TARGET_TIME_FRAMES = 256  # Adjust this for desired length
 
 class Loader:
     """
@@ -215,38 +216,154 @@ class PreprocessingPipeline:
     """
 
     def __init__(self, enable_visualization=False):
-        self.padder = None
-        self.extractor = None
-        self.normalizer = None
-        self.saver = None
-        self.visualizer = None
+        self._padder = None
+        self._extractor = None
+        self._normalizer = None
+        self._saver = None
+        self._visualizer = None
+        self._loader = None
         self.enable_visualization = enable_visualization
         self.min_max_values = {}
-        self._loader = None
-        self._num_expected_samples = None
+        self._num_expected_samples = 0 
 
     @property
     def loader(self):
         return self._loader
+    
+    @property
+    def padder(self):
+        return self._padder
+
+    @property
+    def extractor(self):
+        return self._extractor
+
+    @property
+    def normalizer(self):
+        return self._normalizer
+
+    @property
+    def saver(self):
+        return self._saver
+
+    @property
+    def visualizer(self):
+        return self._visualizer
 
     @loader.setter
     def loader(self, loader):
         self._loader = loader
         self._num_expected_samples = int(loader.sample_rate * loader.duration)
 
+    @padder.setter
+    def padder(self, padder):
+        self._padder = padder
+    
+    @extractor.setter
+    def extractor(self, extractor):
+        self._extractor = extractor
+
+    @normalizer.setter
+    def normalizer(self, normalizer):
+        self._normalizer = normalizer
+
+    @saver.setter
+    def saver(self, saver):
+        self._saver = saver
+
+    @visualizer.setter
+    def visualizer(self, visualizer):
+        self._visualizer = visualizer
+
     def process(self, audio_files_dir):
+        """Process all audio files in a directory."""
+        if self.saver is None:
+            print("Error: Saver not set.")
+            return
+
+        total_segments = 0
         for root, _, files in os.walk(audio_files_dir):
             for file in files:
                 if file.endswith(".wav"):
                     file_path = os.path.join(root, file)
-                    self._process_file(file_path)
-                    print(f"Processed file {file_path}")
+                    segments = self._process_file_with_segments(file_path)
+                    total_segments += segments
+                    print(f"Processed {file} -> {segments} segments")
+        print(f"Total segments created: {total_segments}")
         self.saver.save_min_max_values(self.min_max_values)
 
-    def _process_file(self, file_path):
-        signal = self.loader.load(file_path)
-        if self._is_padding_necessary(signal):
+    def _process_file_with_segments(self, file_path):
+        """
+        Process a single audio file by extracting multiple overlapping segments.
+        This maximizes the use of available musical content.
+        """
+        if self.loader is None:
+            print("Error: Loader not set.")
+            return 0
+
+        segments_created = 0
+
+        # Load the full audio file without duration limit
+        full_signal = librosa.load(file_path, sr=self.loader.sample_rate, mono=self.loader.mono)[0]
+            
+        # Calculate segment parameters
+        segment_samples = self._num_expected_samples
+        hop_samples = segment_samples // 2  # 50% overlap between segments
+        
+        # Extract overlapping segments
+        for start_idx in range(0, len(full_signal) - segment_samples + 1, hop_samples):
+
+            # Extract segment
+            signal_segment = full_signal[start_idx:start_idx + segment_samples]
+            
+            # Skip if segment is too short (shouldn't happen with the range, but safety check)
+            if len(signal_segment) < segment_samples:
+                signal_segment = self._apply_padding(signal_segment)
+            
+            # Create unique filename for this segment
+            segment_file_path = f"{file_path}_segment_{segments_created:03d}"
+            # Extract spectrogram features and save
+            feature, norm_feature, segment_file_path = self._extract_spectrogram_segment(signal_segment, segment_file_path)
+    
+            # Optional visualization (only for first few segments to avoid too many images)
+            if (self.enable_visualization and self.visualizer is not None and 
+                segments_created < 3):  # Only visualize first 3 segments per file
+                self.visualizer.save_comparison_image(feature, norm_feature, segment_file_path)
+            
+            segments_created += 1
+        
+        # If no segments were created (file too short), process the whole file with padding
+        if segments_created == 0:
+            segments_created = self._process_single_segment(file_path, full_signal)
+        
+        return segments_created
+
+    def _extract_spectrogram_segment(self, signal_segment, segment_file_path):
+        """Extract spectrogram from a signal segment."""
+        if self.extractor is None or self.normalizer is None or self.saver is None:
+            print("Error: One or more components not set properly.")
+            return None, None, None
+
+        feature = self.extractor.extract(signal_segment)
+        norm_feature = self.normalizer.normalize(feature)
+        # Save 
+        save_path = self.saver.save_feature(norm_feature, segment_file_path)
+        self._store_min_max_value(save_path, feature.min(), feature.max())
+
+        return feature, norm_feature, segment_file_path
+
+    def _process_single_segment(self, file_path, signal):
+        """Process a single segment (used for very short audio files)."""
+        # Early exit if components not set
+        if self.extractor is None or self.normalizer is None or self.saver is None:
+            print("Error: One or more components not set properly.")
+            return 0
+            
+        if len(signal) < self._num_expected_samples:
             signal = self._apply_padding(signal)
+        elif len(signal) > self._num_expected_samples:
+            signal = signal[:self._num_expected_samples]  # Truncate if too long
+            
         feature = self.extractor.extract(signal)
         norm_feature = self.normalizer.normalize(feature)
         save_path = self.saver.save_feature(norm_feature, file_path)
@@ -254,9 +371,10 @@ class PreprocessingPipeline:
         
         # Optional visualization
         if self.enable_visualization and self.visualizer is not None:
-            # Save comparison image (original vs normalized)
             self.visualizer.save_comparison_image(feature, norm_feature, file_path)
             print(f"Saved visualization for {os.path.basename(file_path)}")
+
+        return 1
 
     def _is_padding_necessary(self, signal):
         if len(signal) < self._num_expected_samples:
@@ -264,6 +382,10 @@ class PreprocessingPipeline:
         return False
 
     def _apply_padding(self, signal):
+        if self.padder is None:
+            print("Error: Padder not set.")
+            return signal
+
         num_missing_samples = self._num_expected_samples - len(signal)
         padded_signal = self.padder.right_pad(signal, num_missing_samples)
         return padded_signal
@@ -275,17 +397,19 @@ class PreprocessingPipeline:
         }
 
 if __name__ == "__main__":
-    FRAME_SIZE = 512
-    HOP_LENGTH = 256
-    SAMPLE_RATE = 22050  # Match the sample rate expected by SoundGenerator
-    # Calculate duration for more meaningful music segments
+    SAMPLE_RATE = 22050    # samples per second
+    FRAME_SIZE = 512       # samples for each STFT window
+    HOP_LENGTH = 256       # move amount of samples between windows
+    # Calculate duration for meaningful music segments
     # For 128 time frames: (128 * 256) / 22050 ≈ 1.49 seconds
     # For 256 time frames: (256 * 256) / 22050 ≈ 2.97 seconds  
     # For 512 time frames: (512 * 256) / 22050 ≈ 5.95 seconds
     
-    TARGET_TIME_FRAMES = 256  # Adjust this for desired length
-    DURATION = (TARGET_TIME_FRAMES * 256) / SAMPLE_RATE # ~2.97 seconds for 256 frames
-    print(f"Using {TARGET_TIME_FRAMES} time frames = {DURATION:.2f} seconds")
+    DURATION = (TARGET_TIME_FRAMES * HOP_LENGTH) / SAMPLE_RATE # ~2.97 seconds for 256 frames
+    
+    print(f"Using {TARGET_TIME_FRAMES} time frames = {DURATION:.2f} seconds per segment")
+    print(f"With 50% overlap, a 3-minute song will generate ~{int(180/DURATION*2)} segments!")
+    print(f"Expected spectrogram shape per segment: (256, {TARGET_TIME_FRAMES})")
     
     MONO = True
 
@@ -294,9 +418,9 @@ if __name__ == "__main__":
     # FILES_DIR = "./data/fsdd/audio/"
     
     FILES_DIR = "./data/raw/maestro-v3.0.0/2011"
-    SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro_spectrograms/"
-    MIN_MAX_VALUES_SAVE_DIR = "./data/raw/maestro-v3.0.0/2011/"
-    VISUALIZATION_SAVE_DIR = "./data/visualizations/spectrograms/"
+    SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro_spectrograms_test/"
+    MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_spectrograms_test/min_max_values/"
+    VISUALIZATION_SAVE_DIR = "./data/processed/maestro_spectrograms_test/spectrograms/"
     
     # Enable visualization (set to False to disable)
     ENABLE_VISUALIZATION = True
