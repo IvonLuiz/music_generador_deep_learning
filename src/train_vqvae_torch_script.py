@@ -1,4 +1,4 @@
-import datetime
+from datetime import datetime
 import torch
 import os
 
@@ -22,9 +22,8 @@ if torch.cuda.is_available():
     print("CUDA memory allocated (MB):", round(torch.cuda.memory_allocated(0)/1024**2, 2))
 
 # Variables
-SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro_spectrograms"
-SPECTROGRAMS_PATH = "./data/processed/maestro_spectrograms"
-MODEL_PATH = "./model/vq_vae_maestro2011"
+SPECTROGRAMS_PATH = "./data/processed/maestro_spectrograms_test"
+MODEL_PATH = "./models/vq_vae_maestro2011"
 
 LEARNING_RATE = 1e-5
 BATCH_SIZE = 16  # this may need to be small due to memory constraints
@@ -32,11 +31,13 @@ EPOCHS = 1000
 current_datetime = datetime.now()
 formatted_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 
-x_train, _ = load_maestro(SPECTROGRAMS_PATH, TARGET_TIME_FRAMES)
+x_train, _ = load_maestro(SPECTROGRAMS_PATH, TARGET_TIME_FRAMES, debug_print=False)
 print("Input shape: ", x_train.shape)
+print("Data range:", x_train.min(), "to", x_train.max())
+print("Data samples length:", x_train.shape[0])
 
 # Fix normalization - your preprocessing already normalizes to [0,1]
-data_variance = np.var(x_train)  # Remove the /255.0 division
+data_variance = np.var(x_train) # data cines normalized from load_maestro
 print(f"Data variance: {data_variance}")
 
 # Get the actual time dimension from your data

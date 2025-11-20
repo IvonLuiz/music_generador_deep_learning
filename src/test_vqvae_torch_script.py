@@ -30,7 +30,7 @@ formatted_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 
 SPECTROGRAMS_SAVE_DIR = "data/processed/maestro_spectrograms/"
 SPECTROGRAMS_PATH = "data/processed/maestro_spectrograms/"
-MODEL_PATH = "../model/vq_vae_maestro2011/model.pth"
+MODEL_PATH = "./models/vq_vae_maestro2011/model.pth"
 
 MIN_MAX_VALUES_SAVE_DIR = "data/raw/maestro-v3.0.0/2011/min_max_values.pkl"
 MIN_MAX_VALUES_PATH = "data/raw/maestro-v3.0.0/2011/min_max_values.pkl"
@@ -39,7 +39,8 @@ SAVE_DIR = f"samples/vq_vae_maestro2011/{formatted_time}/"
 
 x_train, _ = load_maestro(SPECTROGRAMS_PATH, TARGET_TIME_FRAMES)
 print(x_train.shape)
-data_variance = np.var(x_train / 255.0)
+print("Data range:", x_train.min(), "to", x_train.max())
+data_variance = np.var(x_train)
 
 VQVAE = VQ_VAE(
     input_shape=(256, x_train.shape[2], 1),
@@ -85,7 +86,7 @@ sampled_paths = [file_paths[i] for i in indexes]
 
 sampled_min_max_values = []
 for p in sampled_paths:
-    mm = find_min_max_for_path(p, min_max_values)
+    mm = find_min_max_for_path(p, min_max_values, SPECTROGRAMS_PATH)
     if mm is None:
         print(f"Warning: no min/max for {p}; using default")
         mm = {"min": -80.0, "max": 0.0}

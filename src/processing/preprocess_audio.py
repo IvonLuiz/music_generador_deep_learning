@@ -61,7 +61,7 @@ class LogSpectrogramExtractor:
     def extract(self, signal):
         stft = librosa.stft(signal,
                             n_fft=self.frame_size,
-                            hop_length=self.hop_length)[:-1]
+                            hop_length=self.hop_length)[:-1]  # Slice to remove Nyquist bin (257 -> 256) for power-of-2 height
         spectrogram = np.abs(stft)
         log_spectrogram = librosa.amplitude_to_db(spectrogram)
         return log_spectrogram
