@@ -31,25 +31,23 @@ class SpectrogramDataset(Dataset):
 
 
 def train_vqvae(x_train: np.ndarray,
-                       input_shape: Tuple[int, int, int],
-                       conv_filters=(256, 128, 64, 32),
-                       conv_kernels=(3, 3, 3, 3),
-                       conv_strides=((2, 2), (2, 2), (2, 2), (2, 1)),
-                       embeddings_size=256,
-                       latent_space_dim=128,
-                       learning_rate=5e-4,
-                       batch_size=64,
-                       epochs=50,
-                       data_variance: float = 1.0,
-                       save_path: Optional[str] = None,
-                       amp: bool = True,
-                       grad_accum_steps: int = 1,
-                       max_grad_norm: Optional[float] = None):
+                input_shape: Tuple[int, int, int],
+                conv_filters=(256, 128, 64, 32),
+                conv_kernels=(3, 3, 3, 3),
+                conv_strides=((2, 2), (2, 2), (2, 2), (2, 1)),
+                embeddings_size=256,
+                latent_space_dim=128,
+                learning_rate=5e-4,
+                batch_size=64,
+                epochs=50,
+                data_variance: float = 1.0,
+                save_path: Optional[str] = None,
+                amp: bool = True,
+                grad_accum_steps: int = 1,
+                max_grad_norm: Optional[float] = None):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ds = SpectrogramDataset(x_train)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
-
+    
     model = VQ_VAE(
         input_shape=input_shape,
         conv_filters=conv_filters,
@@ -58,64 +56,29 @@ def train_vqvae(x_train: np.ndarray,
         latent_space_dim=latent_space_dim,
         embeddings_size=embeddings_size,
     ).to(device)
+    
+    config = {
+        'input_shape': input_shape,
+        'conv_filters': conv_filters,
+        'conv_kernels': conv_kernels,
+        'conv_strides': conv_strides,
+        'latent_space_dim': latent_space_dim,
+        'embeddings_size': embeddings_size,
+    }
 
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    torch.backends.cudnn.benchmark = True
-    scaler = GradScaler(enabled=(amp and device.type == 'cuda'))
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        running = 0.0
-        optimizer.zero_grad(set_to_none=True)
-        progress_bar = tqdm(dl, desc=f"Epoch {epoch:03d}/{epochs}")
-        for step, specs in enumerate(progress_bar, start=1):
-            specs = specs.to(device, non_blocking=True)
-            with autocast(device_type=device.type, enabled=scaler.is_enabled()):
-                x_hat, _z, vq_loss = model(specs)
-                loss_full = vqvae_loss(specs, x_hat, vq_loss, variance=max(data_variance, 1e-6))
-                loss = loss_full / grad_accum_steps
-
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                if step % grad_accum_steps == 0:
-                    if max_grad_norm is not None:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
-            else:
-                loss.backward()
-                if step % grad_accum_steps == 0:
-                    if max_grad_norm is not None:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-
-            running += loss_full.item() * specs.size(0)
-            progress_bar.set_postfix(loss=loss_full.item())
-
-        avg = running / len(ds)
-        print(f"Epoch {epoch:03d}/{epochs} - loss: {avg:.6f}")
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        torch.save({
-            'model_state': model.state_dict(),
-            'config': {
-                'input_shape': input_shape,
-                'conv_filters': conv_filters,
-                'conv_kernels': conv_kernels,
-                'conv_strides': conv_strides,
-                'latent_space_dim': latent_space_dim,
-                'embeddings_size': embeddings_size,
-            }
-        }, save_path)
-        print(f"Saved model to {save_path}")
-
-    return model
+    return train_model(
+        model=model,
+        x_train=x_train,
+        batch_size=batch_size,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        data_variance=data_variance,
+        save_path=save_path,
+        amp=amp,
+        grad_accum_steps=grad_accum_steps,
+        max_grad_norm=max_grad_norm,
+        model_config=config
+    )
 
 def train_model(model: VQ_VAE,
                 x_train: np.ndarray,
@@ -126,7 +89,8 @@ def train_model(model: VQ_VAE,
                 save_path: Optional[str] = None,
                 amp: bool = True,
                 grad_accum_steps: int = 1,
-                max_grad_norm: Optional[float] = None):
+                max_grad_norm: Optional[float] = None,
+                model_config: Optional[dict] = None):
     """
     Train an existing VQ-VAE model.
     
@@ -138,6 +102,7 @@ def train_model(model: VQ_VAE,
         learning_rate: Learning rate for Adam optimizer
         data_variance: Data variance for loss calculation
         save_path: Optional path to save the model after training
+        model_config: Optional dictionary with model configuration to save
     
     Returns:
         The trained model
@@ -198,9 +163,13 @@ def train_model(model: VQ_VAE,
         if save_path:
             # Save model checkpoint
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            torch.save({
+            save_dict = {
                 'model_state': model.state_dict(),
-            }, save_path)
+            }
+            if model_config:
+                save_dict['config'] = model_config
+            
+            torch.save(save_dict, save_path)
             plot_training_loss(train_losses, save_path=save_path)
 
     return model
