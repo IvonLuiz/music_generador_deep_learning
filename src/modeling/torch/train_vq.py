@@ -1,8 +1,9 @@
 import os
 import math
+import numpy as np
+import matplotlib.pyplot as plt
 from typing import Tuple, Optional
 
-import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
@@ -149,6 +150,9 @@ def train_model(model: VQ_VAE,
     torch.backends.cudnn.benchmark = True
     scaler = GradScaler(enabled=(amp and device.type == 'cuda'))
 
+    train_losses = []
+    print("Model will be saved to :", save_path) if save_path else None
+
     for epoch in range(1, epochs + 1):
         model.train()
         running = 0.0
@@ -178,21 +182,39 @@ def train_model(model: VQ_VAE,
                     optimizer.zero_grad(set_to_none=True)
 
             running += loss_full.item() * specs.size(0)
-
+        
         avg = running / len(ds)
+        train_losses.append(avg)
         print(f"Epoch {epoch:03d}/{epochs} - loss: {avg:.6f}")
+
         if device.type == 'cuda':
             torch.cuda.empty_cache()
-
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        torch.save({
-            'model_state': model.state_dict(),
-        }, save_path)
-        print(f"Saved model to {save_path}")
+        
+        if save_path:
+            # Save model checkpoint
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            torch.save({
+                'model_state': model.state_dict(),
+            }, save_path)
+            plot_training_loss(train_losses, save_path=save_path)
 
     return model
 
+def plot_training_loss(loss_values, save_path: Optional[str] = None):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True) if save_path else None
+    save_file_path = os.path.join(os.path.dirname(save_path), 'training_loss.png') if save_path else None
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(loss_values, label='Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss over Epochs')
+    plt.legend()
+    if save_path:
+        plt.savefig(save_file_path)
+    else:
+        plt.show()
+    plt.close()
 
 def load_fsdd(path, add_channel_axis=True):
     """
