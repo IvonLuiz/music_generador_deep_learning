@@ -7,6 +7,9 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 
 TARGET_TIME_FRAMES = 256  # Adjust this for desired length
+SAMPLE_RATE = 22050    # samples per second
+FRAME_SIZE = 512       # samples for each STFT window
+HOP_LENGTH = 256       # move amount of samples between windows
 
 class Loader:
     """
@@ -397,9 +400,6 @@ class PreprocessingPipeline:
         }
 
 if __name__ == "__main__":
-    SAMPLE_RATE = 22050    # samples per second
-    FRAME_SIZE = 512       # samples for each STFT window
-    HOP_LENGTH = 256       # move amount of samples between windows
     # Calculate duration for meaningful music segments
     # For 128 time frames: (128 * 256) / 22050 ≈ 1.49 seconds
     # For 256 time frames: (256 * 256) / 22050 ≈ 2.97 seconds  

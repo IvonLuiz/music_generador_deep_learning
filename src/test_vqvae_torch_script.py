@@ -28,22 +28,30 @@ if torch.cuda.is_available():
 current_datetime = datetime.now()
 formatted_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 
-SPECTROGRAMS_SAVE_DIR = "data/processed/maestro_spectrograms/"
-SPECTROGRAMS_PATH = "data/processed/maestro_spectrograms/"
-MODEL_PATH = "./models/vq_vae_maestro2011/model.pth"
+SPECTROGRAMS_PATH = "data/processed/maestro_spectrograms_test/"
+MODEL_PATH = "./models/vq_vae_maestro2011/vq_vae_maestro2011_model.pth"
 
 MIN_MAX_VALUES_SAVE_DIR = "data/raw/maestro-v3.0.0/2011/min_max_values.pkl"
 MIN_MAX_VALUES_PATH = "data/raw/maestro-v3.0.0/2011/min_max_values.pkl"
 
+HOP_LENGTH = 256 # from preprocessing audio
+
 SAVE_DIR = f"samples/vq_vae_maestro2011/{formatted_time}/"
 
-x_train, _ = load_maestro(SPECTROGRAMS_PATH, TARGET_TIME_FRAMES)
-print(x_train.shape)
-print("Data range:", x_train.min(), "to", x_train.max())
-data_variance = np.var(x_train)
+# SPECTROGRAMS_PATH and MIN_MAX_VALUES_SAVE_DIR are set in earlier cells
+print('SPECTROGRAMS_PATH =', SPECTROGRAMS_PATH)
+print('MIN_MAX_VALUES_SAVE_DIR =', MIN_MAX_VALUES_SAVE_DIR)
+
+with open(MIN_MAX_VALUES_SAVE_DIR, 'rb') as f:
+    min_max_values = pickle.load(f)
+
+specs, file_paths = load_maestro(SPECTROGRAMS_PATH, TARGET_TIME_FRAMES)
+print(specs.shape)
+print("Data range:", specs.min(), "to", specs.max())
+data_variance = np.var(specs)
 
 VQVAE = VQ_VAE(
-    input_shape=(256, x_train.shape[2], 1),
+    input_shape=(256, specs.shape[2], 1),
     conv_filters=(256, 128, 64, 32),
     conv_kernels=(3, 3, 3, 3),
     conv_strides=((2, 2), (2, 2), (2, 2), (2, 1)),
@@ -59,23 +67,7 @@ VQVAE.load_state_dict(ckpt['model_state'])
 VQVAE.eval()
 
 ## Generate
-sound_generator = SoundGenerator(VQVAE, 256)
-
-
-# Load spectrograms + min max values
-with open(MIN_MAX_VALUES_PATH, "rb") as f:
-    min_max_values = pickle.load(f)
-specs, file_paths = load_maestro(SPECTROGRAMS_PATH)
-
-# SPECTROGRAMS_PATH and MIN_MAX_VALUES_SAVE_DIR are set in earlier cells
-print('SPECTROGRAMS_PATH =', SPECTROGRAMS_PATH)
-print('MIN_MAX_VALUES_SAVE_DIR =', MIN_MAX_VALUES_SAVE_DIR)
-
-with open(MIN_MAX_VALUES_SAVE_DIR, 'rb') as f:
-    min_max_values = pickle.load(f)
-
-specs, file_paths = load_maestro(SPECTROGRAMS_PATH)
-print('Found', len(specs), 'spectrogram files')
+sound_generator = SoundGenerator(VQVAE, hop_length=HOP_LENGTH)
 
 
 # Sample some spectrograms
