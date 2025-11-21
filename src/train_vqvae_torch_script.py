@@ -23,10 +23,10 @@ if torch.cuda.is_available():
 
 # Variables
 SPECTROGRAMS_PATH = "./data/processed/maestro_spectrograms_test/"
-MODEL_PATH = "./models/vq_vae_maestro2011/"
+MODEL_PATH = "./models/vq_vae_maestro2011/vq_vae_maestro2011_model.pth"
 
 LEARNING_RATE = 1e-5
-BATCH_SIZE = 16  # this may need to be small due to memory constraints
+BATCH_SIZE = 32  # this may need to be small due to memory constraints
 EPOCHS = 1000
 current_datetime = datetime.now()
 formatted_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")

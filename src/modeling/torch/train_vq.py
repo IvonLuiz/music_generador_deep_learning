@@ -7,9 +7,14 @@ from tqdm import tqdm
 
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils import clip_grad_norm_
 import torch.optim as optim
 from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
+
+from processing.preprocess_audio import HOP_LENGTH
+from soundgenerator import SoundGenerator
+import soundfile as sf
 
 from .vq_vae import VQ_VAE, vqvae_loss
 
@@ -118,27 +123,42 @@ def train_model(model: VQ_VAE,
     torch.backends.cudnn.benchmark = True
     scaler = GradScaler(enabled=(amp and device.type == 'cuda'))
 
-    train_losses = []
+    # Track losses for training progress
+    train_losses_dict = {
+        'total': [], 
+        'codebook': [], 'commitment': [],
+        'reconstruction': [], 'vq': []
+    }
+    
     print("Model will be saved to :", save_path) if save_path else None
 
     for epoch in range(1, epochs + 1):
+        generate_and_save_signals(model, x_train[:4],
         model.train()
-        running = 0.0
+        running_loss, running_codebook_loss, running_commitment_loss, running_recon_loss, running_vq_loss = 0.0, 0.0, 0.0, 0.0, 0.0
+        total_samples = 0
         optimizer.zero_grad(set_to_none=True)
+
         progress_bar = tqdm(dl, desc=f"Epoch {epoch:03d}/{epochs}")
         for step, specs in enumerate(progress_bar, start=1):
             specs = specs.to(device, non_blocking=True)
             with autocast(device_type=device.type, enabled=scaler.is_enabled()):
-                x_hat, _z, vq_loss = model(specs)
-                loss_full = vqvae_loss(specs, x_hat, vq_loss, variance=max(data_variance, 1e-6))
+                x_hat, _z, vq_loss, codebook_loss, commitment_loss = model(specs)
+                loss_full, recon_loss, vq_loss_val = vqvae_loss(specs, x_hat, vq_loss, variance=max(data_variance, 1e-6))
                 loss = loss_full / grad_accum_steps
+                
+                # Accumulate individual losses for logging
+                running_codebook_loss += codebook_loss.item() * specs.size(0)
+                running_commitment_loss += commitment_loss.item() * specs.size(0)
+                running_recon_loss += recon_loss.item() * specs.size(0)
+                running_vq_loss += vq_loss_val.item() * specs.size(0)
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 if step % grad_accum_steps == 0:
                     if max_grad_norm is not None:
                         scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        clip_grad_norm_(model.parameters(), max_grad_norm)
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
@@ -146,16 +166,22 @@ def train_model(model: VQ_VAE,
                 loss.backward()
                 if step % grad_accum_steps == 0:
                     if max_grad_norm is not None:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        clip_grad_norm_(model.parameters(), max_grad_norm)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
-            running += loss_full.item() * specs.size(0)
-            progress_bar.set_postfix(loss=loss_full.item())
+            batch_size_current = specs.size(0)
+            running_loss += loss_full.item() * batch_size_current
+            total_samples += batch_size_current
+            progress_bar.set_postfix(loss=running_loss / total_samples)
         
-        avg = running / len(ds)
-        train_losses.append(avg)
-        print(f"Epoch {epoch:03d}/{epochs} - loss: {avg:.6f}")
+        train_losses_dict['total'].append(running_loss)
+        train_losses_dict['codebook'].append(running_codebook_loss)
+        train_losses_dict['commitment'].append(running_commitment_loss)
+        train_losses_dict['reconstruction'].append(running_recon_loss)
+        train_losses_dict['vq'].append(running_vq_loss)
+
+        print(f"Epoch {epoch:03d}/{epochs} - losses: {running_loss:.6f}")
 
         if device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -170,9 +196,44 @@ def train_model(model: VQ_VAE,
                 save_dict['config'] = model_config
             
             torch.save(save_dict, save_path)
-            plot_training_loss(train_losses, save_path=save_path)
+            plot_vqvae_losses(train_losses_dict, save_path=save_path)
 
     return model
+
+def generate_and_save_spectrograms(model: VQ_VAE,
+                              specs: np.ndarray,
+                              min_max_values: list,
+                              save_dir: str,
+                              sample_rate: int = 22050):
+    """Generate spectrograms from one of the audio samples before and after passing through the VQ-VAE and save."""
+    sound_generator = SoundGenerator(model, hop_length=HOP_LENGTH)
+    signals, latents = sound_generator.generate(specs, min_max_values)
+    
+    os.makedirs(save_dir, exist_ok=True)
+    
+    
+
+
+def plot_vqvae_losses(train_losses_dict: dict, save_path: Optional[str] = None):
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True) if save_path else None
+    save_file_path = os.path.join(os.path.dirname(save_path), 'vqvae_losses.png') if save_path else None
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses_dict['total'], label='Total Training Loss')
+    plt.plot(train_losses_dict['vq'], label='VQ Loss')
+    plt.plot(train_losses_dict['reconstruction'], label='Reconstruction Loss')
+    plt.plot(train_losses_dict['codebook'], label='Codebook Loss')
+    plt.plot(train_losses_dict['commitment'], label='Commitment Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('VQ-VAE Loss Components over Epochs')
+    plt.legend()
+    if save_path:
+        plt.savefig(save_file_path)
+    else:
+        plt.show()
+    plt.close()
 
 def plot_training_loss(loss_values, save_path: Optional[str] = None):
     os.makedirs(os.path.dirname(save_path), exist_ok=True) if save_path else None

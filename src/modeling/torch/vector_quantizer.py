@@ -66,4 +66,4 @@ class VectorQuantizer(nn.Module):
         # Reshape indices to (B, H, W)
         indices_map = indices.view(B, H, W)
 
-        return z_q_st, indices_map, vq_loss
+        return z_q_st, indices_map, vq_loss, codebook_loss, commitment_loss

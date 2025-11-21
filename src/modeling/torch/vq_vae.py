@@ -95,18 +95,18 @@ class VQ_VAE(nn.Module):
     def forward(self, x):
         # x: (B, C=1, H, W) in [0,1]
         z_e = self.encoder(x)
-        z_q, indices, vq_loss = self.vq(z_e)
+        z_q, indices, vq_loss, codebook_loss, commitment_loss = self.vq(z_e)
         x_hat = self.decoder(z_q)
-        return x_hat, z_q, vq_loss
+        return x_hat, z_q, vq_loss, codebook_loss, commitment_loss
 
     def reconstruct(self, x):
         self.eval()
         with torch.no_grad():
-            x_hat, z_q, _ = self.forward(x)
+            x_hat, z_q, _vq_loss, _, _ = self.forward(x)
         return x_hat, z_q
 
 
 def vqvae_loss(x, x_hat, vq_loss, variance: float = 1.0):
     # Likelihood term ~ scaled MSE (similar to TF code using data variance)
     recon = F.mse_loss(x_hat, x)
-    return recon / (2 * variance) + vq_loss
+    return recon / (2 * variance) + vq_loss, recon / (2 * variance), vq_loss

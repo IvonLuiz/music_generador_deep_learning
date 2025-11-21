@@ -2,18 +2,10 @@ import librosa
 import numpy as np
 from typing import Any
 
-try:
-    import torch
-    from torch import nn as _nn
-except Exception:
-    torch = None
-    _nn = None
+import torch
+from torch import nn as _nn
 
 from processing.preprocess_audio import MinMaxNormalizer
-
-HOP_LENGTH = 256
-MIN_MAX_VALUES_PATH = "./data/fsdd/min_max_values.pkl"
-
 
 class SoundGenerator:
 
@@ -89,9 +81,9 @@ class SoundGenerator:
         return signals
     
 
-    def __invert_log_spectrogram_to_audio(self, log_spectrogram):
+    def __invert_log_spectrogram_to_audio(self, log_spectrogram, method="griffinlim"):
         """
-        Invert a log-spectrogram back to audio using ISTFT.
+        Invert a log-spectrogram back to audio using Griffin-Lim or ISTFT.
         Args:
             log_spectrogram: 2D numpy array (H, W) in dB scale
         Returns:
@@ -99,8 +91,18 @@ class SoundGenerator:
         """
         # Log spectrogram (dB) to amplitude domain
         amplitude_spectrogram = librosa.db_to_amplitude(log_spectrogram)
-        # STFT to get audio signal
-        audio_signal = librosa.istft(amplitude_spectrogram, hop_length=self.hop_length)
-        # audio_signal = librosa.griffinlim(amplitude_spectrogram, hop_length=self.hop_length)
+        
+        # Pad the spectrogram to restore the Nyquist frequency bin if it was trimmed
+        # STFT produces (n_fft // 2 + 1) bins, which is odd for even n_fft.
+        # If we have an even number of bins (e.g. 256), it means the Nyquist bin was removed.
+        if amplitude_spectrogram.shape[0] % 2 == 0:
+             amplitude_spectrogram = np.pad(amplitude_spectrogram, ((0, 1), (0, 0)), mode='constant')
+
+        if method =='griffinlim':
+            # Use Griffin-Lim for phase estimation to improve audio quality
+            audio_signal = librosa.griffinlim(amplitude_spectrogram, hop_length=self.hop_length)
+        elif method == "istft":
+            # STFT to get audio signal (robotic without phase reconstruction)
+            audio_signal = librosa.istft(amplitude_spectrogram, hop_length=self.hop_length)
         
         return audio_signal
