@@ -1,0 +1,12 @@
+.venv
+# data/raw
+**.npy
+data/fsdd/audio
+data/GTZAN
+# data/processed
+
+data/raw/maestro-v3.0.0/**/**.wav
+data/raw/maestro-v3.0.0/**/**.midi
+
+.midi
+__pycache__
