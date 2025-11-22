@@ -21,13 +21,19 @@ if torch.cuda.is_available():
     print("Capability:", torch.cuda.get_device_capability(0))
     print("CUDA memory allocated (MB):", round(torch.cuda.memory_allocated(0)/1024**2, 2))
 
+# Model parameters
+K = 512  # Number of embeddings
+D = 256  # Latent space dimension
+
 # Variables
 SPECTROGRAMS_PATH = "./data/processed/maestro_spectrograms_test/"
-MODEL_PATH = "./models/vq_vae_maestro2011/vq_vae_maestro2011_model.pth"
+MODEL_PATH = f"./models/vq_vae_maestro2011_K_{K}_D_{D}/vq_vae_maestro2011_model.pth"
 
 LEARNING_RATE = 1e-5
 BATCH_SIZE = 32  # this may need to be small due to memory constraints
 EPOCHS = 1000
+
+
 current_datetime = datetime.now()
 formatted_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -56,8 +62,8 @@ VQVAE = VQ_VAE(
     conv_filters=(256, 128, 64, 32),
     conv_kernels=(3, 3, 3, 3),
     conv_strides=((2, 2), (2, 2), (2, 2), (2, 1)),
-    embeddings_size=256,    # K
-    latent_space_dim=256    # D
+    embeddings_size=K,    # K
+    latent_space_dim=D    # D
 )
 
 # Train the model using the train_model function (with AMP to save memory)

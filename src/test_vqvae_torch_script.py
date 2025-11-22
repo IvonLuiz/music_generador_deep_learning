@@ -10,7 +10,7 @@ from modeling.torch.vq_vae import VQ_VAE
 from modeling.torch.train_vq import *
 from generate import *
 from utils import load_maestro, find_min_max_for_path
-from processing.preprocess_audio import TARGET_TIME_FRAMES
+from processing.preprocess_audio import TARGET_TIME_FRAMES, MIN_MAX_VALUES_SAVE_DIR
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -31,18 +31,16 @@ formatted_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 SPECTROGRAMS_PATH = "data/processed/maestro_spectrograms_test/"
 MODEL_PATH = "./models/vq_vae_maestro2011/vq_vae_maestro2011_model.pth"
 
-MIN_MAX_VALUES_SAVE_DIR = "data/raw/maestro-v3.0.0/2011/min_max_values.pkl"
-MIN_MAX_VALUES_PATH = "data/raw/maestro-v3.0.0/2011/min_max_values.pkl"
+MIN_MAX_VALUES_FILE_PATH = MIN_MAX_VALUES_SAVE_DIR + "min_max_values.pkl"
 
 HOP_LENGTH = 256 # from preprocessing audio
 
 SAVE_DIR = f"samples/vq_vae_maestro2011/{formatted_time}/"
 
-# SPECTROGRAMS_PATH and MIN_MAX_VALUES_SAVE_DIR are set in earlier cells
 print('SPECTROGRAMS_PATH =', SPECTROGRAMS_PATH)
-print('MIN_MAX_VALUES_SAVE_DIR =', MIN_MAX_VALUES_SAVE_DIR)
+print('MIN_MAX_VALUES_FILE_PATH =', MIN_MAX_VALUES_FILE_PATH)
 
-with open(MIN_MAX_VALUES_SAVE_DIR, 'rb') as f:
+with open(MIN_MAX_VALUES_FILE_PATH, 'rb') as f:
     min_max_values = pickle.load(f)
 
 specs, file_paths = load_maestro(SPECTROGRAMS_PATH, TARGET_TIME_FRAMES)
@@ -55,7 +53,6 @@ VQVAE = VQ_VAE(
     conv_filters=(256, 128, 64, 32),
     conv_kernels=(3, 3, 3, 3),
     conv_strides=((2, 2), (2, 2), (2, 2), (2, 1)),
-    #data_variance=data_variance,
     embeddings_size=256,    # K
     latent_space_dim=256    # D
 )
