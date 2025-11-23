@@ -6,7 +6,7 @@ import soundfile as sf
 import torch
 import matplotlib.pyplot as plt
 
-from soundgenerator import SoundGenerator
+from generation.soundgenerator import SoundGenerator
 from modeling.torch.vq_vae import VQ_VAE
 from modeling.torch.train_vq import load_fsdd
 

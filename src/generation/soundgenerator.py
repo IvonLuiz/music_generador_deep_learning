@@ -56,7 +56,7 @@ class SoundGenerator:
         return signals, latent_representations
     
     
-    def convert_spectrograms_to_audio(self, spectrograms, min_max_values):
+    def convert_spectrograms_to_audio(self, spectrograms, min_max_values, method="griffinlim"):
         """
         Convert normalized log-spectrograms to audio signals.
         Args:
@@ -75,7 +75,7 @@ class SoundGenerator:
                 log_spectrogram, min_max_value["min"], min_max_value["max"]
             )
 
-            signal = self.__invert_log_spectrogram_to_audio(denorm_log_spec)
+            signal = self.__invert_log_spectrogram_to_audio(denorm_log_spec, method=method)
             signals.append(signal)
 
         return signals
