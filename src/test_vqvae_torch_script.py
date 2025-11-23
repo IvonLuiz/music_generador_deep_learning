@@ -31,8 +31,9 @@ formatted_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 # Model parameters
 K = 1024  # Number of embeddings
 D = 512  # Latent space dimension
+conv_filters=(64, 128, 256, 512) # Doubled capacity
 SPECTROGRAMS_PATH = "data/processed/maestro_spectrograms_test/"
-MODEL_PATH = f"./models/vq_vae_maestro2011_K_{K}_D_{D}/vq_vae_maestro2011_model.pth"
+MODEL_PATH = f"./models/vq_vae_maestro2011_K_{K}_D_{D}_conv_filters_{conv_filters}/vq_vae_maestro2011_model.pth"
 
 MIN_MAX_VALUES_FILE_PATH = MIN_MAX_VALUES_SAVE_DIR + "min_max_values.pkl"
 
@@ -53,7 +54,7 @@ data_variance = np.var(specs)
 
 VQVAE = VQ_VAE(
     input_shape=(256, specs.shape[2], 1),
-    conv_filters=(32, 64, 128, 256),
+    conv_filters=conv_filters,
     conv_kernels=(3, 3, 3, 3),
     conv_strides=((2, 2), (2, 2), (2, 2), (2, 1)),
     embeddings_size=K,    # K
@@ -72,6 +73,7 @@ sound_generator = SoundGenerator(VQVAE, hop_length=HOP_LENGTH)
 
 
 # Sample some spectrograms
+np.random.seed(42)
 num_samples = min(5, len(specs))
 indexes = np.random.choice(range(len(specs)), num_samples, replace=False)
 sampled_specs = specs[indexes]

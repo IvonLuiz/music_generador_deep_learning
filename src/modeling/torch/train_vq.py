@@ -148,14 +148,14 @@ def train_model(model: VQ_VAE,
             specs = specs.to(device, non_blocking=True)
             with autocast(device_type=device.type, enabled=scaler.is_enabled()):
                 x_hat, _z, vq_loss, codebook_loss, commitment_loss = model(specs)
-                loss_full, recon_loss, vq_loss_val = vqvae_loss(specs, x_hat, vq_loss, variance=max(data_variance, 1e-6))
+                loss_full, recon_loss  = vqvae_loss(specs, x_hat, vq_loss, variance=max(data_variance, 1e-6))
                 loss = loss_full / grad_accum_steps
                 
                 # Accumulate individual losses for logging
                 running_codebook_loss += codebook_loss.item() * specs.size(0)
                 running_commitment_loss += commitment_loss.item() * specs.size(0)
                 running_recon_loss += recon_loss.item() * specs.size(0)
-                running_vq_loss += vq_loss_val.item() * specs.size(0)
+                running_vq_loss += vq_loss.item() * specs.size(0)
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -308,7 +308,7 @@ def save_spectrogram_comparisons(original_specs, min_max_values, sound_generator
         
         # Add shape information to the title
         shape_info = f'Orig: {denorm_orig.shape}, Recon: {denorm_recon.shape}'
-        fig.suptitle(f'MSE: {mse:.3f} dB², MAE: {mae:.3f} dB | {shape_info}', fontsize=10)
+        fig.suptitle(f'MSE: {mse:.6f} dB², MAE: {mae:.6f} dB | {shape_info}', fontsize=10)
         
         plt.tight_layout()
         

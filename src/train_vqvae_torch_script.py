@@ -25,14 +25,15 @@ if torch.cuda.is_available():
 K = 1024  # Number of embeddings
 D = 512  # Latent space dimension
 conv_filters=(32, 64, 128, 256)
+conv_filters=(64, 128, 256, 512) # Doubled capacity
 
 # Variables
 SPECTROGRAMS_PATH = "./data/processed/maestro_spectrograms_test/"
 MODEL_PATH = f"./models/vq_vae_maestro2011_K_{K}_D_{D}_conv_filters_{conv_filters}/vq_vae_maestro2011_model.pth"
 
-LEARNING_RATE = 2e-4
-BATCH_SIZE = 64  # this may need to be small due to memory constraints
-EPOCHS = 300
+LEARNING_RATE = 1e-4
+BATCH_SIZE = 50  # this may need to be small due to memory constraints
+EPOCHS = 100
 
 
 current_datetime = datetime.now()

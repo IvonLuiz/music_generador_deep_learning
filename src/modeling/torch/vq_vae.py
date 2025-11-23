@@ -116,6 +116,6 @@ class VQ_VAE(nn.Module):
 
 
 def vqvae_loss(x, x_hat, vq_loss, variance: float = 1.0):
-    # Likelihood term ~ scaled MSE (similar to TF code using data variance)
-    recon = F.mse_loss(x_hat, x)
-    return recon / (2 * variance) + vq_loss, recon / (2 * variance), vq_loss
+    # Likelihood term ~ scaled MSE
+    recon = F.mse_loss(x_hat, x) / (2 * variance)
+    return recon + vq_loss, recon
