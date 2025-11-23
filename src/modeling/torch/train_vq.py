@@ -13,7 +13,7 @@ from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
 
 from processing.preprocess_audio import HOP_LENGTH
-from soundgenerator import SoundGenerator
+from generation.soundgenerator import SoundGenerator
 import soundfile as sf
 
 from .vq_vae import VQ_VAE, vqvae_loss
@@ -124,7 +124,7 @@ def train_model(model: VQ_VAE,
     ds = SpectrogramDataset(x_train)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     torch.backends.cudnn.benchmark = True
     scaler = GradScaler(enabled=(amp and device.type == 'cuda'))
 
@@ -296,7 +296,7 @@ def save_spectrogram_comparisons(original_specs, min_max_values, sound_generator
         
         # Difference (reconstruction error)
         diff = np.abs(denorm_orig_cropped - denorm_recon_cropped)
-        im3 = axes[2].imshow(diff, aspect='auto', origin='lower', cmap='hot')
+        im3 = axes[2].imshow(diff, aspect='auto', origin='lower', cmap='hot', vmin=0, vmax=1)
         axes[2].set_title(f'Reconstruction Error\n(Sample {i+1})\n(Cropped to {min_time_frames} frames)')
         axes[2].set_xlabel('Time Frames')
         axes[2].set_ylabel('Frequency Bins')

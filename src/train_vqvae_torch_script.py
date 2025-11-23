@@ -4,7 +4,7 @@ import os
 
 from modeling.torch.vq_vae import VQ_VAE
 from modeling.torch.train_vq import *
-from generate import *
+from generation.generate import *
 from utils import load_maestro
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
@@ -22,16 +22,17 @@ if torch.cuda.is_available():
     print("CUDA memory allocated (MB):", round(torch.cuda.memory_allocated(0)/1024**2, 2))
 
 # Model parameters
-K = 512  # Number of embeddings
-D = 256  # Latent space dimension
+K = 1024  # Number of embeddings
+D = 512  # Latent space dimension
+conv_filters=(32, 64, 128, 256)
 
 # Variables
 SPECTROGRAMS_PATH = "./data/processed/maestro_spectrograms_test/"
-MODEL_PATH = f"./models/vq_vae_maestro2011_K_{K}_D_{D}/vq_vae_maestro2011_model.pth"
+MODEL_PATH = f"./models/vq_vae_maestro2011_K_{K}_D_{D}_conv_filters_{conv_filters}/vq_vae_maestro2011_model.pth"
 
-LEARNING_RATE = 1e-5
-BATCH_SIZE = 32  # this may need to be small due to memory constraints
-EPOCHS = 1000
+LEARNING_RATE = 2e-4
+BATCH_SIZE = 64  # this may need to be small due to memory constraints
+EPOCHS = 300
 
 
 current_datetime = datetime.now()
@@ -59,11 +60,12 @@ print(f"Time frames detected: {time_frames}")
 # For 257 time frames, we need strides that work well with this dimension
 VQVAE = VQ_VAE(
     input_shape=(256, time_frames, 1),
-    conv_filters=(256, 128, 64, 32),
+    conv_filters=conv_filters,
     conv_kernels=(3, 3, 3, 3),
     conv_strides=((2, 2), (2, 2), (2, 2), (2, 1)),
     embeddings_size=K,    # K
-    latent_space_dim=D    # D
+    latent_space_dim=D,   # D
+    dropout_rate=0.1      # Add dropout to prevent overfitting
 )
 
 # Train the model using the train_model function (with AMP to save memory)

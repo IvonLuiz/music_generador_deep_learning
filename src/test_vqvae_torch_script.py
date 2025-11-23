@@ -8,7 +8,7 @@ from datetime import datetime
 
 from modeling.torch.vq_vae import VQ_VAE
 from modeling.torch.train_vq import *
-from generate import *
+from generation.generate import *
 from utils import load_maestro, find_min_max_for_path
 from processing.preprocess_audio import TARGET_TIME_FRAMES, MIN_MAX_VALUES_SAVE_DIR
 
@@ -28,8 +28,11 @@ if torch.cuda.is_available():
 current_datetime = datetime.now()
 formatted_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 
+# Model parameters
+K = 1024  # Number of embeddings
+D = 512  # Latent space dimension
 SPECTROGRAMS_PATH = "data/processed/maestro_spectrograms_test/"
-MODEL_PATH = "./models/vq_vae_maestro2011/vq_vae_maestro2011_model.pth"
+MODEL_PATH = f"./models/vq_vae_maestro2011_K_{K}_D_{D}/vq_vae_maestro2011_model.pth"
 
 MIN_MAX_VALUES_FILE_PATH = MIN_MAX_VALUES_SAVE_DIR + "min_max_values.pkl"
 
@@ -50,11 +53,12 @@ data_variance = np.var(specs)
 
 VQVAE = VQ_VAE(
     input_shape=(256, specs.shape[2], 1),
-    conv_filters=(256, 128, 64, 32),
+    conv_filters=(32, 64, 128, 256),
     conv_kernels=(3, 3, 3, 3),
     conv_strides=((2, 2), (2, 2), (2, 2), (2, 1)),
-    embeddings_size=256,    # K
-    latent_space_dim=256    # D
+    embeddings_size=K,    # K
+    latent_space_dim=D,    # D
+    dropout_rate=0.1
 )
 
 # Load trained model
@@ -88,7 +92,7 @@ for p, mm in zip(sampled_paths, sampled_min_max_values):
 # Generate with the trained PyTorch model
 signals, latents = sound_generator.generate(sampled_specs, sampled_min_max_values)
 # Also convert originals (denorm + istft) and play
-originals = sound_generator.convert_spectrograms_to_audio(sampled_specs, sampled_min_max_values)
+originals = sound_generator.convert_spectrograms_to_audio(sampled_specs, sampled_min_max_values, method="griffinlim") # griffinlim or istft
 
 save_multiple_signals({'generated': signals, 'original': originals}, SAVE_DIR)
 save_spectrogram_comparisons(sampled_specs, sampled_min_max_values, sound_generator,

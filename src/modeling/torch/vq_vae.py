@@ -12,7 +12,8 @@ class Encoder(nn.Module):
                  conv_filters: Iterable[int],
                  conv_kernels: Iterable[int],
                  conv_strides: Iterable[Tuple[int, int]],
-                 latent_space_dim: int):
+                 latent_space_dim: int,
+                 dropout_rate: float = 0.0):
         super().__init__()
         layers = []
         c_in = in_channels
@@ -22,6 +23,8 @@ class Encoder(nn.Module):
             layers.append(nn.Conv2d(c_in, out_ch, kernel_size=k, stride=s_tuple, padding=k // 2))
             layers.append(nn.BatchNorm2d(out_ch))
             layers.append(nn.ReLU(inplace=True))
+            if dropout_rate > 0:
+                layers.append(nn.Dropout(dropout_rate))
             c_in = out_ch
         # Project to latent dim D (channels==latent_space_dim)
         layers.append(nn.Conv2d(c_in, latent_space_dim, kernel_size=1))
@@ -37,7 +40,8 @@ class Decoder(nn.Module):
                  conv_filters: Iterable[int],
                  conv_kernels: Iterable[int],
                  conv_strides: Iterable[Tuple[int, int]],
-                 latent_space_dim: int):
+                 latent_space_dim: int,
+                 dropout_rate: float = 0.0):
         super().__init__()
         # Mirror of encoder: start from latent D and go through reversed filters
         filters_rev = list(conv_filters)[::-1]
@@ -52,6 +56,8 @@ class Decoder(nn.Module):
             layers.append(nn.ConvTranspose2d(c_in, out_ch, kernel_size=k, stride=s_tuple, padding=k // 2, output_padding=(s_tuple[0] - 1, s_tuple[1] - 1)))
             layers.append(nn.BatchNorm2d(out_ch))
             layers.append(nn.ReLU(inplace=True))
+            if dropout_rate > 0:
+                layers.append(nn.Dropout(dropout_rate))
             c_in = out_ch
         # Final layer to reconstruct single-channel spectrogram (1 channel)
         layers.append(nn.ConvTranspose2d(c_in, out_channels, kernel_size=3, stride=1, padding=1))
@@ -71,7 +77,8 @@ class VQ_VAE(nn.Module):
                  conv_strides: Iterable[Tuple[int, int]],
                  latent_space_dim: int,
                  embeddings_size: int = 128,
-                 beta: float = 0.25):
+                 beta: float = 0.25,
+                 dropout_rate: float = 0.0):
         super().__init__()
         H, W, C = input_shape
         assert C == 1, "Expected single-channel for audio input (spectrogram)."
@@ -82,6 +89,7 @@ class VQ_VAE(nn.Module):
             conv_kernels=conv_kernels,
             conv_strides=conv_strides,
             latent_space_dim=latent_space_dim,
+            dropout_rate=dropout_rate
         )
         self.vq = VectorQuantizer(num_embeddings=embeddings_size, embedding_dim=latent_space_dim, beta=beta)
         self.decoder = Decoder(
@@ -90,6 +98,7 @@ class VQ_VAE(nn.Module):
             conv_kernels=conv_kernels,
             conv_strides=conv_strides,
             latent_space_dim=latent_space_dim,
+            dropout_rate=dropout_rate
         )
 
     def forward(self, x):
