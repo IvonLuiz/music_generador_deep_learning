@@ -8,6 +8,7 @@ import pickle
 import yaml
 
 from modeling.torch.vq_vae import VQ_VAE
+from modeling.torch.vq_vae_residual import VQ_VAE as VQ_VAE_Residual
 from modeling.torch.train_vq import *
 from generation.generate import *
 from utils import load_maestro, find_min_max_for_path, load_config
@@ -40,8 +41,7 @@ if os.path.exists(LATEST_MODEL_POINTER):
         MODEL_PATH = f.read().strip()
     print(f"Using latest model from: {MODEL_PATH}")
 else:
-    # Fallback or manual override
-    print("Latest model pointer not found. Please specify MODEL_PATH manually.")
+    print(f"Latest model pointer not found: {LATEST_MODEL_POINTER}.")
     exit(1)
 
 # Load the config specific to this model run if it exists
@@ -58,7 +58,8 @@ D = config['model']['D']
 conv_filters = tuple(config['model']['conv_filters'])
 conv_kernels = tuple(config['model']['conv_kernels'])
 conv_strides = tuple([tuple(s) for s in config['model']['conv_strides']])
-dropout_rate = config['model']['dropout_rate']
+dropout_rate = config['model'].get('dropout_rate', 0.0)
+use_residual = config['model'].get('use_residual', False)
 
 SPECTROGRAMS_PATH = config['dataset']['processed_path']
 MIN_MAX_VALUES_FILE_PATH = MIN_MAX_VALUES_SAVE_DIR + "min_max_values.pkl"
@@ -77,15 +78,28 @@ print(specs.shape)
 print("Data range:", specs.min(), "to", specs.max())
 data_variance = np.var(specs)
 
-VQVAE = VQ_VAE(
-    input_shape=(256, specs.shape[2], 1),
-    conv_filters=conv_filters,
-    conv_kernels=conv_kernels,
-    conv_strides=conv_strides,
-    embeddings_size=K,
-    latent_space_dim=D,
-    dropout_rate=dropout_rate
-)
+if use_residual:
+    print("Initializing Residual VQ-VAE...")
+    VQVAE = VQ_VAE_Residual(
+        input_shape=(256, specs.shape[2], 1),
+        conv_filters=conv_filters,
+        conv_kernels=conv_kernels,
+        conv_strides=conv_strides,
+        embeddings_size=K,
+        latent_space_dim=D,
+        dropout_rate=dropout_rate
+    )
+else:
+    print("Initializing Standard VQ-VAE...")
+    VQVAE = VQ_VAE(
+        input_shape=(256, specs.shape[2], 1),
+        conv_filters=conv_filters,
+        conv_kernels=conv_kernels,
+        conv_strides=conv_strides,
+        embeddings_size=K,
+        latent_space_dim=D,
+        dropout_rate=dropout_rate
+    )
 
 # Load trained model
 print(f"Model path: {MODEL_PATH}")

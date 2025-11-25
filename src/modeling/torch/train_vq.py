@@ -295,8 +295,10 @@ def save_spectrogram_comparisons(original_specs, min_max_values, sound_generator
         denorm_recon_cropped = denorm_recon[:, :min_time_frames]
         
         # Difference (reconstruction error)
+        # errors are between 0 and 1.0 dB, but for visualization and comparison we use a
+        # fixed vmax smaller that normally the errors don't exceed it's value of 0.4 dB
         diff = np.abs(denorm_orig_cropped - denorm_recon_cropped)
-        im3 = axes[2].imshow(diff, aspect='auto', origin='lower', cmap='hot', vmin=0, vmax=1)
+        im3 = axes[2].imshow(diff, aspect='auto', origin='lower', cmap='hot', vmin=0, vmax=0.4)
         axes[2].set_title(f'Reconstruction Error\n(Sample {i+1})\n(Cropped to {min_time_frames} frames)')
         axes[2].set_xlabel('Time Frames')
         axes[2].set_ylabel('Frequency Bins')

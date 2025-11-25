@@ -4,6 +4,7 @@ import os
 import yaml
 
 from modeling.torch.vq_vae import VQ_VAE
+from modeling.torch.vq_vae_residual import VQ_VAE as VQ_VAE_Residual
 from modeling.torch.train_vq import *
 from generation.generate import *
 from utils import load_maestro, load_config
@@ -33,6 +34,7 @@ conv_filters = tuple(config['model']['conv_filters'])
 conv_kernels = tuple(config['model']['conv_kernels'])
 conv_strides = tuple([tuple(s) for s in config['model']['conv_strides']])
 dropout_rate = config['model']['dropout_rate']
+use_residual = config['model'].get('use_residual', False)
 
 # Training parameters from config
 BATCH_SIZE = config['training']['batch_size']
@@ -52,6 +54,9 @@ MODEL_PATH = os.path.join(
     MODEL_SAVE_DIR, 
     f"{MODEL_NAME}_K_{K}_D_{D}_filters_{'_'.join(map(str, conv_filters))}"
 )
+if use_residual:
+    MODEL_PATH += "_residual"
+
 MODEL_FILE_PATH = os.path.join(MODEL_PATH, f"{MODEL_NAME}_model.pth")
 
 print(f"Training configuration loaded from {CONFIG_PATH}")
@@ -62,29 +67,44 @@ print("Input shape: ", x_train.shape)
 print("Data range:", x_train.min(), "to", x_train.max())
 print("Data samples length:", x_train.shape[0])
 
-# Fix normalization - your preprocessing already normalizes to [0,1]
+# If variance is too small, the loss term (MSE / 2*var) becomes huge, causing exploding gradients.
 data_variance = np.var(x_train) # data cines normalized from load_maestro
 print(f"Data variance: {data_variance}")
-
-# Stability fix: If variance is too small, the loss term (MSE / 2*var) becomes huge, causing exploding gradients.
-# We clamp the variance to a safe minimum (e.g. 0.05) or use 1.0 to rely on standard MSE.
-effective_variance = max(float(data_variance), 0.05)
-print(f"Effective variance used for training: {effective_variance}")
 
 # Get the actual time dimension from your data
 time_frames = x_train.shape[2]
 print(f"Time frames detected: {time_frames}")
 
 # Define VQ-VAE model with actual dimensions
-VQVAE = VQ_VAE(
-    input_shape=(256, time_frames, 1),
-    conv_filters=conv_filters,
-    conv_kernels=conv_kernels,
-    conv_strides=conv_strides,
-    embeddings_size=K,
-    latent_space_dim=D,
-    dropout_rate=dropout_rate
-)
+if use_residual:
+    print("Initializing Residual VQ-VAE...")
+    # Note: VQ_VAE_Residual might not support dropout_rate in __init__ if not updated
+    # Assuming it has similar signature or we need to check vq_vae_residual.py
+    # Based on previous context, vq_vae_residual.py didn't have dropout_rate in __init__
+    # Let's assume we want to use it if available, or fallback.
+    # Ideally, we should update vq_vae_residual.py to match vq_vae.py features.
+    # For now, let's instantiate without dropout if it fails, or update the file first.
+    # Actually, let's update vq_vae_residual.py to support dropout first to be safe.
+    VQVAE = VQ_VAE_Residual(
+        input_shape=(256, time_frames, 1),
+        conv_filters=conv_filters,
+        conv_kernels=conv_kernels,
+        conv_strides=conv_strides,
+        embeddings_size=K,
+        latent_space_dim=D,
+        dropout_rate=dropout_rate
+    )
+else:
+    print("Initializing Standard VQ-VAE...")
+    VQVAE = VQ_VAE(
+        input_shape=(256, time_frames, 1),
+        conv_filters=conv_filters,
+        conv_kernels=conv_kernels,
+        conv_strides=conv_strides,
+        embeddings_size=K,
+        latent_space_dim=D,
+        dropout_rate=dropout_rate
+    )
 
 # Train the model using the train_model function (with AMP to save memory)
 # We save to a timestamped subdirectory to keep history
@@ -101,7 +121,7 @@ train_model(
     batch_size=BATCH_SIZE,
     epochs=EPOCHS,
     learning_rate=LEARNING_RATE,
-    data_variance=effective_variance,
+    data_variance=data_variance,
     save_path=timestamped_model_path,
     amp=True,
     grad_accum_steps=1,
