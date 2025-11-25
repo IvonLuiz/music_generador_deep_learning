@@ -8,6 +8,7 @@ dataset:
 
 model:
   name: "vq_vae_maestro2011"
+  use_residual: true
   K: 1024
   D: 512
   conv_filters: [64, 128, 256, 512]
