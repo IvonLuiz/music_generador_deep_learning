@@ -14,4 +14,6 @@ data/processed
 samples/
 
 .midi
+*.pth
+*.pkl
 __pycache__
