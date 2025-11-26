@@ -1,0 +1,37 @@
+dataset:
+  frame_size: 512
+  hop_length: 256
+  processed_path: ./data/processed/maestro_spectrograms_test/
+  raw_path: ./data/raw/maestro-v3.0.0/2011
+  sample_rate: 22050
+  target_time_frames: 256
+model:
+  D: 512
+  K: 1024
+  conv_filters:
+  - 64
+  - 128
+  - 256
+  - 512
+  conv_kernels:
+  - 3
+  - 3
+  - 3
+  - 3
+  conv_strides:
+  - - 2
+    - 2
+  - - 2
+    - 2
+  - - 2
+    - 2
+  - - 2
+    - 1
+  dropout_rate: 0.1
+  name: vq_vae_maestro2011
+  use_residual: true
+training:
+  batch_size: 64
+  epochs: 100
+  learning_rate: 0.0001
+  save_dir: ./models/

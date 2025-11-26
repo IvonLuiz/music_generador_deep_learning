@@ -7,6 +7,13 @@ data/GTZAN
 
 data/raw/maestro-v3.0.0/**/**.wav
 data/raw/maestro-v3.0.0/**/**.midi
+data/raw/maestro-v3.0.0/**/**
+data/processed/maestro
+data/processed
+**visualizations/
+samples/
 
 .midi
+*.pth
+*.pkl
 __pycache__

@@ -11,6 +11,8 @@ SAMPLE_RATE = 22050    # samples per second
 FRAME_SIZE = 512       # samples for each STFT window
 HOP_LENGTH = 256       # move amount of samples between windows
 
+MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_spectrograms_test/min_max_values/"
+
 class Loader:
     """
     Loader is responsible for loading an audio file.
@@ -419,7 +421,6 @@ if __name__ == "__main__":
     
     FILES_DIR = "./data/raw/maestro-v3.0.0/2011"
     SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro_spectrograms_test/"
-    MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_spectrograms_test/min_max_values/"
     VISUALIZATION_SAVE_DIR = "./data/processed/maestro_spectrograms_test/spectrograms/"
     
     # Enable visualization (set to False to disable)

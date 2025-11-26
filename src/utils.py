@@ -1,6 +1,7 @@
 import os
 import numpy as np
 from tqdm import tqdm
+import yaml
 
 
 def load_maestro(path, target_time_frames=256, debug_print=False):
@@ -95,3 +96,8 @@ def find_min_max_for_path(fp, min_max_values, spectrograms_dir):
             return v
     # not found
     return None
+
+def load_config(config_path):
+    with open(config_path, 'r') as file:
+        config = yaml.safe_load(file)
+    return config
