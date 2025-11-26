@@ -55,9 +55,14 @@ class VectorQuantizer(nn.Module):
 
         # Losses
         ## Codebook loss: ||sg[z_e] - e||^2
+        # z_e.detach() stops gradients from flowing to the Encoder.
+        # gradients ONLY flow to z_q (the Codebook embeddings).
         codebook_loss = F.mse_loss(z_e.detach(), z_q)
         ## Commitment loss: ||z_e - sg[z_q]||^2
+        # z_q.detach() stops gradients from flowing to the Codebook.
+        # gradients ONLY flow to z_e (the Encoder).
         commitment_loss = F.mse_loss(z_e, z_q.detach())
+
         vq_loss = codebook_loss + self.beta * commitment_loss
 
         # Straight-through estimator
@@ -66,4 +71,4 @@ class VectorQuantizer(nn.Module):
         # Reshape indices to (B, H, W)
         indices_map = indices.view(B, H, W)
 
-        return z_q_st, indices_map, vq_loss, codebook_loss, commitment_loss
+        return z_q_st, indices_map, vq_loss, codebook_loss, self.beta * commitment_loss
