@@ -1,8 +1,33 @@
 keras==3.5.0
-librosa==0.10.2.post1
+# Install TensorFlow with CUDA runtime libraries via pip (modern GPU support)
+tensorflow[cuda]==2.17.0
+
+# Core scientific stack
+# TensorFlow 2.17 on Python <=3.11 requires NumPy <2.0; on Python 3.12 it requires NumPy >=2.0
+numpy==1.26.4; python_version <= "3.11"
+numpy==2.1.2; python_version >= "3.12"
+
+# Match SciPy/Numba to the NumPy ABI for each Python version
+scipy==1.11.4; python_version <= "3.11"
+scipy>=1.14.0; python_version >= "3.12"
+numba==0.59.1; python_version <= "3.11"
+numba==0.60.0; python_version >= "3.12"
+
 matplotlib==3.9.2
-music21==9.1.0
-numpy==2.1.2
+pandas==2.2.3
+tqdm==4.67.1
+
+# Audio / DSP
+librosa==0.10.2.post1
 soundfile==0.12.1
-tensorflow==2.17.0
-tensorflow_intel==2.17.0
+audioread
+resampy
+
+# MIDI / music tools
+mido
+pretty_midi
+music21==9.1.0
+
+# Notebooks
+jupyterlab
+ipykernel
