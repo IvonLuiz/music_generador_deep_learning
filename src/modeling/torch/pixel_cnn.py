@@ -4,53 +4,104 @@ import torch.nn.functional as F
 from typing import Iterable, Tuple
 
 
-class PixelConvLayer(nn.Module):
+class MaskedConv2d(nn.Conv2d):
     """
-    A single layer of PixelCNN with masked convolutions.
+    A 2D convolutional layer with a mask applied to the weights.
+    The mask ensures that the convolution respects the autoregressive property.
     """
-    def __init__(self, mask_type: str, in_channels: int, out_channels: int, kernel_size: int) -> None:
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size // 2)
+    def __init__(self, mask_type: str, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        assert mask_type in ['A', 'B'], "mask_type must be either 'A' or 'B'"
+
         self.mask_type = mask_type
-        self.register_buffer('mask', self.create_mask())
-    
+        self.register_buffer('mask', self.weight.data.clone())
+        self.mask = self.create_mask()
+
     def create_mask(self) -> torch.Tensor:
         """
         Create mask for the convolutional layer.
         Type A masks out the center pixel, Type B includes it.
-        @return: mask tensor of shape (1, 1, k, k)
+        @return: mask tensor of shape (1, 1, k_h, k_w)
         """
-        k = self.conv.kernel_size[0]
-        mask = torch.ones((k, k), dtype=torch.float32)
-        center = k // 2
-        mask[center, center + (self.mask_type == 'B'):] = 0
-        mask[center + 1:] = 0
-        return mask.unsqueeze(0).unsqueeze(0)
+        _, _, kernel_height, kernel_width = self.weight.size()
+        mask = torch.ones((kernel_height, kernel_width), dtype=torch.float32)
+        center_height = kernel_height // 2
+        center_width = kernel_width // 2
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self.conv.weight.data *= self.mask
-        return self.conv(x)
+        # Mask out future pixels
+        # For type A, also mask out the center pixel
+        mask[center_height, center_width + (self.mask_type == 'B'):] = 0 # Mask out pixels to the right of center
+        mask[center_height + 1:] = 0 # Mask out rows below the center row
 
-class PixelCNN(nn.Module):
-    """
-    PixelCNN model for autoregressive modeling of images.
-    """
-    def __init__(self, in_channels: int, num_layers: int, hidden_channels: int, kernel_size: int) -> None:
-        super().__init__()
-        layers = []
-        
-        # First layer is type A
-        layers.append(PixelConvLayer('A', in_channels, hidden_channels, kernel_size))
-        layers.append(nn.ReLU(inplace=True))
-        
-        # Subsequent layers are type B
-        for _ in range(num_layers - 1):
-            layers.append(PixelConvLayer('B', hidden_channels, hidden_channels, kernel_size))
-            layers.append(nn.ReLU(inplace=True))
-        
-        # Final layer to output logits for each pixel value
-        layers.append(nn.Conv2d(hidden_channels, in_channels, kernel_size=1))
-        self.net = nn.Sequential(*layers)
+        return mask.unsqueeze(0).unsqueeze(0)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        self.weight.data *= self.mask
+        return super().forward(x)
+
+
+class GatedPixelCNNBlock(nn.Module):
+    """
+    A single Gated PixelCNN block with masked convolutions.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3) -> None:
+        super().__init__()
+        # Vertical stack for pixels above
+        self.conv_vertical = MaskedConv2d(
+            'B',
+            in_channels,
+            2 * out_channels,
+            kernel_size,
+            padding=kernel_size // 2
+        )
+        # Horizontal stack for pixels to the left
+        self.conv_horizontal = MaskedConv2d(
+            'B',
+            in_channels,
+            2 * out_channels,
+            kernel_size,
+            padding=kernel_size // 2
+        )
+        # Vertical and horizontal projections (1x1 convolutions)
+        self.proj_vertical = nn.Conv2d(2 * out_channels, 2 * out_channels, kernel_size=1)
+        self.proj_horizontal = nn.Conv2d(out_channels, out_channels, kernel_size=1)
+        
+        self.out_channels = out_channels
+
+    def gated_activation(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Gated activation function.
+        @param x: Input tensor of shape [B, 2*Channels, H, W]
+        @return: Activated tensor of shape [B, Channels, H, W]
+        """
+        # Divide the channels into 2 halves (features and gates)
+        tanh_out, sigmoid_out = x.chunk(2, dim=1)
+        # tanh(f) * sigmoid(g)
+        return torch.tanh(tanh_out) * torch.sigmoid(sigmoid_out)
+
+    def forward(self, x: torch.Tensor, h_input: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the Gated PixelCNN block.
+        Formula: $$y = \tanh(W_{f} * x) \odot \sigma(W_{g} * x)$$
+        @param x: Input tensor of shape [B, In_Channels, H, W]
+        @param h_input: Conditional input tensor of shape [B, In_Channels, H, W]
+        @return: Output tensor of shape [B, Out_Channels, H, W]
+        """
+        # Vertical and horizontal convolutions
+        v_val = self.conv_vertical(x)               # [B, 2*Out, H, W]
+        h_val = self.conv_horizontal(x)             # [B, 2*Out, H, W]
+        
+        # Connection from vertical to horizontal
+        v_proj = self.proj_vertical(v_val)          # [B, 2*Out, H, W]
+        h_val = h_val + v_proj                      # [B, 2*Out, H, W]
+        
+        # Gated activation
+        v_val = self.gated_activation(v_val)        # [B, Out, H, W]
+        h_val = self.gated_activation(h_val)        # [B, Out, H, W]
+        
+        # Residual connection for horizontal stack
+        if self.mask_type == 'B':
+            h_proj = self.proj_horizontal(h_val)    # [B, Out, H, W]
+        
+        return v_proj + h_proj
+
