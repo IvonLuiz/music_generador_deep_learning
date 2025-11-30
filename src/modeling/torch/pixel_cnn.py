@@ -156,7 +156,7 @@ class ConditionalGatedPixelCNN(nn.Module):
                  num_layers: int = 5,
                  kernel_size: int = 3,
                  conditional_dim: int = None,
-                 n_classes: int = 256) -> None:
+                 num_classes: int = 256) -> None:
         """
         Initialize the Conditional Gated PixelCNN model.
         @param in_channels: Number of input channels
@@ -164,9 +164,10 @@ class ConditionalGatedPixelCNN(nn.Module):
         @param num_layers: Number of Gated PixelCNN layers hidden
         @param kernel_size: Kernel size for convolutions
         @param conditional_dim: Dimension of the conditional vector
-        @param n_classes: Number of output classes (e.g., 256 for 8-bit quantization)
+        @param num_classes: Number of output classes (e.g., 256 for 8-bit quantization)
         """
         super().__init__()
+        self.num_classes = num_classes
 
         # Mask type A for the first layer
         self.input_conv = GatedPixelCNNBlock(in_channels, hidden_channels, 'A', kernel_size, conditional_dim)
@@ -181,7 +182,7 @@ class ConditionalGatedPixelCNN(nn.Module):
             nn.ReLU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
             nn.ReLU(),
-            nn.Conv2d(hidden_channels, in_channels, kernel_size=1)
+            nn.Conv2d(hidden_channels, in_channels * num_classes, kernel_size=1)
         )
     
     def forward(self, x: torch.Tensor, cond: torch.Tensor = None) -> torch.Tensor:
@@ -204,8 +205,8 @@ class ConditionalGatedPixelCNN(nn.Module):
 
         # x is flattened
         # reshape for CrossEntropy: [B, 256, C, H, W] or [B, 256, H, W] if C=1
-        batch, channels, height, width = x.size()
-        x = x.view(batch, -1, height, width)  # [B, 256, H, W]
+        batch, _, height, width = x.size()
+        x = x.view(batch, self.num_classes, -1, height, width)  # [B, 256, C, H, W]
 
         return x
 
