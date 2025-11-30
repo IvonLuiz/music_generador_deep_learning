@@ -44,18 +44,23 @@ class GatedPixelCNNBlock(nn.Module):
     """
     A single Gated PixelCNN block with masked convolutions.
     """
-    def __init__(self, in_channels: int,
+    def __init__(self,
+                 in_channels: int,
                  out_channels: int,
+                 mask_type: str = 'B',
                  kernel_size: int = 3,
-                 mask_type: str = 'B') -> None:
+                 conditional_dim: int = None) -> None:
         super().__init__()
+        self.mask_type = mask_type
+        padding = kernel_size // 2
+
         # Vertical stack for pixels above
         self.conv_vertical = MaskedConv2d(
             mask_type,
             in_channels,
             2 * out_channels,
             kernel_size,
-            padding=kernel_size // 2
+            padding = padding
         )
         # Horizontal stack for pixels to the left
         self.conv_horizontal = MaskedConv2d(
@@ -63,13 +68,31 @@ class GatedPixelCNNBlock(nn.Module):
             in_channels,
             2 * out_channels,
             kernel_size,
-            padding=kernel_size // 2
+            padding = padding
         )
         # Vertical and horizontal projections (1x1 convolutions)
-        self.proj_vertical = nn.Conv2d(2 * out_channels, 2 * out_channels, kernel_size=1)
-        self.proj_horizontal = nn.Conv2d(out_channels, out_channels, kernel_size=1)
+        self.proj_vertical = nn.Conv2d(
+            2 * out_channels,
+            2 * out_channels,
+            kernel_size=1
+        ) # connects vertical to horizontal
+        self.proj_horizontal = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=1
+        ) # final convolution for horizontal residual connection
         
-        self.out_channels = out_channels
+        # Conditioning
+        self.conditional_dim = conditional_dim
+        if conditional_dim is not None:
+            # projects the vector h to sum before activations
+            # W_f * h and W_g * h
+            self.cond_proj_vertical = nn.Linear(
+                conditional_dim, 2 * out_channels
+            )
+            self.cond_proj_horizontal = nn.Linear(
+                conditional_dim, 2 * out_channels
+            )
 
     def gated_activation(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -82,31 +105,45 @@ class GatedPixelCNNBlock(nn.Module):
         # tanh(f) * sigmoid(g)
         return torch.tanh(tanh_out) * torch.sigmoid(sigmoid_out)
 
-    def forward(self, x: torch.Tensor, h_input: torch.Tensor) -> torch.Tensor:
+    def forward(self, vert_input: torch.Tensor, hor_input: torch.Tensor, cond = None) -> torch.Tensor:
         """
         Forward pass of the Gated PixelCNN block.
         Formula: $$y = \tanh(W_{f} * x) \odot \sigma(W_{g} * x)$$
-        @param x: Input tensor of shape [B, In_Channels, H, W]
-        @param h_input: Conditional input tensor of shape [B, In_Channels, H, W]
+        @param vert_input: Input tensor of shape [B, In_Channels, H, W]
+        @param hor_input: Input tensor of shape [B, In_Channels, H, W]
+        @param cond: Conditional input tensor of shape [B, Conditional_Dim]
         @return: Output tensor of shape [B, Out_Channels, H, W]
         """
         # Vertical and horizontal convolutions
-        v_val = self.conv_vertical(x)               # [B, 2*Out, H, W]
-        h_val = self.conv_horizontal(x)             # [B, 2*Out, H, W]
+        vert_val = self.conv_vertical(vert_input)       # [B, 2*Out, H, W]
+        hor_val = self.conv_horizontal(hor_input)           # [B, 2*Out, H, W]
         
         # Connection from vertical to horizontal
-        v_proj = self.proj_vertical(v_val)          # [B, 2*Out, H, W]
-        h_val = h_val + v_proj                      # [B, 2*Out, H, W]
+        vert_proj = self.proj_vertical(vert_val)           # [B, 2*Out, H, W]
+        hor_val = hor_val + vert_proj                          # [B, 2*Out, H, W]
+
+        # Add conditioning if provided
+        if self.conditional_dim is not None and cond is not None:
+            # Project conditioning vector to match dimensions
+            cond_vert = self.cond_proj_vertical(cond)      # [B, 2*Out]
+            cond_horiz = self.cond_proj_horizontal(cond)   # [B, 2*Out]
+            # Reshape for addition
+            cond_vert = cond_vert.unsqueeze(2).unsqueeze(3)     # [B, 2*Out, 1, 1]
+            cond_horiz = cond_horiz.unsqueeze(2).unsqueeze(3)   # [B, 2*Out, 1, 1]
+            
+            # Add conditioning (bias to certain features)
+            vert_val = vert_val + cond_vert
+            hor_val = hor_val + cond_horiz
         
         # Gated activation
-        v_val = self.gated_activation(v_val)        # [B, Out, H, W]
-        h_val = self.gated_activation(h_val)        # [B, Out, H, W]
+        vert_out = self.gated_activation(vert_val)          # [B, Out, H, W]
+        hor_out = self.gated_activation(hor_val)              # [B, Out, H, W]
         
         # Residual connection for horizontal stack
         if self.mask_type == 'B':
-            h_proj = self.proj_horizontal(h_val)    # [B, Out, H, W]
+            hor_out = self.proj_horizontal(hor_out) + hor_input    # [B, Out, H, W]
         
-        return v_proj + h_proj
+        return vert_out, hor_out
 
 
 class ConditionalGatedPixelCNN(nn.Module):
@@ -117,21 +154,25 @@ class ConditionalGatedPixelCNN(nn.Module):
                  in_channels: int = 1,
                  hidden_channels: int = 64,
                  num_layers: int = 5,
-                 kernel_size: int = 3) -> None:
+                 kernel_size: int = 3,
+                 conditional_dim: int = None,
+                 n_classes: int = 256) -> None:
         """
         Initialize the Conditional Gated PixelCNN model.
         @param in_channels: Number of input channels
         @param hidden_channels: Number of hidden channels
         @param num_layers: Number of Gated PixelCNN layers hidden
         @param kernel_size: Kernel size for convolutions
+        @param conditional_dim: Dimension of the conditional vector
+        @param n_classes: Number of output classes (e.g., 256 for 8-bit quantization)
         """
         super().__init__()
 
         # Mask type A for the first layer
-        self.input_conv = GatedPixelCNNBlock('A', in_channels, hidden_channels, kernel_size)
+        self.input_conv = GatedPixelCNNBlock(in_channels, hidden_channels, 'A', kernel_size, conditional_dim)
         # Mask type B for subsequent layers
         self.gated_blocks = nn.ModuleList([
-            GatedPixelCNNBlock('B', hidden_channels, hidden_channels, kernel_size)
+            GatedPixelCNNBlock(hidden_channels, hidden_channels, 'B', kernel_size, conditional_dim)
             for _ in range(num_layers)
         ])
 
@@ -143,20 +184,28 @@ class ConditionalGatedPixelCNN(nn.Module):
             nn.Conv2d(hidden_channels, in_channels, kernel_size=1)
         )
     
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond: torch.Tensor = None) -> torch.Tensor:
         """
         @param x: Input of normalized tensor of shape [B, C, H, W]
         @param cond: Conditional tensor of shape [B, C, H, W]
         @return: Output tensor of shape [B, C, H, W]
         """
         x = x.float()
-        x = self.input_conv(x)
-        cond = self.cond_conv(cond)
-        x = x + cond
+ 
+        # Initial vertical and horizontal stacks
+        vert, hor = self.input_conv(x, x, cond) # receive same image
         
+        # Pass through residual Gated PixelCNN blocks
         for block in self.gated_blocks:
-            x = block(x) + x  # Residual connection
-        
-        x = self.output_conv(x)
+            vert, hor = block(vert, hor, cond)
+
+        # Post-process output (only horizontal stack is used for prediction)
+        x = self.output_conv(hor) # relu -> conv2d -> relu -> conv2d
+
+        # x is flattened
+        # reshape for CrossEntropy: [B, 256, C, H, W] or [B, 256, H, W] if C=1
+        batch, channels, height, width = x.size()
+        x = x.view(batch, -1, height, width)  # [B, 256, H, W]
+
         return x
 
