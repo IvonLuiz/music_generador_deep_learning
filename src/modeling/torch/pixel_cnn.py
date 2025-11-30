@@ -156,21 +156,32 @@ class ConditionalGatedPixelCNN(nn.Module):
                  num_layers: int = 5,
                  kernel_size: int = 3,
                  conditional_dim: int = None,
-                 num_classes: int = 256) -> None:
+                 num_classes: int = 256,
+                 num_embeddings: int = None) -> None:
         """
         Initialize the Conditional Gated PixelCNN model.
-        @param in_channels: Number of input channels
+        @param in_channels: Number of input channels (ignored if num_embeddings is provided)
         @param hidden_channels: Number of hidden channels
         @param num_layers: Number of Gated PixelCNN layers hidden
         @param kernel_size: Kernel size for convolutions
         @param conditional_dim: Dimension of the conditional vector
         @param num_classes: Number of output classes (e.g., 256 for 8-bit quantization)
+        @param num_embeddings: Size of embedding dictionary (if input is discrete indices)
         """
         super().__init__()
         self.num_classes = num_classes
+        self.num_embeddings = num_embeddings
+
+        if num_embeddings is not None:
+            self.embedding = nn.Embedding(num_embeddings, hidden_channels)
+            # If using embeddings, the input to the first conv is the embedding dimension (hidden_channels)
+            input_channels = hidden_channels
+        else:
+            self.embedding = None
+            input_channels = in_channels
 
         # Mask type A for the first layer
-        self.input_conv = GatedPixelCNNBlock(in_channels, hidden_channels, 'A', kernel_size, conditional_dim)
+        self.input_conv = GatedPixelCNNBlock(input_channels, hidden_channels, 'A', kernel_size, conditional_dim)
         # Mask type B for subsequent layers
         self.gated_blocks = nn.ModuleList([
             GatedPixelCNNBlock(hidden_channels, hidden_channels, 'B', kernel_size, conditional_dim)
@@ -187,11 +198,21 @@ class ConditionalGatedPixelCNN(nn.Module):
     
     def forward(self, x: torch.Tensor, cond: torch.Tensor = None) -> torch.Tensor:
         """
-        @param x: Input of normalized tensor of shape [B, C, H, W]
+        @param x: Input tensor. 
+                  If num_embeddings is None: [B, C, H, W] (normalized float)
+                  If num_embeddings is Set:  [B, H, W] (int indices) or [B, 1, H, W]
         @param cond: Conditional tensor of shape [B, C, H, W]
-        @return: Output tensor of shape [B, C, H, W]
+        @return: Output tensor of shape [B, num_classes, C, H, W]
         """
-        x = x.float()
+        if self.embedding is not None:
+            # Expect indices
+            if x.ndim == 4 and x.shape[1] == 1:
+                x = x.squeeze(1) # [B, H, W]
+            x = x.long()
+            x = self.embedding(x) # [B, H, W, hidden]
+            x = x.permute(0, 3, 1, 2) # [B, hidden, H, W]
+        else:
+            x = x.float()
  
         # Initial vertical and horizontal stacks
         vert, hor = self.input_conv(x, x, cond) # receive same image
