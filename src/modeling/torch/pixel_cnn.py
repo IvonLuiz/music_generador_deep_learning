@@ -44,11 +44,14 @@ class GatedPixelCNNBlock(nn.Module):
     """
     A single Gated PixelCNN block with masked convolutions.
     """
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3) -> None:
+    def __init__(self, in_channels: int,
+                 out_channels: int,
+                 kernel_size: int = 3,
+                 mask_type: str = 'B') -> None:
         super().__init__()
         # Vertical stack for pixels above
         self.conv_vertical = MaskedConv2d(
-            'B',
+            mask_type,
             in_channels,
             2 * out_channels,
             kernel_size,
@@ -56,7 +59,7 @@ class GatedPixelCNNBlock(nn.Module):
         )
         # Horizontal stack for pixels to the left
         self.conv_horizontal = MaskedConv2d(
-            'B',
+            mask_type,
             in_channels,
             2 * out_channels,
             kernel_size,
@@ -104,4 +107,56 @@ class GatedPixelCNNBlock(nn.Module):
             h_proj = self.proj_horizontal(h_val)    # [B, Out, H, W]
         
         return v_proj + h_proj
+
+
+class ConditionalGatedPixelCNN(nn.Module):
+    """
+    Gated PixelCNN model with conditional input.
+    """
+    def __init__(self,
+                 in_channels: int = 1,
+                 hidden_channels: int = 64,
+                 num_layers: int = 5,
+                 kernel_size: int = 3) -> None:
+        """
+        Initialize the Conditional Gated PixelCNN model.
+        @param in_channels: Number of input channels
+        @param hidden_channels: Number of hidden channels
+        @param num_layers: Number of Gated PixelCNN layers hidden
+        @param kernel_size: Kernel size for convolutions
+        """
+        super().__init__()
+
+        # Mask type A for the first layer
+        self.input_conv = GatedPixelCNNBlock('A', in_channels, hidden_channels, kernel_size)
+        # Mask type B for subsequent layers
+        self.gated_blocks = nn.ModuleList([
+            GatedPixelCNNBlock('B', hidden_channels, hidden_channels, kernel_size)
+            for _ in range(num_layers)
+        ])
+
+        # Output layers with ReLu and 1x1 convs
+        self.output_conv = nn.Sequential(
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels, in_channels, kernel_size=1)
+        )
+    
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """
+        @param x: Input of normalized tensor of shape [B, C, H, W]
+        @param cond: Conditional tensor of shape [B, C, H, W]
+        @return: Output tensor of shape [B, C, H, W]
+        """
+        x = x.float()
+        x = self.input_conv(x)
+        cond = self.cond_conv(cond)
+        x = x + cond
+        
+        for block in self.gated_blocks:
+            x = block(x) + x  # Residual connection
+        
+        x = self.output_conv(x)
+        return x
 
