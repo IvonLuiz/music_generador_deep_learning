@@ -13,7 +13,7 @@ from processing.preprocess_audio import TARGET_TIME_FRAMES
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 # Load configuration
-CONFIG_PATH = "./config/config.yaml"
+CONFIG_PATH = "./config/config_vqvae.yaml"
 config = load_config(CONFIG_PATH)
 
 # Optional: faster matmul on Ampere+ GPUs
