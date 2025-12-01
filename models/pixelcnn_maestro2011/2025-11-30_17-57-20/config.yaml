@@ -1,0 +1,15 @@
+dataset:
+  processed_path: ./data/processed/maestro_spectrograms_test/
+  target_time_frames: 256
+model:
+  dropout_rate: 0.0
+  hidden_channels: 128
+  kernel_size: 5
+  name: pixelcnn_maestro2011
+  num_layers: 15
+training:
+  batch_size: 128
+  epochs: 300
+  learning_rate: 0.001
+  save_dir: ./models/
+  validation_split: 0.2

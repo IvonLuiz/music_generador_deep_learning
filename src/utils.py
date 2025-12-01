@@ -2,6 +2,12 @@ import os
 import numpy as np
 from tqdm import tqdm
 import yaml
+import torch
+
+from modeling.torch.vq_vae import VQ_VAE
+from modeling.torch.vq_vae_residual import VQ_VAE as VQ_VAE_Residual
+from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
+from processing.preprocess_audio import TARGET_TIME_FRAMES
 
 
 def load_maestro(path, target_time_frames=256, debug_print=False):
@@ -101,3 +107,157 @@ def load_config(config_path):
     with open(config_path, 'r') as file:
         config = yaml.safe_load(file)
     return config
+
+def initialize_vqvae_model(config_or_path, device=torch.device('cpu')):
+    """
+    Initializes a VQ-VAE model from a configuration dictionary or path.
+    
+    Args:
+        config_or_path (dict or str): Configuration dictionary or path to config.yaml.
+        device (torch.device): Device to initialize the model onto.
+        
+    Returns:
+        torch.nn.Module: The initialized VQ-VAE model (random weights).
+    """
+    if isinstance(config_or_path, str):
+        config = load_config(config_or_path)
+    else:
+        config = config_or_path
+
+    model_config = config['model'] if 'model' in config else config
+    
+    K = model_config['K']
+    D = model_config['D']
+    conv_filters = tuple(model_config['conv_filters'])
+    conv_kernels = tuple(model_config['conv_kernels'])
+    conv_strides = tuple([tuple(s) for s in model_config['conv_strides']])
+    dropout_rate = model_config.get('dropout_rate', 0.0)
+    use_residual = model_config.get('use_residual', False)
+    
+    if use_residual:
+        print("Initializing Residual VQ-VAE...")
+        model = VQ_VAE_Residual(
+            input_shape=(256, TARGET_TIME_FRAMES, 1),
+            conv_filters=conv_filters,
+            conv_kernels=conv_kernels,
+            conv_strides=conv_strides,
+            embeddings_size=K,
+            latent_space_dim=D,
+            dropout_rate=dropout_rate
+        )
+    else:
+        print("Initializing Standard VQ-VAE...")
+        model = VQ_VAE(
+            input_shape=(256, TARGET_TIME_FRAMES, 1),
+            conv_filters=conv_filters,
+            conv_kernels=conv_kernels,
+            conv_strides=conv_strides,
+            embeddings_size=K,
+            latent_space_dim=D,
+            dropout_rate=dropout_rate
+        )
+    
+    model.to(device)
+    return model
+
+def load_vqvae_model(model_path: str, device: torch.device, weights_file: str = None):
+    """
+    Loads a VQ-VAE model from a given path (initializes and loads weights).
+    
+    Args:
+        model_path (str): Path to the model file (.pth) or the directory containing it.
+                          If a directory is provided, it looks for 'model.pth' and 'config.yaml'.
+                          If a file is provided, it looks for 'config.yaml' in the same directory.
+        device (torch.device): Device to load the model onto.
+        weights_file (str, optional): Specific weights file name to load if model_path is a directory.
+                                      If None, tries to read 'weights_file_choice' from config, 
+                                      defaulting to 'model.pth'.
+    """
+    if os.path.isdir(model_path):
+        config_path = os.path.join(model_path, "config.yaml")
+        # Defer model_file determination
+    else:
+        config_path = os.path.join(os.path.dirname(model_path), "config.yaml")
+        model_file = model_path
+        
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found at {config_path}")
+    
+    config = load_config(config_path)
+    
+    if os.path.isdir(model_path):
+        if weights_file:
+            model_file = os.path.join(model_path, weights_file)
+        else:
+            # Check config for preference, default to model.pth
+            choice = config.get('training', {}).get('weights_file_choice')
+            model_file = os.path.join(model_path, choice)
+    
+    # Initialize model structure using the helper function
+    model = initialize_vqvae_model(config, device)
+        
+    print(f"Loading VQ-VAE weights from {model_file}")
+    checkpoint = torch.load(model_file, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state'])
+    model.eval()
+    
+    return model
+
+def load_pixelcnn_model(model_path: str, device: torch.device):
+    """
+    Loads a PixelCNN model from a given path.
+    
+    Args:
+        model_path (str): Path to the model file (.pth) or the directory containing it.
+                          If a directory is provided, it looks for 'best_pixelcnn_model.pth' and 'config.yaml'.
+        device (torch.device): Device to load the model onto.
+        
+    Returns:
+        torch.nn.Module: The loaded PixelCNN model.
+    """
+    if os.path.isdir(model_path):
+        config_path = os.path.join(model_path, "config.yaml")
+        # Prefer best model
+        if os.path.exists(os.path.join(model_path, "best_pixelcnn_model.pth")):
+            model_file = os.path.join(model_path, "best_pixelcnn_model.pth")
+        else:
+            # Fallback to any .pth file or specific name
+            model_file = os.path.join(model_path, "pixelcnn_model.pth")
+    else:
+        config_path = os.path.join(os.path.dirname(model_path), "config.yaml")
+        model_file = model_path
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found at {config_path}")
+
+    config = load_config(config_path)
+    model_config = config['model']
+    
+    hidden_channels = model_config['hidden_channels']
+    num_layers = model_config['num_layers']
+    kernel_size = model_config['kernel_size']
+    
+    # K (num_embeddings) must be in the config. 
+    # Ensure training script saves it.
+    if 'K' in model_config:
+        K = model_config['K']
+    elif 'num_embeddings' in model_config:
+        K = model_config['num_embeddings']
+    else:
+        raise ValueError("Model config must contain 'K' or 'num_embeddings' to initialize PixelCNN.")
+
+    pixel_cnn = ConditionalGatedPixelCNN(
+        in_channels=1,
+        hidden_channels=hidden_channels,
+        num_layers=num_layers,
+        kernel_size=kernel_size,
+        num_classes=K,
+        num_embeddings=K,
+    ).to(device)
+    
+    print(f"Loading PixelCNN weights from {model_file}")
+    checkpoint = torch.load(model_file, map_location=device, weights_only=False)
+    pixel_cnn.load_state_dict(checkpoint['model_state'])
+    pixel_cnn.eval()
+    
+    return pixel_cnn
