@@ -10,7 +10,8 @@ model:
   dropout_rate: 0.0
 
 training:
-  batch_size: 32
+  batch_size: 128
   learning_rate: 0.001
   epochs: 50
   save_dir: "./models/"
+  validation_split: 0.2
