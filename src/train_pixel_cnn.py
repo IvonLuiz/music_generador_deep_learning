@@ -10,10 +10,8 @@ import yaml
 import matplotlib.pyplot as plt
 
 from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
-from modeling.torch.vq_vae import VQ_VAE
-from modeling.torch.vq_vae_residual import VQ_VAE as VQ_VAE_Residual
 from datasets.quantized_dataset import QuantizedDataset
-from utils import load_maestro, load_config
+from utils import load_maestro, load_config, load_vqvae_model
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
 def plot_pixelcnn_losses(train_losses, val_losses, save_dir):
@@ -37,23 +35,11 @@ def train_pixel_cnn(pixelcnn_config_path: str, vqvae_model_path: str):
     print(f"Training on {device}")
 
     # Load VQ-VAE configuration (assumed to be in the same directory as the model)
-    vqvae_config_path = os.path.join(os.path.dirname(vqvae_model_path), "config.yaml")
-    if not os.path.exists(vqvae_config_path):
-        # Fallback to default VQ-VAE config if run-specific config not found
-        print(f"Warning: Run-specific config not found at {vqvae_config_path}. Using default config/config_vqvae.yaml")
-        vqvae_config_path = "./config/config_vqvae.yaml"
-    
-    vqvae_config = load_config(vqvae_config_path)
-    print(f"Loaded VQ-VAE config from {vqvae_config_path}")
-
-    # VQ-VAE Parameters
-    K = vqvae_config['model']['K']
-    D = vqvae_config['model']['D']
-    conv_filters = tuple(vqvae_config['model']['conv_filters'])
-    conv_kernels = tuple(vqvae_config['model']['conv_kernels'])
-    conv_strides = tuple([tuple(s) for s in vqvae_config['model']['conv_strides']])
-    dropout_rate_vqvae = vqvae_config['model'].get('dropout_rate', 0.0)
-    use_residual = vqvae_config['model'].get('use_residual', False)
+    # But we still need K for PixelCNN initialization
+    print(f"Loading VQ-VAE model from {vqvae_model_path}")
+    vqvae = load_vqvae_model(vqvae_model_path, device)
+    K = vqvae.embeddings.num_embeddings
+    print(f"Extracted K={K} from VQ-VAE model")
 
     # PixelCNN Parameters
     batch_size = pixelcnn_config['training']['batch_size']
@@ -68,35 +54,8 @@ def train_pixel_cnn(pixelcnn_config_path: str, vqvae_model_path: str):
     num_layers = pixelcnn_config['model']['num_layers']
     kernel_size = pixelcnn_config['model']['kernel_size']
 
-    # Load VQ-VAE Model
-    print(f"Loading VQ-VAE model from {vqvae_model_path}")
-    if use_residual:
-        vqvae = VQ_VAE_Residual(
-            input_shape=(256, TARGET_TIME_FRAMES, 1),
-            conv_filters=conv_filters,
-            conv_kernels=conv_kernels,
-            conv_strides=conv_strides,
-            latent_space_dim=D,
-            embeddings_size=K,
-            dropout_rate=dropout_rate_vqvae
-        )
-    else:
-        vqvae = VQ_VAE(
-            input_shape=(256, TARGET_TIME_FRAMES, 1),
-            conv_filters=conv_filters,
-            conv_kernels=conv_kernels,
-            conv_strides=conv_strides,
-            latent_space_dim=D,
-            embeddings_size=K,
-            dropout_rate=dropout_rate_vqvae
-        )
-    checkpoint = torch.load(vqvae_model_path, map_location=device, weights_only=False)
-    vqvae.load_state_dict(checkpoint['model_state'])
-    vqvae.to(device)
-    vqvae.eval()
-
     # Creating Datasets
-    # load Data
+    # load data
     spectrograms_data, _ = load_maestro(spectrograms_path, TARGET_TIME_FRAMES)
     # split into train/val
     num_samples = len(spectrograms_data)
@@ -135,11 +94,14 @@ def train_pixel_cnn(pixelcnn_config_path: str, vqvae_model_path: str):
     optimizer = optim.Adam(pixel_cnn.parameters(), lr=learning_rate)
     criterion = nn.CrossEntropyLoss()
 
-    # 5. Training Loop
+    # Training Loop
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     save_path_dir = os.path.join(save_dir, f"{model_name}", current_time)
     os.makedirs(save_path_dir, exist_ok=True)
-    
+
+    # Inject K into pixelcnn_config before saving, so load_pixelcnn_model can find it
+    pixelcnn_config['model']['K'] = K
+
     # Save the pixelcnn config for reproducibility
     with open(os.path.join(save_path_dir, "config.yaml"), 'w') as f:
         yaml.dump(pixelcnn_config, f)
