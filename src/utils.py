@@ -190,7 +190,14 @@ def load_vqvae_model(model_path: str, device: torch.device, weights_file: str = 
             model_file = os.path.join(model_path, weights_file)
         else:
             # Check config for preference, default to model.pth
-            choice = config.get('training', {}).get('weights_file_choice')
+            # Try 'testing' section first (new standard), then 'training' (legacy), then default
+            choice = config.get('testing', {}).get('weights_file_choice')
+            if not choice:
+                choice = config.get('training', {}).get('weights_file_choice')
+            
+            if not choice:
+                choice = "model.pth"
+                
             model_file = os.path.join(model_path, choice)
     
     # Initialize model structure using the helper function
@@ -203,7 +210,7 @@ def load_vqvae_model(model_path: str, device: torch.device, weights_file: str = 
     
     return model
 
-def load_pixelcnn_model(model_path: str, device: torch.device):
+def load_pixelcnn_model(model_path: str, device: torch.device, weights_file: str = None, num_embeddings: int = None):
     """
     Loads a PixelCNN model from a given path.
     
@@ -211,6 +218,8 @@ def load_pixelcnn_model(model_path: str, device: torch.device):
         model_path (str): Path to the model file (.pth) or the directory containing it.
                           If a directory is provided, it looks for 'best_pixelcnn_model.pth' and 'config.yaml'.
         device (torch.device): Device to load the model onto.
+        weights_file (str, optional): Specific weights file name.
+        num_embeddings (int, optional): Number of embeddings (K). If provided, overrides config.
         
     Returns:
         torch.nn.Module: The loaded PixelCNN model.
@@ -237,14 +246,15 @@ def load_pixelcnn_model(model_path: str, device: torch.device):
     num_layers = model_config['num_layers']
     kernel_size = model_config['kernel_size']
     
-    # K (num_embeddings) must be in the config. 
-    # Ensure training script saves it.
-    if 'K' in model_config:
+    # K (num_embeddings) must be in the config or provided. 
+    if num_embeddings is not None:
+        K = num_embeddings
+    elif 'K' in model_config:
         K = model_config['K']
     elif 'num_embeddings' in model_config:
         K = model_config['num_embeddings']
     else:
-        raise ValueError("Model config must contain 'K' or 'num_embeddings' to initialize PixelCNN.")
+        raise ValueError("Model config must contain 'K' or 'num_embeddings' to initialize PixelCNN, or it must be passed as an argument.")
 
     pixel_cnn = ConditionalGatedPixelCNN(
         in_channels=1,

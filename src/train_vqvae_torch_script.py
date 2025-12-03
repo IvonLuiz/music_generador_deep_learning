@@ -51,6 +51,12 @@ config_file_path = os.path.join(run_dir, "config.yaml")
 print(f"Training configuration loaded from {config_path}")
 print(f"Model will be saved to: {model_file_path}")
 
+# Ensure testing configuration is present for future loading
+if 'testing' not in config:
+    config['testing'] = {}
+if 'weights_file_choice' not in config['testing']:
+    config['testing']['weights_file_choice'] = 'model.pth'
+
 # Save the config used for this training run immediately
 with open(config_file_path, 'w') as f:
     yaml.dump(config, f)
