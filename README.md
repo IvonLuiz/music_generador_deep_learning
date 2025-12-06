@@ -13,12 +13,26 @@ pip install -r requirements.txt
 
 ## Project Roadmap
 
-- [ ] **Train the VQ-VAE on larger dataset**
-- [] **Fix Noisy VQ-VAE output**:
-  - [] Try residual network training
-  - [x] Try inverse filters (32, 64, 128, 256)
-  - [x] Increase filters size (32, 64, 128, 256) -> (62, 128, 256, 512)
-- [ ] **Train the Prior (The "Composer") model**
+- **VQ-VAE TODO**:
+  - [ ] **Train the VQ-VAE on larger dataset**
+  - [] **Fix Noisy VQ-VAE output**:
+    - [x] Try residual network training
+      - This improved
+    - [x] Try inverse filters (32, 64, 128, 256)
+      - This improved
+    - [x] Increase filters size (32, 64, 128, 256) -> (62, 128, 256, 512)
+- **Prior (The "Composer") model TODO**
+  - Implement Prior archtectures:
+    - [ ] PixelCNN
+    - [X] CondicionalPixelCNN
+    - [ ] WaveNet
+    - [ ] Transformer GPT like
+  - Train Prior:
+    - [ ] PixelCNN
+    - [ ] CondicionalPixelCNN
+      - [ ] Need a dataset with vectors for different genres
+    - [ ] WaveNet
+    - [ ] Transformer GPT like
   - The paper suggests using a PixelCNN for images (2D data like spectrograms) or a WaveNet for raw audio.
   - Potential approach: Modern Transformer (like GPT).
   - **Task**: Autoregressive prediction. Given code $z_1, z_2, ... z_{t-1}$, predict code $z_t$.
