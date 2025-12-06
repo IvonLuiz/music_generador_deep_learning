@@ -5,19 +5,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import pickle
-import yaml
 
-from modeling.torch.vq_vae import VQ_VAE
-from modeling.torch.vq_vae_residual import VQ_VAE as VQ_VAE_Residual
 from modeling.torch.train_vq import *
 from generation.generate import *
-from utils import load_maestro, find_min_max_for_path, load_config
+from utils import load_maestro, find_min_max_for_path, load_config, load_vqvae_model
 from processing.preprocess_audio import TARGET_TIME_FRAMES, MIN_MAX_VALUES_SAVE_DIR
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 # Load configuration
-CONFIG_PATH = "./config/config.yaml"
+CONFIG_PATH = "./config/config_vqvae.yaml"
 config = load_config(CONFIG_PATH)
 
 # Optional: faster matmul on Ampere+ GPUs
@@ -31,85 +28,51 @@ if torch.cuda.is_available():
     print("Capability:", torch.cuda.get_device_capability(0))
     print("CUDA memory allocated (MB):", round(torch.cuda.memory_allocated(0)/1024**2, 2))
 
+## Prepare paths and directories
 current_datetime = datetime.now()
 formatted_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 
-# Try to load the latest trained model path
-LATEST_MODEL_POINTER = os.path.join(config['training']['save_dir'], "latest_model_path.txt")
-if os.path.exists(LATEST_MODEL_POINTER):
-    with open(LATEST_MODEL_POINTER, 'r') as f:
-        MODEL_PATH = f.read().strip()
-    print(f"Using latest model from: {MODEL_PATH}")
+# Construct the full path to the specific run directory
+run_dir_name = str(config['testing']['specific_run_dir'])
+base_save_dir = config['training']['save_dir']
+run_dir = os.path.join(base_save_dir, run_dir_name)
+
+# Load run-specific config to ensure dataset params match
+run_config_path = os.path.join(run_dir, "config.yaml")
+if os.path.exists(run_config_path):
+    print(f"Loading run-specific config from {run_config_path}")
+    run_config = load_config(run_config_path)
+    config.update(run_config)
 else:
-    print(f"Latest model pointer not found: {LATEST_MODEL_POINTER}.")
-    exit(1)
+    print(f"Warning: Run-specific config not found at {run_config_path}. Using global config.")
 
-# Load the config specific to this model run if it exists
-model_run_config_path = os.path.join(os.path.dirname(MODEL_PATH), "config.yaml")
-if os.path.exists(model_run_config_path):
-    print(f"Loading run-specific config from {model_run_config_path}")
-    run_config = load_config(model_run_config_path)
-    # Update model params from the run config to ensure architecture matches
-    config['model'] = run_config['model']
+weights_file = config['testing']['weights_file_choice']
 
-# Model parameters
-K = config['model']['K']
-D = config['model']['D']
-conv_filters = tuple(config['model']['conv_filters'])
-conv_kernels = tuple(config['model']['conv_kernels'])
-conv_strides = tuple([tuple(s) for s in config['model']['conv_strides']])
-dropout_rate = config['model'].get('dropout_rate', 0.0)
-use_residual = config['model'].get('use_residual', False)
-
-SPECTROGRAMS_PATH = config['dataset']['processed_path']
-MIN_MAX_VALUES_FILE_PATH = MIN_MAX_VALUES_SAVE_DIR + "min_max_values.pkl"
-HOP_LENGTH = config['dataset']['hop_length']
+spectrograms_path = config['dataset']['processed_path']
+min_max_values_file_path = MIN_MAX_VALUES_SAVE_DIR + "min_max_values.pkl"
+hop_length = config['dataset']['hop_length']
 
 SAVE_DIR = f"samples/{config['model']['name']}/{formatted_time}/"
 
-print('SPECTROGRAMS_PATH =', SPECTROGRAMS_PATH)
-print('MIN_MAX_VALUES_FILE_PATH =', MIN_MAX_VALUES_FILE_PATH)
+print('spectrograms_path =', spectrograms_path)
+print('min_max_values_file_path =', min_max_values_file_path)
 
-with open(MIN_MAX_VALUES_FILE_PATH, 'rb') as f:
+with open(min_max_values_file_path, 'rb') as f:
     min_max_values = pickle.load(f)
 
-specs, file_paths = load_maestro(SPECTROGRAMS_PATH, TARGET_TIME_FRAMES)
+specs, file_paths = load_maestro(spectrograms_path, TARGET_TIME_FRAMES)
 print(specs.shape)
 print("Data range:", specs.min(), "to", specs.max())
 data_variance = np.var(specs)
 
-if use_residual:
-    print("Initializing Residual VQ-VAE...")
-    VQVAE = VQ_VAE_Residual(
-        input_shape=(256, specs.shape[2], 1),
-        conv_filters=conv_filters,
-        conv_kernels=conv_kernels,
-        conv_strides=conv_strides,
-        embeddings_size=K,
-        latent_space_dim=D,
-        dropout_rate=dropout_rate
-    )
-else:
-    print("Initializing Standard VQ-VAE...")
-    VQVAE = VQ_VAE(
-        input_shape=(256, specs.shape[2], 1),
-        conv_filters=conv_filters,
-        conv_kernels=conv_kernels,
-        conv_strides=conv_strides,
-        embeddings_size=K,
-        latent_space_dim=D,
-        dropout_rate=dropout_rate
-    )
-
-# Load trained model
-print(f"Model path: {MODEL_PATH}")
-ckpt = torch.load(MODEL_PATH, map_location='cuda')
-VQVAE.load_state_dict(ckpt['model_state'])
-VQVAE.eval()
+## Load trained model
+print(f"Model path: {run_dir}")
+print(f"Weights file: {weights_file}")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+vqvae_model = load_vqvae_model(run_dir, device, weights_file=weights_file)
 
 ## Generate
-sound_generator = SoundGenerator(VQVAE, hop_length=HOP_LENGTH)
-
+sound_generator = SoundGenerator(vqvae_model, hop_length=hop_length)
 
 # Sample some spectrograms
 np.random.seed(42)
@@ -120,7 +83,7 @@ sampled_paths = [file_paths[i] for i in indexes]
 
 sampled_min_max_values = []
 for p in sampled_paths:
-    mm = find_min_max_for_path(p, min_max_values, SPECTROGRAMS_PATH)
+    mm = find_min_max_for_path(p, min_max_values, spectrograms_path)
     if mm is None:
         print(f"Warning: no min/max for {p}; using default")
         mm = {"min": -80.0, "max": 0.0}
