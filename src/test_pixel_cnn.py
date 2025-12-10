@@ -1,7 +1,7 @@
 import os
+import argparse
 import torch
 import torch.nn.functional as F
-import numpy as np
 from datetime import datetime
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -48,7 +48,6 @@ def decode_indices(indices, vqvae_model):
     """
     Decode indices (B, H, W) to spectrograms using the trained VQ-VAE decoder.
     """
-    device = indices.device
     vqvae_model.eval()
     
     with torch.no_grad():
@@ -133,19 +132,24 @@ def test_pixel_cnn(pixelcnn_model_path: str, vqvae_model_path: str, num_samples:
         plt.close()
 
 if __name__ == "__main__":
-    # Update these paths to your trained models
-    VQVAE_PATH = "models/vq_vae/2025-11-24_00-17-34" # Example path
-    PIXELCNN_PATH = "models/pixelcnn_maestro2011/2025-11-30_17-57-20" # Example path
-    MIN_MAGNITUDE = -40.0   # dB
-    MAX_MAGNITUDE = 40.0    # dB
-    NUM_SAMPLES = 5
+    parser = argparse.ArgumentParser(description="Test PixelCNN model")
+    parser.add_argument("--vqvae_path", type=str, default="models/vq_vae/2025-11-24_00-17-34", help="Path to VQ-VAE model")
+    parser.add_argument("--pixelcnn_path", type=str, default="models/pixelcnn_maestro2011/2025-11-30_17-57-20", help="Path to PixelCNN model")
+    parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to generate")
+    parser.add_argument("--min_db", type=float, default=-40.0, help="Minimum dB value")
+    parser.add_argument("--max_db", type=float, default=40.0, help="Maximum dB value")
+    
+    args = parser.parse_args()
+    
+    VQVAE_PATH = args.vqvae_path
+    PIXELCNN_PATH = args.pixelcnn_path
     
     # Check if paths exist, if not, try to find them or warn user
     if not os.path.exists(VQVAE_PATH):
-        print(f"Warning: VQ-VAE path {VQVAE_PATH} does not exist. Please update the path in the script.")
+        print(f"Warning: VQ-VAE path {VQVAE_PATH} does not exist. Please provide a valid path.")
         exit(1)
     if not os.path.exists(PIXELCNN_PATH):
-        print(f"Warning: PixelCNN path {PIXELCNN_PATH} does not exist. Please update the path in the script.")
+        print(f"Warning: PixelCNN path {PIXELCNN_PATH} does not exist. Please provide a valid path.")
         exit(1)
         
-    test_pixel_cnn(PIXELCNN_PATH, VQVAE_PATH, num_samples=NUM_SAMPLES, default_min_db=MIN_MAGNITUDE, default_max_db=MAX_MAGNITUDE)
+    test_pixel_cnn(PIXELCNN_PATH, VQVAE_PATH, num_samples=args.num_samples, default_min_db=args.min_db, default_max_db=args.max_db)
