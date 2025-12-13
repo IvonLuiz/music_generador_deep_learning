@@ -7,7 +7,7 @@ from modeling.torch.vq_vae import VQ_VAE
 from modeling.torch.vq_vae_residual import VQ_VAE as VQ_VAE_Residual
 from modeling.torch.train_vq import *
 from generation.generate import *
-from utils import load_maestro, load_config, load_vqvae_model, initialize_vqvae_model
+from utils import load_maestro, load_config, initialize_vqvae_model
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
