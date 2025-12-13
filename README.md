@@ -21,6 +21,8 @@ pip install -r requirements.txt
     - [x] Try inverse filters (32, 64, 128, 256)
       - This improved
     - [x] Increase filters size (32, 64, 128, 256) -> (62, 128, 256, 512)
+  - [ ] Increase latent space:
+    - [ ] Decrease strides
 - **Prior (The "Composer") model TODO**
   - Implement Prior archtectures:
     - [ ] PixelCNN
@@ -29,7 +31,7 @@ pip install -r requirements.txt
     - [ ] Transformer GPT like
   - Train Prior:
     - [ ] PixelCNN
-    - [ ] CondicionalPixelCNN
+    - [X] CondicionalPixelCNN
       - [ ] Need a dataset with vectors for different genres
     - [ ] WaveNet
     - [ ] Transformer GPT like

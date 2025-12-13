@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 from datetime import datetime
@@ -197,12 +197,29 @@ if __name__ == "__main__":
     
     # Find latest VQ-VAE model
     vqvae_global_config = load_config(VQVAE_CONFIG_PATH)
-    LATEST_MODEL_POINTER = os.path.join(vqvae_global_config['training']['save_dir'], "latest_model_path.txt")
+    save_dir = vqvae_global_config['training']['save_dir']
     
-    if os.path.exists(LATEST_MODEL_POINTER):
-        with open(LATEST_MODEL_POINTER, 'r') as f:
-            MODEL_PATH = f.read().strip()
-        print(f"Using latest VQ-VAE model: {MODEL_PATH}")
+    # Search for the latest run directory
+    MODEL_PATH = None
+    if os.path.exists(save_dir):
+        # Get all subdirectories
+        subdirs = [os.path.join(save_dir, d) for d in os.listdir(save_dir) if os.path.isdir(os.path.join(save_dir, d))]
+        # Filter for directories that contain a model file
+        valid_runs = []
+        for d in subdirs:
+            # Check for common model filenames
+            if os.path.exists(os.path.join(d, "model.pth")) or \
+               any(f.endswith("_model.pth") for f in os.listdir(d)):
+                 valid_runs.append(d)
+        
+        if valid_runs:
+            # Sort by name (assuming timestamp format YYYY-MM-DD_HH-MM-SS which sorts chronologically)
+            # or by modification time
+            latest_run = max(valid_runs, key=os.path.getmtime)
+            MODEL_PATH = latest_run
+            print(f"Found latest VQ-VAE model run: {MODEL_PATH}")
+    
+    if MODEL_PATH:
         train_pixel_cnn(PIXELCNN_CONFIG_PATH, MODEL_PATH)
     else:
-        print("No latest model found. Please provide path manually or train VQ-VAE first.")
+        print(f"No VQ-VAE models found in {save_dir}. Please provide path manually or train VQ-VAE first.")
