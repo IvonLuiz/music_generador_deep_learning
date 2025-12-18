@@ -195,4 +195,26 @@ class VQ_VAE_Hierarchical(nn.Module):
         x_recon = torch.sigmoid(x_recon)  # Assuming input images are normalized between 0 and 1
         
         # VQ Losses return
-        return x_recon, (vq_loss_top, codebook_loss_top, commitment_loss_top), (vq_loss_bottom, codebook_loss_bottom, commitment_loss_bottom)
+        total_vq_loss = vq_loss_top + vq_loss_bottom
+        return x_recon, total_vq_loss, (vq_loss_top, codebook_loss_top, commitment_loss_top), (vq_loss_bottom, codebook_loss_bottom, commitment_loss_bottom)
+
+    def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Reconstruct input x using the trained model.
+        Args:
+            x: Input tensor of shape (B, C, H, W)
+        Returns:
+            x_recon: Reconstructed tensor of shape (B, C, H, W)
+        """
+        self.eval()
+        with torch.no_grad():
+            x_recon, _, _ = self.forward(x)
+        return x_recon
+
+def vqvae_hierarchical_loss(x, x_recon, vq_losses_top, vq_losses_bottom, variance: float = 1.0):
+    # Likelihood term ~ scaled MSE
+    recon = F.mse_loss(x_recon, x) / (2 * variance)
+    vq_loss_top, codebook_loss_top, commitment_loss_top = vq_losses_top
+    vq_loss_bottom, codebook_loss_bottom, commitment_loss_bottom = vq_losses_bottom
+    total_vq_loss = vq_loss_top + vq_loss_bottom
+    return recon + total_vq_loss, recon
