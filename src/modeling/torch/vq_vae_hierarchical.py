@@ -66,7 +66,7 @@ class DecoderBlock(nn.Module):
             layers.append(nn.Dropout(dropout_rate))
 
         self._net = nn.Sequential(*layers)
-    
+
     def forward(self, x):
         x = self._net(x)
         return x
@@ -78,7 +78,7 @@ class VQ_VAE_Hierarchical(nn.Module):
     
     This implementation on the paper Generating Diverse High-Fidelity Images with VQ-VAE-2 (https://arxiv.org/abs/1906.00446).
     """
-    
+
     def __init__(self,
                  input_shape: Tuple[int, int, int],
                  dim_bottom: int = 64,
@@ -97,7 +97,7 @@ class VQ_VAE_Hierarchical(nn.Module):
         
         super().__init__()
         H, W, C = input_shape
-        
+
         ## ENCODER PATH
         # Bottom: image -> bottom latents (e.g., 256 -> 128 -> 64)
         self.encoder_bottom = nn.Sequential(
@@ -112,7 +112,7 @@ class VQ_VAE_Hierarchical(nn.Module):
                          stride=2,
                          dropout_rate=dropout_rate) # H/4
         )
-        
+
         # Top: bottom latents -> top latents (e.g., 64 -> 32)
         self.encoder_top = nn.Sequential(
             EncoderBlock(in_channels=dim_bottom,
@@ -129,7 +129,7 @@ class VQ_VAE_Hierarchical(nn.Module):
         self.vq_bottom = VectorQuantizer(num_embeddings=num_embeddings_bottom,
                                          embedding_dim=dim_bottom,
                                          beta=beta)
-        
+
         ## PRE-QUANT CONVS
         # 1x1 conv to adjust channels before quantization if needed
         self.pre_vq_conv_top = nn.Conv2d(in_channels=dim_top,
@@ -138,7 +138,7 @@ class VQ_VAE_Hierarchical(nn.Module):
         self.pre_vq_conv_bottom = nn.Conv2d(in_channels=dim_bottom,
                                             out_channels=dim_bottom,
                                             kernel_size=1)
-        
+
         ## DECODER PATH
         # Top: top latents -> upsampled to bottom size
         self.decoder_top = nn.Sequential(
@@ -148,7 +148,7 @@ class VQ_VAE_Hierarchical(nn.Module):
                          num_residual_layers=num_residual_layers,
                          dropout_rate=dropout_rate), # H/4
         )
-        
+
         # Bottom: bottom latents + upsampled top -> reconstructed image
         self.decoder_bottom = nn.Sequential(
             DecoderBlock(in_channels=dim_bottom * 2,
@@ -162,4 +162,37 @@ class VQ_VAE_Hierarchical(nn.Module):
                          num_residual_layers=num_residual_layers,
                          dropout_rate=dropout_rate), # H
         )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Forward pass through the hierarchical VQ-VAE.
+        Args:
+            x: Input tensor of shape (B, C, H, W)
+        Returns:
+            x_recon: Reconstructed tensor of shape (B, C, H, W)
+            vq_losses: List of VQ losses from top and bottom quantizers
+        """
+        # Encoder
+        z_bottom = self.encoder_bottom(x)  # (B, dim_bottom, H/4, W/4)
+        z_top = self.encoder_top(z_bottom)  # (B, dim_top, H/8, W/8)
         
+        # Quantization
+        ## top
+        z_top = self.pre_vq_conv_top(z_top)  # (B, dim_top, H/8, W/8)
+        z_top_q, _, vq_loss_top, codebook_loss_top, commitment_loss_top = self.vq_top(z_top)
+        
+        ## bottom
+        # Note: In VQ-VAE-2, bottom can be conditioned on top during quantization,
+        # but standard implementation often quantizes the bottom features directly 
+        # for reconstruction training, letting the decoder learn the merger.
+        z_bottom = self.pre_vq_conv_bottom(z_bottom)  # (B, dim_bottom, H/4, W/4)
+        z_bottom_q, _, vq_loss_bottom, codebook_loss_bottom, commitment_loss_bottom = self.vq_bottom(z_bottom)
+
+        # Decoder
+        z_top_upsampled = self.decoder_top(z_top_q)  # (B, dim_bottom, H/4, W/4)
+        z_combined = torch.cat([z_bottom_q, z_top_upsampled], dim=1)  # (B, dim_bottom*2, H/4, W/4)
+        x_recon = self.decoder_bottom(z_combined)  # (B, C, H, W)
+        x_recon = torch.sigmoid(x_recon)  # Assuming input images are normalized between 0 and 1
+        
+        # VQ Losses return
+        return x_recon, (vq_loss_top, codebook_loss_top, commitment_loss_top), (vq_loss_bottom, codebook_loss_bottom, commitment_loss_bottom)
