@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vq_vae_residual import ResidualStack
-from .vector_quantizer import VectorQuantizer
+from modeling.torch.vector_quantizer import VectorQuantizer
 
 class EncoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, dropout_rate=0.0):
