@@ -10,7 +10,7 @@ import sys
 # Add 'src' to sys.path to allow imports from sibling directories
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from modeling.torch.train_vq_utils import *
+from train_scripts.train_vq_utils import *
 from generation.generate import *
 from utils import load_maestro, find_min_max_for_path, load_config, load_vqvae_model
 from processing.preprocess_audio import TARGET_TIME_FRAMES, MIN_MAX_VALUES_SAVE_DIR
