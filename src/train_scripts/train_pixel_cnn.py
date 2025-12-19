@@ -8,6 +8,10 @@ import numpy as np
 from datetime import datetime
 import yaml
 import matplotlib.pyplot as plt
+import sys
+
+# Add 'src' to sys.path to allow imports from sibling directories
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
 from datasets.quantized_dataset import QuantizedDataset
@@ -38,7 +42,7 @@ def train_pixel_cnn(pixelcnn_config_path: str, vqvae_model_path: str):
     # But we still need K for PixelCNN initialization
     print(f"Loading VQ-VAE model from {vqvae_model_path}")
     vqvae = load_vqvae_model(vqvae_model_path, device)
-    K = vqvae.embeddings.num_embeddings
+    K = vqvae.vq.num_embeddings
     print(f"Extracted K={K} from VQ-VAE model")
 
     # PixelCNN Parameters
