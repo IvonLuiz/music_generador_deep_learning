@@ -1,0 +1,28 @@
+dataset:
+  raw_path: "./data/raw/maestro-v3.0.0/2011"
+  processed_path: "./data/processed/maestro_spectrograms_test/"
+  sample_rate: 22050
+  hop_length: 256
+  frame_size: 512
+  target_time_frames: 256
+
+model:
+  name: "vq_vae_hierarquical_maestro2011"
+  dim_bottom: 256
+  dim_top: 512
+  num_residual_layers: 2
+  num_embeddings_top: 512
+  num_embeddings_bottom: 512
+  beta: 0.25
+  dropout_rate: 0.0
+
+training:
+  batch_size: 32
+  learning_rate: 0.0002
+  epochs: 150
+  validation_split: 0.2
+  save_dir: "./models/vq_vae_hierarquical/"
+
+testing:
+  specific_run_dir:   # date format: YYYY-MM-DD_HH-MM-SS when was trained (merged in code with trained.save_dir)
+  weights_file_choice: "model.pth"  # options: "model.pth", "best_model.pth" ...
