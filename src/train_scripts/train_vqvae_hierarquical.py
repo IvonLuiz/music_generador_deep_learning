@@ -9,8 +9,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
 from generation.generate import *
-from utils import load_maestro, load_config, initialize_vqvae_model
-from train_scripts.train_vq_utils import train_vqvae_hierarchical
+from utils import load_maestro, load_config, initialize_vqvae_hierarchical_model
+from train_scripts.train_vqvae2_utils import train_vqvae_hierarquical
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -66,17 +66,17 @@ if __name__ == "__main__":
     data_variance = np.var(x_train)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    vqvae_hierarquical_model = initialize_vqvae_model(config['model'], device)
+    vqvae_hierarquical_model = initialize_vqvae_hierarchical_model(config['model'], device)
     
     # Train the VQ-VAE Hierarchical model
-    train_vqvae_hierarchical(
+    train_vqvae_hierarquical(
         model=vqvae_hierarquical_model,
-        data=x_train,
+        x_train=x_train,
         device=device,
         batch_size=batch_size,
         learning_rate=learning_rate,
         epochs=epochs,
-        model_save_path=model_file_path,
+        save_path=model_file_path,
         data_variance=data_variance
     )
     print("Training completed.")
