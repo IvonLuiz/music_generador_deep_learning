@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vq_vae_residual import ResidualStack
+from .vq_vae_residual import ResidualStack
 from modeling.torch.vector_quantizer import VectorQuantizer
 
 class EncoderBlock(nn.Module):
@@ -93,6 +93,11 @@ class VQ_VAE_Hierarchical(nn.Module):
             dim_bottom: Channels for the bottom latent space.
             dim_top: Channels for the top latent space.
             embeddings_size: Size of the codebook (K).
+            num_residual_layers: Number of residual layers in each block.
+            num_embeddings_top: Number of embeddings in the top vector quantizer.
+            num_embeddings_bottom: Number of embeddings in the bottom vector quantizer.
+            beta: Commitment loss coefficient.
+            dropout_rate: Dropout rate for regularization.
         """
         
         super().__init__()
@@ -196,7 +201,7 @@ class VQ_VAE_Hierarchical(nn.Module):
         
         # VQ Losses return
         total_vq_loss = vq_loss_top + vq_loss_bottom
-        return x_recon, total_vq_loss, (vq_loss_top, codebook_loss_top, commitment_loss_top), (vq_loss_bottom, codebook_loss_bottom, commitment_loss_bottom)
+        return x_recon, total_vq_loss, [(vq_loss_top, codebook_loss_top, commitment_loss_top), (vq_loss_bottom, codebook_loss_bottom, commitment_loss_bottom)]
 
     def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
         """
