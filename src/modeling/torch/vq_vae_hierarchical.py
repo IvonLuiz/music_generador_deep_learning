@@ -8,10 +8,9 @@ from .vq_vae_residual import ResidualStack
 from modeling.torch.vector_quantizer import VectorQuantizer
 
 class EncoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, dropout_rate=0.0):
+    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1):
         super().__init__()
         layers = []
-        
         stride = (stride, stride) if isinstance(stride, int) else stride  # normalize stride to tuple if it's an int
 
         # Downsampling conv
@@ -23,9 +22,6 @@ class EncoderBlock(nn.Module):
                                 padding=padding))
         layers.append(nn.BatchNorm2d(out_channels))
         layers.append(nn.ReLU(inplace=True))
-
-        if dropout_rate > 0:
-            layers.append(nn.Dropout(dropout_rate))
 
         # Residual Stack after downsampling
         layers.append(ResidualStack(in_channels=out_channels,
@@ -41,17 +37,16 @@ class EncoderBlock(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, dropout_rate=0.0):
+    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, final_relu=True):
         super().__init__()
         layers = []
+        stride = (stride, stride) if isinstance(stride, int) else stride  # normalize stride to tuple if it's an int
 
         # Residual Stack before upsampling
         layers.append(ResidualStack(in_channels=in_channels,
                                     num_hiddens=in_channels,
                                     num_residual_hiddens=in_channels // 2,
                                     num_residual_layers=num_residual_layers))
-
-        stride = (stride, stride) if isinstance(stride, int) else stride  # normalize stride to tuple if it's an int
 
         # Upsampling conv (Transpose Conv)
         layers.append(nn.ConvTranspose2d(in_channels,
@@ -61,9 +56,6 @@ class DecoderBlock(nn.Module):
                                          padding=padding))
         layers.append(nn.BatchNorm2d(out_channels))
         layers.append(nn.ReLU(inplace=True))
-
-        if dropout_rate > 0:
-            layers.append(nn.Dropout(dropout_rate))
 
         self._net = nn.Sequential(*layers)
 
@@ -86,8 +78,7 @@ class VQ_VAE_Hierarchical(nn.Module):
                  num_residual_layers: int = 2,
                  num_embeddings_top: int = 512,
                  num_embeddings_bottom: int = 512,
-                 beta: float = 0.25,
-                 dropout_rate: float = 0.0):
+                 beta: float = 0.25):
         """
         Args:
             dim_bottom: Channels for the bottom latent space.
@@ -97,7 +88,6 @@ class VQ_VAE_Hierarchical(nn.Module):
             num_embeddings_top: Number of embeddings in the top vector quantizer.
             num_embeddings_bottom: Number of embeddings in the bottom vector quantizer.
             beta: Commitment loss coefficient.
-            dropout_rate: Dropout rate for regularization.
         """
         
         super().__init__()
@@ -109,13 +99,11 @@ class VQ_VAE_Hierarchical(nn.Module):
             EncoderBlock(in_channels=C,
                          out_channels=dim_bottom // 2,
                          num_residual_layers=num_residual_layers,
-                         stride=2,
-                         dropout_rate=dropout_rate), # H/2
+                         stride=2), # H/2
             EncoderBlock(in_channels=dim_bottom // 2,
                          out_channels=dim_bottom,
                          num_residual_layers=num_residual_layers,
-                         stride=2,
-                         dropout_rate=dropout_rate) # H/4
+                         stride=2) # H/4
         )
 
         # Top: bottom latents -> top latents (e.g., 64 -> 32)
@@ -123,8 +111,7 @@ class VQ_VAE_Hierarchical(nn.Module):
             EncoderBlock(in_channels=dim_bottom,
                          out_channels=dim_top,
                          num_residual_layers=num_residual_layers,
-                         stride=2,
-                         dropout_rate=dropout_rate), # H/8
+                         stride=2), # H/8
         )
 
         ## VECTOR QUANTIZERS
@@ -150,8 +137,7 @@ class VQ_VAE_Hierarchical(nn.Module):
             DecoderBlock(in_channels=dim_top,
                          out_channels=dim_bottom,
                          stride=2,
-                         num_residual_layers=num_residual_layers,
-                         dropout_rate=dropout_rate), # H/4
+                         num_residual_layers=num_residual_layers), # H/4
         )
 
         # Bottom: bottom latents + upsampled top -> reconstructed image
@@ -159,13 +145,20 @@ class VQ_VAE_Hierarchical(nn.Module):
             DecoderBlock(in_channels=dim_bottom * 2,
                          out_channels=dim_bottom // 2,
                          stride=2,
-                         num_residual_layers=num_residual_layers,
-                         dropout_rate=dropout_rate), # H/2
-            DecoderBlock(in_channels=dim_bottom // 2,
-                         out_channels=C,
-                         stride=2,
-                         num_residual_layers=num_residual_layers,
-                         dropout_rate=dropout_rate), # H
+                         num_residual_layers=num_residual_layers), # H/2
+            
+            # Final block: H/2 -> H. 
+            # We manually construct this to avoid the final ReLU/BatchNorm in DecoderBlock,
+            # which would restrict the output range before the final Sigmoid.
+            ResidualStack(in_channels=dim_bottom // 2,
+                          num_hiddens=dim_bottom // 2,
+                          num_residual_hiddens=dim_bottom // 4,
+                          num_residual_layers=num_residual_layers),
+            nn.ConvTranspose2d(in_channels=dim_bottom // 2,
+                               out_channels=C,
+                               kernel_size=4,
+                               stride=2,
+                               padding=1)
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
