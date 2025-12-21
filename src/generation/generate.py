@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 
 from generation.soundgenerator import SoundGenerator
 from modeling.torch.vq_vae import VQ_VAE
-from modeling.torch.train_vq import load_fsdd
+from train_scripts.train_vq_utils import load_fsdd
 
 
 HOP_LENGTH = 256

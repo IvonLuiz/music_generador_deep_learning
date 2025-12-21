@@ -218,41 +218,59 @@ def generate_and_save_hierarchical_spectrograms(model, specs, min_max_values, sa
     # Convert reconstructed spectrograms to audio
     reconstructed_signals = sound_generator.convert_spectrograms_to_audio(reconstructed_specs, min_max_values)
 
-    for i, (orig, recon, orig_sig, recon_sig) in enumerate(zip(specs, reconstructed_specs, original_signals, reconstructed_signals)):
+    for i, (orig, recon, orig_sig, recon_sig, min_max_val) in enumerate(zip(specs, reconstructed_specs, original_signals, reconstructed_signals, min_max_values)):
         orig_2d = orig[:, :, 0]
         recon_2d = recon[:, :, 0]
         
-        # Plotting normalized spectrograms (0-1 scale)
+        # Denormalize for visualization
+        orig_min = min_max_val["min"]
+        orig_max = min_max_val["max"]
+        denorm_orig = orig_2d * (orig_max - orig_min) + orig_min
+        denorm_recon = recon_2d * (orig_max - orig_min) + orig_min
+        
+        # Create comparison plot
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
         
         # Original
-        im1 = axes[0].imshow(orig_2d, origin='lower', aspect='auto', cmap='viridis', vmin=0, vmax=1)
-        axes[0].set_title(f'Original {i} (Normalized)')
-        plt.colorbar(im1, ax=axes[0])
+        vmin, vmax = denorm_orig.min(), denorm_orig.max()
+        im1 = axes[0].imshow(denorm_orig, origin='lower', aspect='auto', cmap='viridis', vmin=vmin, vmax=vmax)
+        axes[0].set_title(f'Original Spectrogram\n(Sample {i+1})')
+        axes[0].set_xlabel('Time Frames')
+        axes[0].set_ylabel('Frequency Bins')
+        plt.colorbar(im1, ax=axes[0], label='Magnitude (dB)')
         
         # Recon
-        im2 = axes[1].imshow(recon_2d, origin='lower', aspect='auto', cmap='viridis', vmin=0, vmax=1)
-        axes[1].set_title(f'Reconstructed {i} (Normalized)')
-        plt.colorbar(im2, ax=axes[1])
+        im2 = axes[1].imshow(denorm_recon, origin='lower', aspect='auto', cmap='viridis', vmin=vmin, vmax=vmax)
+        axes[1].set_title(f'VQ-VAE Reconstructed\n(Sample {i+1})')
+        axes[1].set_xlabel('Time Frames')
+        axes[1].set_ylabel('Frequency Bins')
+        plt.colorbar(im2, ax=axes[1], label='Magnitude (dB)')
         
+        # Handle shape mismatch
+        min_time_frames = min(denorm_orig.shape[1], denorm_recon.shape[1])
+        denorm_orig_cropped = denorm_orig[:, :min_time_frames]
+        denorm_recon_cropped = denorm_recon[:, :min_time_frames]
+
         # Diff
-        diff = np.abs(orig_2d - recon_2d)
+        diff = np.abs(denorm_orig_cropped - denorm_recon_cropped)
         im3 = axes[2].imshow(diff, origin='lower', aspect='auto', cmap='hot', vmin=0, vmax=0.4)
-        axes[2].set_title(f'Difference {i}')
-        plt.colorbar(im3, ax=axes[2])
+        axes[2].set_title(f'Reconstruction Error\n(Sample {i+1})\n(Cropped to {min_time_frames} frames)')
+        axes[2].set_xlabel('Time Frames')
+        axes[2].set_ylabel('Frequency Bins')
+        plt.colorbar(im3, ax=axes[2], label='|Error| (dB)')
 
         # Add statistics as text
-        mse = np.mean((orig_2d - recon_2d) ** 2)
-        mae = np.mean(np.abs(orig_2d - recon_2d))
+        mse = np.mean((denorm_orig_cropped - denorm_recon_cropped) ** 2)
+        mae = np.mean(np.abs(denorm_orig_cropped - denorm_recon_cropped))
         
         # Add shape information to the title
-        shape_info = f'Orig: {orig_2d.shape}, Recon: {recon_2d.shape}'
-        fig.suptitle(f'MSE: {mse:.6f}, MAE: {mae:.6f} | {shape_info}', fontsize=10)
+        shape_info = f'Orig: {denorm_orig.shape}, Recon: {denorm_recon.shape}'
+        fig.suptitle(f'MSE: {mse:.6f} dB², MAE: {mae:.6f} dB | {shape_info}', fontsize=10)
         
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f"comparison_{i}.png"))
+        plt.savefig(os.path.join(save_dir, f"comparison_{i+1:03d}.png"), dpi=150, bbox_inches='tight')
         plt.close()
 
         # Save audio
-        sf.write(os.path.join(save_dir, f"original_{i}.wav"), orig_sig, SAMPLE_RATE)
-        sf.write(os.path.join(save_dir, f"reconstructed_{i}.wav"), recon_sig, SAMPLE_RATE)
+        sf.write(os.path.join(save_dir, f"original_{i+1:03d}.wav"), orig_sig, SAMPLE_RATE)
+        sf.write(os.path.join(save_dir, f"reconstructed_{i+1:03d}.wav"), recon_sig, SAMPLE_RATE)
