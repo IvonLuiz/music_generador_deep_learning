@@ -1,6 +1,9 @@
 import os
 import numpy as np
+import matplotlib
+matplotlib.use('Agg') # Set non-interactive backend to avoid thread issues
 import matplotlib.pyplot as plt
+import soundfile as sf
 
 import torch
 from torch import optim
@@ -12,10 +15,15 @@ from tqdm import tqdm
 
 from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
 from datasets.spectrogram_dataset import SpectrogramDataset
+from generation.soundgenerator import SoundGenerator
+from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE
+from utils import find_min_max_for_path
 
 
 def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
                              x_train: np.ndarray,
+                             train_file_paths: list,
+                             min_max_values: dict,
                              data_variance: float,
                              batch_size: int,
                              epochs: int,
@@ -29,6 +37,8 @@ def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
     Args:
         model (VQ_VAE_Hierarchical): The VQ-VAE Hierarchical model to train.
         x_train (np.ndarray): Training spectrogram data.
+        train_file_paths (list): List of file paths corresponding to x_train.
+        min_max_values (dict): Dictionary of min/max values for denormalization.
         data_variance (float): Variance of the training data for loss scaling.
         batch_size (int): Batch size for training.
         learning_rate (float): Learning rate for the optimizer.
@@ -87,6 +97,11 @@ def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
                 loss = recon_loss + total_vq_loss
 
             scaler.scale(loss).backward()
+            
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
 
@@ -128,17 +143,30 @@ def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
             # Plot losses
             plot_vqvae_hierarchical_losses(train_losses_dict, save_path=save_path)
 
-            # Generate and save spectrograms for visualization (every 5 epochs or last one)
-            if (epoch + 1) % 5 == 0 or (epoch + 1) == epochs:
-                epoch_save_dir = os.path.join(os.path.dirname(save_path), "samples", f"epoch_{epoch+1:03d}")
-                # Take first 4 samples for visualization
-                samples = x_train[:4]
-                # We need a dummy min_max_values list if not provided, assuming normalized data
-                dummy_min_max = [{"min": 0.0, "max": 1.0} for _ in range(len(samples))]
+            # Generate and save spectrograms for visualization (every epoch)
+            epoch_save_dir = os.path.join(os.path.dirname(save_path), "samples", f"epoch_{epoch+1:03d}")
+            
+            # Take first 4 samples for visualization
+            samples = x_train[:4]
+            sample_paths = train_file_paths[:4]
+            
+            # Find min/max values for these samples
+            # We need the spectrograms directory to help find_min_max_for_path if needed, 
+            # but usually the full path in sample_paths is enough.
+            # We can infer spectrograms_dir from the first path if needed, or just pass empty string if paths are absolute.
+            spectrograms_dir = os.path.dirname(sample_paths[0])
+            
+            sample_min_max = []
+            for fp in sample_paths:
+                mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
+                if mm is None:
+                    print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
+                    mm = {"min": 0.0, "max": 1.0}
+                sample_min_max.append(mm)
 
-                # We need to create a temporary wrapper or adapt the function since SoundGenerator might expect standard VQ-VAE
-                # For now, let's manually call reconstruction
-                generate_and_save_hierarchical_spectrograms(model, samples, dummy_min_max, epoch_save_dir, device)
+            # We need to create a temporary wrapper or adapt the function since SoundGenerator might expect standard VQ-VAE
+            # For now, let's manually call reconstruction
+            generate_and_save_hierarchical_spectrograms(model, samples, sample_min_max, epoch_save_dir, device)
 
     return model
 
@@ -162,6 +190,9 @@ def plot_vqvae_hierarchical_losses(train_losses_dict: dict, save_path: str):
 def generate_and_save_hierarchical_spectrograms(model, specs, min_max_values, save_dir, device):
     os.makedirs(save_dir, exist_ok=True)
     
+    # Initialize SoundGenerator for audio conversion
+    sound_generator = SoundGenerator(model, hop_length=HOP_LENGTH)
+
     model.eval()
     with torch.no_grad():
         # Prepare input
@@ -176,36 +207,52 @@ def generate_and_save_hierarchical_spectrograms(model, specs, min_max_values, sa
         x_recon = model.reconstruct(x)
         reconstructed_specs = x_recon.cpu().permute(0, 2, 3, 1).numpy()
         
-    # We can reuse the logic from train_vq_utils if we import it, or duplicate for independence.
-    # Duplicating simplified version here for completeness within this file context.
+    # Convert to audio
+    # Note: SoundGenerator expects (N, H, W, 1)
+    # We use the original specs (normalized) and reconstructed specs (normalized)
+    # SoundGenerator handles denormalization internally using min_max_values
     
-    for i, (orig, recon, mm) in enumerate(zip(specs, reconstructed_specs, min_max_values)):
+    # Convert original spectrograms to audio
+    original_signals = sound_generator.convert_spectrograms_to_audio(specs, min_max_values)
+    
+    # Convert reconstructed spectrograms to audio
+    reconstructed_signals = sound_generator.convert_spectrograms_to_audio(reconstructed_specs, min_max_values)
+
+    for i, (orig, recon, orig_sig, recon_sig) in enumerate(zip(specs, reconstructed_specs, original_signals, reconstructed_signals)):
         orig_2d = orig[:, :, 0]
         recon_2d = recon[:, :, 0]
         
-        # Denormalize
-        orig_min, orig_max = mm["min"], mm["max"]
-        denorm_orig = orig_2d * (orig_max - orig_min) + orig_min
-        denorm_recon = recon_2d * (orig_max - orig_min) + orig_min
-        
+        # Plotting normalized spectrograms (0-1 scale)
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
         
         # Original
-        im1 = axes[0].imshow(denorm_orig, origin='lower', aspect='auto', cmap='viridis')
-        axes[0].set_title(f'Original {i}')
+        im1 = axes[0].imshow(orig_2d, origin='lower', aspect='auto', cmap='viridis', vmin=0, vmax=1)
+        axes[0].set_title(f'Original {i} (Normalized)')
         plt.colorbar(im1, ax=axes[0])
         
         # Recon
-        im2 = axes[1].imshow(denorm_recon, origin='lower', aspect='auto', cmap='viridis')
-        axes[1].set_title(f'Reconstructed {i}')
+        im2 = axes[1].imshow(recon_2d, origin='lower', aspect='auto', cmap='viridis', vmin=0, vmax=1)
+        axes[1].set_title(f'Reconstructed {i} (Normalized)')
         plt.colorbar(im2, ax=axes[1])
         
         # Diff
-        diff = np.abs(denorm_orig - denorm_recon)
-        im3 = axes[2].imshow(diff, origin='lower', aspect='auto', cmap='hot')
+        diff = np.abs(orig_2d - recon_2d)
+        im3 = axes[2].imshow(diff, origin='lower', aspect='auto', cmap='hot', vmin=0, vmax=0.4)
         axes[2].set_title(f'Difference {i}')
         plt.colorbar(im3, ax=axes[2])
+
+        # Add statistics as text
+        mse = np.mean((orig_2d - recon_2d) ** 2)
+        mae = np.mean(np.abs(orig_2d - recon_2d))
+        
+        # Add shape information to the title
+        shape_info = f'Orig: {orig_2d.shape}, Recon: {recon_2d.shape}'
+        fig.suptitle(f'MSE: {mse:.6f}, MAE: {mae:.6f} | {shape_info}', fontsize=10)
         
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"comparison_{i}.png"))
         plt.close()
+
+        # Save audio
+        sf.write(os.path.join(save_dir, f"original_{i}.wav"), orig_sig, SAMPLE_RATE)
+        sf.write(os.path.join(save_dir, f"reconstructed_{i}.wav"), recon_sig, SAMPLE_RATE)
