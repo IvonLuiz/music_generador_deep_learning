@@ -66,11 +66,11 @@ if __name__ == "__main__":
         min_max_values = pickle.load(f)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    vqvae_hierarquical_model = initialize_vqvae_hierarchical_model(config['model'], device)
+    vqvae_hierarchical_model = initialize_vqvae_hierarchical_model(config['model'], device)
     
     # Train the VQ-VAE Hierarchical model
     train_vqvae_hierarquical(
-        model=vqvae_hierarquical_model,
+        model=vqvae_hierarchical_model,
         x_train=x_train,
         train_file_paths=file_paths,
         min_max_values=min_max_values,
