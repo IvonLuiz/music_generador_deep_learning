@@ -14,7 +14,6 @@ model:
   num_embeddings_top: 512
   num_embeddings_bottom: 512
   beta: 0.25
-  dropout_rate: 0.0
 
 training:
   batch_size: 32

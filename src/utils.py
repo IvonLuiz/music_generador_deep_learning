@@ -21,7 +21,9 @@ def load_maestro(path, target_time_frames=256, debug_print=False):
     if os.path.exists(cache_path):
         print(f"Found cached dataset at {cache_path}. Loading...")
         try:
-            data = np.load(cache_path)
+            # using mmap_mode='r' to avoid loading the entire dataset into RAM
+            # this allows us to slice it later without holding 2x data in memory
+            data = np.load(cache_path, mmap_mode='r')
             x_train = data['x_train']
             file_paths = data['file_paths']
             print(f"Loaded cached dataset shape: {x_train.shape}")
@@ -183,7 +185,6 @@ def initialize_vqvae_hierarchical_model(config_or_path, device=torch.device('cpu
     num_embeddings_top = model_config['num_embeddings_top']
     num_embeddings_bottom = model_config['num_embeddings_bottom']
     beta = model_config['beta']
-    dropout_rate = model_config.get('dropout_rate', 0.0)
     
     model = VQ_VAE_Hierarchical(
         input_shape=(256, TARGET_TIME_FRAMES, 1),
@@ -192,8 +193,7 @@ def initialize_vqvae_hierarchical_model(config_or_path, device=torch.device('cpu
         num_residual_layers=num_residual_layers,
         num_embeddings_top=num_embeddings_top,
         num_embeddings_bottom=num_embeddings_bottom,
-        beta=beta,
-        dropout_rate=dropout_rate
+        beta=beta
     )
     
     model.to(device)
