@@ -1,11 +1,13 @@
 import os
 import numpy as np
+from typing import Union
 from tqdm import tqdm
 import yaml
 import torch
 
 from modeling.torch.vq_vae import VQ_VAE
 from modeling.torch.vq_vae_residual import VQ_VAE as VQ_VAE_Residual
+from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
 from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
@@ -19,7 +21,9 @@ def load_maestro(path, target_time_frames=256, debug_print=False):
     if os.path.exists(cache_path):
         print(f"Found cached dataset at {cache_path}. Loading...")
         try:
-            data = np.load(cache_path)
+            # using mmap_mode='r' to avoid loading the entire dataset into RAM
+            # this allows us to slice it later without holding 2x data in memory
+            data = np.load(cache_path, mmap_mode='r')
             x_train = data['x_train']
             file_paths = data['file_paths']
             print(f"Loaded cached dataset shape: {x_train.shape}")
@@ -108,7 +112,7 @@ def load_config(config_path):
         config = yaml.safe_load(file)
     return config
 
-def initialize_vqvae_model(config_or_path, device=torch.device('cpu')):
+def initialize_vqvae_model(config_or_path, device=torch.device('cpu')) -> Union[VQ_VAE, VQ_VAE_Residual]:
     """
     Initializes a VQ-VAE model from a configuration dictionary or path.
     
@@ -156,6 +160,41 @@ def initialize_vqvae_model(config_or_path, device=torch.device('cpu')):
             latent_space_dim=D,
             dropout_rate=dropout_rate
         )
+    
+    model.to(device)
+    return model
+
+def initialize_vqvae_hierarchical_model(config_or_path, device=torch.device('cpu')) -> VQ_VAE_Hierarchical:
+    """
+    Initializes a Hierarchical VQ-VAE model from a configuration dictionary or path.
+    
+    Args:
+        config_or_path (dict or str): Configuration dictionary or path to config.yaml.
+        device (torch.device): Device to initialize the model onto.
+    """
+    
+    if isinstance(config_or_path, str):
+        config = load_config(config_or_path)
+    else:
+        config = config_or_path
+
+    model_config = config['model'] if 'model' in config else config
+    dim_bottom = model_config['dim_bottom']
+    dim_top = model_config['dim_top']
+    num_residual_layers = model_config['num_residual_layers']
+    num_embeddings_top = model_config['num_embeddings_top']
+    num_embeddings_bottom = model_config['num_embeddings_bottom']
+    beta = model_config['beta']
+    
+    model = VQ_VAE_Hierarchical(
+        input_shape=(256, TARGET_TIME_FRAMES, 1),
+        dim_bottom=dim_bottom,
+        dim_top=dim_top,
+        num_residual_layers=num_residual_layers,
+        num_embeddings_top=num_embeddings_top,
+        num_embeddings_bottom=num_embeddings_bottom,
+        beta=beta
+    )
     
     model.to(device)
     return model

@@ -2,10 +2,14 @@ from datetime import datetime
 import torch
 import os
 import yaml
+import sys
+
+# Add 'src' to sys.path to allow imports from sibling directories
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modeling.torch.vq_vae import VQ_VAE
 from modeling.torch.vq_vae_residual import VQ_VAE as VQ_VAE_Residual
-from modeling.torch.train_vq import *
+from train_scripts.train_vq_utils import *
 from generation.generate import *
 from utils import load_maestro, load_config, initialize_vqvae_model
 from processing.preprocess_audio import TARGET_TIME_FRAMES

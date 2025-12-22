@@ -16,23 +16,8 @@ from processing.preprocess_audio import HOP_LENGTH
 from generation.soundgenerator import SoundGenerator
 import soundfile as sf
 
-from .vq_vae import VQ_VAE, vqvae_loss
-
-
-class SpectrogramDataset(Dataset):
-    def __init__(self, x: np.ndarray):
-        # Expect (N, H, W, 1) with values in [0,1]
-        assert x.ndim == 4 and x.shape[-1] == 1
-        self.x = x.astype(np.float32)
-
-    def __len__(self):
-        return self.x.shape[0]
-
-    def __getitem__(self, idx):
-        spec = self.x[idx]  # (H, W, 1)
-        # To torch (C,H,W)
-        spec = np.transpose(spec, (2, 0, 1))  # (1, H, W)
-        return torch.from_numpy(spec)
+from modeling.torch.vq_vae import VQ_VAE, vqvae_loss
+from datasets.spectrogram_dataset import SpectrogramDataset
 
 
 def train_vqvae(x_train: np.ndarray,
