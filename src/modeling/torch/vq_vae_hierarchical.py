@@ -14,7 +14,7 @@ class EncoderBlock(nn.Module):
         stride = (stride, stride) if isinstance(stride, int) else stride  # normalize stride to tuple if it's an int
 
         # Downsampling conv
-        # 4x4 conv with stride 2  s standard for VQ-VAE to reduce checkerboard artifacts
+        # 4x4 conv with stride 2 is standard for VQ-VAE to reduce checkerboard artifacts
         layers.append(nn.Conv2d(in_channels,
                                 out_channels,
                                 kernel_size=kernel_size,
