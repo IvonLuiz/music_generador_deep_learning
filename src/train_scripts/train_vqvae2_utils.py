@@ -20,6 +20,41 @@ from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE
 from utils import find_min_max_for_path
 
 
+def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
+                             x_train: np.ndarray,
+                             train_file_paths: list,
+                             min_max_values: dict,
+                             data_variance: float,
+                             batch_size: int,
+                             epochs: int,
+                             learning_rate: float,
+                             save_path: str,
+                             device: torch.device,
+                             amp: bool = True,
+                             x_val: np.ndarray = None,
+                             val_file_paths: list = None):
+    """
+    Wrapper for backward compatibility.
+
+    Use this correctly spelled function name instead of
+    `train_vqvae_hierarquical`. It forwards all arguments to the
+    existing implementation.
+    """
+    return train_vqvae_hierarquical(
+        model=model,
+        x_train=x_train,
+        train_file_paths=train_file_paths,
+        min_max_values=min_max_values,
+        data_variance=data_variance,
+        batch_size=batch_size,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        save_path=save_path,
+        device=device,
+        amp=amp,
+        x_val=x_val,
+        val_file_paths=val_file_paths,
+    )
 def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
                              x_train: np.ndarray,
                              train_file_paths: list,
