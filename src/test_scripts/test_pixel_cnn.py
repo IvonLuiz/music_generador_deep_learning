@@ -5,6 +5,10 @@ import torch.nn.functional as F
 from datetime import datetime
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import sys
+
+# Add 'src' to sys.path to allow imports from sibling directories
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from generation.soundgenerator import SoundGenerator
 from generation.generate import save_multiple_signals
