@@ -237,18 +237,33 @@ def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
 
 def plot_vqvae_hierarchical_losses(train_losses_dict: dict, save_path: str):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    save_file_path = os.path.join(os.path.dirname(save_path), 'vqvae_hierarchical_losses.png')
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(train_losses_dict['total'], label='Total Loss (Train)')
-    plt.plot(train_losses_dict['reconstruction_loss'], label='Reconstruction Loss (Train)')
-    plt.plot(train_losses_dict['vq_loss_top'], label='VQ Loss Top (Train)')
-    plt.plot(train_losses_dict['vq_loss_bottom'], label='VQ Loss Bottom (Train)')
     
+    # --- Training Losses Plot ---
+    save_file_path_train = os.path.join(os.path.dirname(save_path), 'vqvae_hierarchical_losses_train.png')
+    plt.figure(figsize=(12, 6))
+    plt.plot(train_losses_dict['total'], label='Total Loss')
+    plt.plot(train_losses_dict['reconstruction_loss'], label='Reconstruction Loss')
+    plt.plot(train_losses_dict['vq_loss_top'], label='VQ Loss Top')
+    plt.plot(train_losses_dict['vq_loss_bottom'], label='VQ Loss Bottom')
+    
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('VQ-VAE Hierarchical Training Losses')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_file_path_train)
+    plt.close()
+
+    # --- Validation Losses Plot ---
     if 'val_total' in train_losses_dict and len(train_losses_dict['val_total']) > 0:
+        save_file_path_val = os.path.join(os.path.dirname(save_path), 'vqvae_hierarchical_losses_val.png')
+        plt.figure(figsize=(12, 6))
+        
         val_losses = train_losses_dict['val_total']
-        plt.plot(val_losses, label='Total Loss (Val)', linestyle='--')
-        plt.plot(train_losses_dict['val_reconstruction_loss'], label='Reconstruction Loss (Val)', linestyle='--')
+        plt.plot(val_losses, label='Total Loss')
+        plt.plot(train_losses_dict['val_reconstruction_loss'], label='Reconstruction Loss')
+        plt.plot(train_losses_dict['val_vq_loss_top'], label='VQ Loss Top')
+        plt.plot(train_losses_dict['val_vq_loss_bottom'], label='VQ Loss Bottom')
         
         # Find best validation epoch (0-indexed)
         best_val_idx = np.argmin(val_losses)
@@ -265,14 +280,14 @@ def plot_vqvae_hierarchical_losses(train_losses_dict: dict, save_path: str):
                      xy=(best_val_idx, best_val_loss), 
                      xytext=(10, 10), textcoords='offset points',
                      arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=.2'))
-    
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('VQ-VAE Hierarchical Loss Components')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(save_file_path)
-    plt.close()
+        
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('VQ-VAE Hierarchical Validation Losses')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(save_file_path_val)
+        plt.close()
 
 def generate_and_save_hierarchical_spectrograms(model, specs, min_max_values, save_dir, device):
     os.makedirs(save_dir, exist_ok=True)
