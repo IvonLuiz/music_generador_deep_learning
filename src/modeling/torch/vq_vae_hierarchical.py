@@ -83,7 +83,6 @@ class VQ_VAE_Hierarchical(nn.Module):
         Args:
             dim_bottom: Channels for the bottom latent space.
             dim_top: Channels for the top latent space.
-            embeddings_size: Size of the codebook (K).
             num_residual_layers: Number of residual layers in each block.
             num_embeddings_top: Number of embeddings in the top vector quantizer.
             num_embeddings_bottom: Number of embeddings in the bottom vector quantizer.
