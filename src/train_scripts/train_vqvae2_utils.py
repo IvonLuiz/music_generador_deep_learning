@@ -80,7 +80,7 @@ def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
         batch_size (int): Batch size for training.
         learning_rate (float): Learning rate for the optimizer.
         epochs (int): Number of training epochs.
-        model_file_path (str): Path to save the trained model.
+        save_path (str): Path to save the trained model.
         device (torch.device): Device to run the training on (CPU or GPU).
         x_val (np.ndarray): Validation spectrogram data.
         val_file_paths (list): List of file paths corresponding to x_val.
