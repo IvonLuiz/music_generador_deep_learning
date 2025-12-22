@@ -78,12 +78,13 @@ def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
         min_max_values (dict): Dictionary of min/max values for denormalization.
         data_variance (float): Variance of the training data for loss scaling.
         batch_size (int): Batch size for training.
-        learning_rate (float): Learning rate for the optimizer.
         epochs (int): Number of training epochs.
+        learning_rate (float): Learning rate for the optimizer.
         save_path (str): Path to save the trained model.
         device (torch.device): Device to run the training on (CPU or GPU).
-        x_val (np.ndarray): Validation spectrogram data.
-        val_file_paths (list): List of file paths corresponding to x_val.
+        amp (bool, optional): Whether to use automatic mixed precision (AMP) during training. Defaults to True.
+        x_val (np.ndarray, optional): Validation spectrogram data.
+        val_file_paths (list, optional): List of file paths corresponding to x_val.
     """
     model.to(device)
     
