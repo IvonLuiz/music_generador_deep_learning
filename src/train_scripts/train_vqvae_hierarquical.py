@@ -17,12 +17,6 @@ from processing.preprocess_audio import TARGET_TIME_FRAMES, MIN_MAX_VALUES_SAVE_
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 if __name__ == "__main__":
-    # Load configuration
-    config_path = "./config/config_vqvae_hierarchical.yaml"
-    config = load_config(config_path)
-    print(f"Configuration loaded from {config_path}")
-    print(config)
-
     # Optional: faster matmul on Ampere+ GPUs
     try:
         torch.set_float32_matmul_precision('high')
