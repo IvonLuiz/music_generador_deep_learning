@@ -7,7 +7,7 @@ dataset:
   target_time_frames: 256
 
 model:
-  name: "vq_vae_hierarquical_maestro2011"
+  name: "vq_vae_hierarchical_maestro2011"
   dim_bottom: 256
   dim_top: 512
   num_residual_layers: 2
