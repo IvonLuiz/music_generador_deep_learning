@@ -161,14 +161,15 @@ class VQ_VAE_Hierarchical(nn.Module):
                                padding=1)
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """
         Forward pass through the hierarchical VQ-VAE.
         Args:
             x: Input tensor of shape (B, C, H, W)
         Returns:
             x_recon: Reconstructed tensor of shape (B, C, H, W)
-            vq_losses: List of VQ losses from top and bottom quantizers
+            total_vq_loss: Scalar VQ loss combining top and bottom quantizers
+            vq_losses_details: List with entries (vq_loss, codebook_loss, commitment_loss) for top and bottom quantizers
         """
         # Encoder
         z_bottom = self.encoder_bottom(x)  # (B, dim_bottom, H/4, W/4)
