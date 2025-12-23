@@ -17,7 +17,8 @@ from generation.soundgenerator import SoundGenerator
 import soundfile as sf
 
 from modeling.torch.vq_vae import VQ_VAE, vqvae_loss
-from datasets.spectrogram_dataset import SpectrogramDataset
+from datasets.spectrogram_dataset import SpectrogramDataset, MmapSpectrogramDataset
+from callbacks import EarlyStopping, ModelCheckpoint, LossPlotter, SampleGenerator
 
 
 def train_vqvae(x_train: np.ndarray,
@@ -35,7 +36,8 @@ def train_vqvae(x_train: np.ndarray,
                 amp: bool = True,
                 grad_accum_steps: int = 1,
                 max_grad_norm: Optional[float] = None,
-                min_max_values: Optional[list] = None):
+                min_max_values: Optional[list] = None,
+                x_val: Optional[np.ndarray] = None):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -69,7 +71,8 @@ def train_vqvae(x_train: np.ndarray,
         grad_accum_steps=grad_accum_steps,
         max_grad_norm=max_grad_norm,
         model_config=config,
-        min_max_values=min_max_values
+        min_max_values=min_max_values,
+        x_val=x_val
     )
 
 
@@ -84,7 +87,8 @@ def train_model(model: VQ_VAE,
                 grad_accum_steps: int = 1,
                 max_grad_norm: Optional[float] = None,
                 model_config: Optional[dict] = None,
-                min_max_values: Optional[list] = None):
+                min_max_values: Optional[list] = None,
+                x_val: Optional[np.ndarray] = None):
     """
     Train an existing VQ-VAE model.
     
@@ -98,6 +102,7 @@ def train_model(model: VQ_VAE,
         save_path: Optional path to save the model after training
         model_config: Optional dictionary with model configuration to save
         min_max_values: Optional list of min/max values for reconstruction visualization
+        x_val: Optional validation data
     
     Returns:
         The trained model
@@ -106,8 +111,35 @@ def train_model(model: VQ_VAE,
     print(f"Training on device: {device}")
     
     model = model.to(device)
-    ds = SpectrogramDataset(x_train)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    
+    if isinstance(x_train, (np.ndarray, list)):
+        ds = SpectrogramDataset(x_train)
+    else:
+        ds = x_train
+        
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    # Setup Validation Data
+    early_stopping = None
+    val_dataloader = None
+    val_dataset = None
+
+    if x_val is not None:
+        if isinstance(x_val, (np.ndarray, list)):
+            if len(x_val) > 0:
+                print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
+                val_dataset = SpectrogramDataset(x_val)
+                val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+                early_stopping = EarlyStopping(patience=20, verbose=True)
+        else:
+            # Assume x_val is a Dataset
+            print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
+            val_dataset = x_val
+            val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+            early_stopping = EarlyStopping(patience=20, verbose=True)
+    
+    if val_dataloader is None:
+        print(f"Using all {len(x_train)} samples for training (no validation set provided).")
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     torch.backends.cudnn.benchmark = True
@@ -121,6 +153,43 @@ def train_model(model: VQ_VAE,
     }
     
     print("Model will be saved to :", save_path) if save_path else None
+
+    # Initialize Callbacks
+    model_checkpoint = None
+    loss_plotter = None
+    sample_generator = None
+
+    if save_path:
+        model_checkpoint = ModelCheckpoint(save_path, model, optimizer, mode="min")
+        loss_plotter = LossPlotter(save_path)
+        
+        # Prepare samples for visualization
+        if val_dataloader:
+            if isinstance(val_dataset, Dataset):
+                samples = []
+                for i in range(4):
+                    s = val_dataset[i]
+                    s = s.permute(1, 2, 0).numpy()
+                    samples.append(s)
+                samples = np.stack(samples)
+            else:
+                samples = x_val[:4]
+        else:
+            if isinstance(ds, Dataset):
+                samples = []
+                for i in range(4):
+                    s = ds[i]
+                    s = s.permute(1, 2, 0).numpy()
+                    samples.append(s)
+                samples = np.stack(samples)
+            else:
+                samples = x_train[:4]
+        
+        if min_max_values is None:
+            # Create dummy min_max_values for visualization only (0-1 range)
+            min_max_values = [{"min": 0.0, "max": 1.0} for _ in range(len(samples))]
+        
+        sample_generator = SampleGenerator(model, samples, min_max_values[:4], os.path.dirname(save_path), device)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -164,183 +233,36 @@ def train_model(model: VQ_VAE,
             total_samples += batch_size_current
             progress_bar.set_postfix(loss=running_loss / total_samples)
         
-        train_losses_dict['total'].append(running_loss / len(ds))
-        train_losses_dict['codebook'].append(running_codebook_loss / len(ds))
-        train_losses_dict['commitment'].append(running_commitment_loss / len(ds))
-        train_losses_dict['reconstruction'].append(running_recon_loss / len(ds))
-        train_losses_dict['vq'].append(running_vq_loss / len(ds))
+        avg_loss = running_loss / len(ds)
+        avg_codebook = running_codebook_loss / len(ds)
+        avg_commitment = running_commitment_loss / len(ds)
+        avg_recon = running_recon_loss / len(ds)
+        avg_vq = running_vq_loss / len(ds)
 
-        print(f"Epoch {epoch:03d}/{epochs} - losses: running {running_loss / len(ds):.6f}; codebook {running_codebook_loss / len(ds):.6f}, commitment {running_commitment_loss / len(ds):.6f}, recon {running_recon_loss / len(ds):.6f}, vq {running_vq_loss / len(ds):.6f}")
+        print(f"Epoch {epoch:03d}/{epochs} - losses: running {avg_loss:.6f}; codebook {avg_codebook:.6f}, commitment {avg_commitment:.6f}, recon {avg_recon:.6f}, vq {avg_vq:.6f}")
 
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         
-        if save_path:
-            # Save model checkpoint
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            save_dict = {
-                'model_state': model.state_dict(),
-            }
-            if model_config:
-                save_dict['config'] = model_config
+        # Callbacks Step
+        if loss_plotter:
+            loss_plotter.update({
+                'total': avg_loss,
+                'codebook': avg_codebook,
+                'commitment': avg_commitment,
+                'reconstruction': avg_recon,
+                'vq': avg_vq
+            })
+            loss_plotter.plot()
             
-            torch.save(save_dict, save_path)
-            plot_vqvae_losses(train_losses_dict, save_path=save_path)
+        if model_checkpoint:
+            model_checkpoint.step(epoch, avg_loss)
             
-            # Generate and save spectrograms for visualization
-            epoch_save_dir = os.path.join(os.path.dirname(save_path), "samples", f"epoch_{epoch:03d}")
-            # Take first 4 samples for visualization
-            samples = x_train[:4]
-            generate_and_save_spectrograms(model, samples, min_max_values, epoch_save_dir)
+        if sample_generator:
+            sample_generator.step(epoch)
 
     return model
 
-
-def generate_and_save_spectrograms(model: VQ_VAE,
-                              specs: np.ndarray,
-                              min_max_values: Optional[list],
-                              save_dir: str):
-    """Generate spectrograms from one of the audio samples before and after passing through the VQ-VAE and save."""
-    sound_generator = SoundGenerator(model, hop_length=HOP_LENGTH)
-    
-    if min_max_values is None:
-        # Create dummy min_max_values for visualization only (0-1 range)
-        min_max_values = [{"min": 0.0, "max": 1.0} for _ in range(len(specs))]
-        # print("Warning: min_max_values not provided. Visualizing normalized spectrograms (0-1).")
-
-    os.makedirs(save_dir, exist_ok=True)
-    save_spectrogram_comparisons(specs, min_max_values, sound_generator, save_dir=save_dir)
-
-
-def save_spectrogram_comparisons(original_specs, min_max_values, sound_generator, save_dir="spectrograms/"):
-    """
-    Save side-by-side comparisons of original vs VQ-VAE reconstructed spectrograms.
-    This visualizes how well the model reconstructs the input spectrograms.
-    """
-    from pathlib import Path
-    
-    Path(save_dir).mkdir(parents=True, exist_ok=True)
-    
-    # Get VQ-VAE reconstructed spectrograms (in spectrogram domain, not audio)
-    model = sound_generator.autoencoder
-    model.eval()
-    
-    with torch.no_grad():
-        # Convert to torch tensor and move to device
-        if isinstance(original_specs, np.ndarray):
-            x = torch.from_numpy(original_specs.astype(np.float32))
-        else:
-            x = torch.from_numpy(np.array(original_specs, dtype=np.float32))
-        
-        x = x.permute(0, 3, 1, 2)  # (N, 1, H, W)
-        device = next(model.parameters()).device
-        x = x.to(device)
-        
-        # Get reconstruction directly from VQ-VAE
-        x_hat, z_q = model.reconstruct(x)
-        reconstructed_specs = x_hat.cpu().permute(0, 2, 3, 1).numpy()  # Back to (N, H, W, 1)
-    
-    # Create comparison plots
-    for i, (orig_spec, recon_spec, min_max_val) in enumerate(zip(original_specs, reconstructed_specs, min_max_values)):
-        # Remove channel dimension for visualization
-        if len(orig_spec.shape) == 3:
-            orig_spec_2d = orig_spec[:, :, 0]
-            recon_spec_2d = recon_spec[:, :, 0]
-        else:
-            orig_spec_2d = orig_spec
-            recon_spec_2d = recon_spec
-            
-        # Denormalize both for proper visualization
-        orig_min = min_max_val["min"]
-        orig_max = min_max_val["max"]
-        denorm_orig = orig_spec_2d * (orig_max - orig_min) + orig_min
-        denorm_recon = recon_spec_2d * (orig_max - orig_min) + orig_min
-        
-        # Create comparison plot
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        
-        # Original spectrogram
-        vmin, vmax = denorm_orig.min(), denorm_orig.max()
-        im1 = axes[0].imshow(denorm_orig, aspect='auto', origin='lower', cmap='viridis', vmin=vmin, vmax=vmax)
-        axes[0].set_title(f'Original Spectrogram\n(Sample {i+1})')
-        axes[0].set_xlabel('Time Frames')
-        axes[0].set_ylabel('Frequency Bins')
-        plt.colorbar(im1, ax=axes[0], label='Magnitude (dB)')
-        
-        # VQ-VAE reconstructed spectrogram  
-        im2 = axes[1].imshow(denorm_recon, aspect='auto', origin='lower', cmap='viridis', vmin=vmin, vmax=vmax)
-        axes[1].set_title(f'VQ-VAE Reconstructed\n(Sample {i+1})')
-        axes[1].set_xlabel('Time Frames')
-        axes[1].set_ylabel('Frequency Bins')
-        plt.colorbar(im2, ax=axes[1], label='Magnitude (dB)')
-        
-        # Handle shape mismatch by cropping to smaller dimension
-        min_time_frames = min(denorm_orig.shape[1], denorm_recon.shape[1])
-        denorm_orig_cropped = denorm_orig[:, :min_time_frames]
-        denorm_recon_cropped = denorm_recon[:, :min_time_frames]
-        
-        # Difference (reconstruction error)
-        # errors are between 0 and 1.0 dB, but for visualization and comparison we use a
-        # fixed vmax smaller that normally the errors don't exceed it's value of 0.4 dB
-        diff = np.abs(denorm_orig_cropped - denorm_recon_cropped)
-        im3 = axes[2].imshow(diff, aspect='auto', origin='lower', cmap='hot', vmin=0, vmax=0.4)
-        axes[2].set_title(f'Reconstruction Error\n(Sample {i+1})\n(Cropped to {min_time_frames} frames)')
-        axes[2].set_xlabel('Time Frames')
-        axes[2].set_ylabel('Frequency Bins')
-        plt.colorbar(im3, ax=axes[2], label='|Error| (dB)')
-        
-        # Add statistics as text
-        mse = np.mean((denorm_orig_cropped - denorm_recon_cropped) ** 2)
-        mae = np.mean(np.abs(denorm_orig_cropped - denorm_recon_cropped))
-        
-        # Add shape information to the title
-        shape_info = f'Orig: {denorm_orig.shape}, Recon: {denorm_recon.shape}'
-        fig.suptitle(f'MSE: {mse:.6f} dB², MAE: {mae:.6f} dB | {shape_info}', fontsize=10)
-        
-        plt.tight_layout()
-        
-        # Save the comparison
-        save_path_img = os.path.join(save_dir, f"vqvae_comparison_{i+1:03d}.png")
-        plt.savefig(save_path_img, dpi=150, bbox_inches='tight')
-        plt.close()
-
-
-def plot_vqvae_losses(train_losses_dict: dict, save_path: Optional[str] = None):
-
-    os.makedirs(os.path.dirname(save_path), exist_ok=True) if save_path else None
-    save_file_path = os.path.join(os.path.dirname(save_path), 'vqvae_losses.png') if save_path else None
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses_dict['total'], label='Total Training Loss')
-    plt.plot(train_losses_dict['vq'], label='VQ Loss')
-    plt.plot(train_losses_dict['reconstruction'], label='Reconstruction Loss')
-    plt.plot(train_losses_dict['codebook'], label='Codebook Loss')
-    plt.plot(train_losses_dict['commitment'], label='Commitment Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('VQ-VAE Loss Components over Epochs')
-    plt.legend()
-    if save_path:
-        plt.savefig(save_file_path)
-    else:
-        plt.show()
-    plt.close()
-
-def plot_training_loss(loss_values, save_path: Optional[str] = None):
-    os.makedirs(os.path.dirname(save_path), exist_ok=True) if save_path else None
-    save_file_path = os.path.join(os.path.dirname(save_path), 'training_loss.png') if save_path else None
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(loss_values, label='Training Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training Loss over Epochs')
-    plt.legend()
-    if save_path:
-        plt.savefig(save_file_path)
-    else:
-        plt.show()
-    plt.close()
 
 def load_fsdd(path, add_channel_axis=True):
     """
