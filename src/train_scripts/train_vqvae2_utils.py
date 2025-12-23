@@ -3,59 +3,23 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg') # Set non-interactive backend to avoid thread issues
 import matplotlib.pyplot as plt
-import soundfile as sf
+from tqdm import tqdm
 
 import torch
 from torch import optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
 import torch.nn.functional as F
-from tqdm import tqdm
 
 from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
-from datasets.spectrogram_dataset import SpectrogramDataset
-from generation.soundgenerator import SoundGenerator
+from datasets.spectrogram_dataset import SpectrogramDataset, MmapSpectrogramDataset
 from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE
 from utils import find_min_max_for_path
+from callbacks import EarlyStopping, ModelCheckpoint, LossPlotter, SampleGenerator
 
 
 def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
-                             x_train: np.ndarray,
-                             train_file_paths: list,
-                             min_max_values: dict,
-                             data_variance: float,
-                             batch_size: int,
-                             epochs: int,
-                             learning_rate: float,
-                             save_path: str,
-                             device: torch.device,
-                             amp: bool = True,
-                             x_val: np.ndarray = None,
-                             val_file_paths: list = None):
-    """
-    Wrapper for backward compatibility.
-
-    Use this correctly spelled function name instead of
-    `train_vqvae_hierarquical`. It forwards all arguments to the
-    existing implementation.
-    """
-    return train_vqvae_hierarquical(
-        model=model,
-        x_train=x_train,
-        train_file_paths=train_file_paths,
-        min_max_values=min_max_values,
-        data_variance=data_variance,
-        batch_size=batch_size,
-        epochs=epochs,
-        learning_rate=learning_rate,
-        save_path=save_path,
-        device=device,
-        amp=amp,
-        x_val=x_val,
-        val_file_paths=val_file_paths,
-    )
-def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
                              x_train: np.ndarray,
                              train_file_paths: list,
                              min_max_values: dict,
@@ -89,38 +53,85 @@ def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
     model.to(device)
     
     # Setup Validation Data
-    if x_val is not None and len(x_val) > 0:
-        print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
-        val_dataset = SpectrogramDataset(x_val)
-        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    else:
-        val_dataloader = None
+    early_stopping = None
+    val_dataloader = None
+    val_dataset = None
+
+    if x_val is not None:
+        if isinstance(x_val, (np.ndarray, list)):
+            if len(x_val) > 0:
+                print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
+                val_dataset = SpectrogramDataset(x_val)
+                val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+                early_stopping = EarlyStopping(patience=20, verbose=True)
+        else:
+            # Assume x_val is a Dataset
+            print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
+            val_dataset = x_val
+            val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+            early_stopping = EarlyStopping(patience=20, verbose=True)
+    
+    if val_dataloader is None:
         print(f"Using all {len(x_train)} samples for training (no validation set provided).")
 
-    dataset = SpectrogramDataset(x_train)
+    if isinstance(x_train, (np.ndarray, list)):
+        dataset = SpectrogramDataset(x_train)
+    else:
+        dataset = x_train
+        
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner for potential speedup
     scaler = GradScaler(enabled=amp and device.type == 'cuda')  # For mixed precision training
 
-    # Track losses for training progress
-    train_losses_dict = {
-        'total': [],
-        'reconstruction_loss': [],
-        'vq_loss_top': [],
-        'vq_loss_bottom': [],
-        'val_total': [],
-        'val_reconstruction_loss': [],
-        'val_vq_loss_top': [],
-        'val_vq_loss_bottom': []
-    }
-
     print("Model will be saved to :", save_path)
     
-    # Create directory for saving samples
+    # Initialize Callbacks
+    model_checkpoint = None
+    loss_plotter = None
+    sample_generator = None
+
     if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        model_checkpoint = ModelCheckpoint(save_path, model, optimizer, mode="min")
+        loss_plotter = LossPlotter(save_path)
+        
+        # Prepare samples for visualization
+        if val_dataloader:
+            if isinstance(val_dataset, Dataset):
+                # Fetch samples from dataset and convert to numpy (N, H, W, 1)
+                samples = []
+                for i in range(4):
+                    # Dataset returns (1, H, W) tensor
+                    s = val_dataset[i]
+                    s = s.permute(1, 2, 0).numpy() # (H, W, 1)
+                    samples.append(s)
+                samples = np.stack(samples)
+            else:
+                samples = x_val[:4]
+            sample_paths = val_file_paths[:4]
+        else:
+            if isinstance(dataset, Dataset):
+                samples = []
+                for i in range(4):
+                    s = dataset[i]
+                    s = s.permute(1, 2, 0).numpy()
+                    samples.append(s)
+                samples = np.stack(samples)
+            else:
+                samples = x_train[:4]
+            sample_paths = train_file_paths[:4]
+        
+        spectrograms_dir = os.path.dirname(sample_paths[0])
+        sample_min_max = []
+        for fp in sample_paths:
+            mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
+            if mm is None:
+                print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
+                mm = {"min": 0.0, "max": 1.0}
+            sample_min_max.append(mm)
+            
+        sample_generator = SampleGenerator(model, samples, sample_min_max, os.path.dirname(save_path), device)
 
     best_val_loss = float('inf')
 
@@ -175,13 +186,18 @@ def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
         avg_vq_loss_top = epoch_vq_loss_top / len(dataset)
         avg_vq_loss_bottom = epoch_vq_loss_bottom / len(dataset)
 
-        train_losses_dict['total'].append(avg_epoch_loss)
-        train_losses_dict['reconstruction_loss'].append(avg_recon_loss)
-        train_losses_dict['vq_loss_top'].append(avg_vq_loss_top)
-        train_losses_dict['vq_loss_bottom'].append(avg_vq_loss_bottom)
+        # Update Loss Plotter
+        epoch_metrics = {
+            'total': avg_epoch_loss,
+            'reconstruction_loss': avg_recon_loss,
+            'vq_loss_top': avg_vq_loss_top,
+            'vq_loss_bottom': avg_vq_loss_bottom
+        }
 
         # Validation Loop
         val_loss_str = ""
+        avg_val_loss = None
+        
         if val_dataloader:
             model.eval()
             val_epoch_loss = 0.0
@@ -213,195 +229,38 @@ def train_vqvae_hierarquical(model: VQ_VAE_Hierarchical,
             avg_val_vq_loss_top = val_epoch_vq_loss_top / len(val_dataset)
             avg_val_vq_loss_bottom = val_epoch_vq_loss_bottom / len(val_dataset)
             
-            train_losses_dict['val_total'].append(avg_val_loss)
-            train_losses_dict['val_reconstruction_loss'].append(avg_val_recon_loss)
-            train_losses_dict['val_vq_loss_top'].append(avg_val_vq_loss_top)
-            train_losses_dict['val_vq_loss_bottom'].append(avg_val_vq_loss_bottom)
+            epoch_metrics.update({
+                'val_total': avg_val_loss,
+                'val_reconstruction_loss': avg_val_recon_loss,
+                'val_vq_loss_top': avg_val_vq_loss_top,
+                'val_vq_loss_bottom': avg_val_vq_loss_bottom
+            })
             
             val_loss_str = f", Val Loss: {avg_val_loss:.4f}"
 
         print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_epoch_loss:.4f}, Recon: {avg_recon_loss:.4f}, VQ Top: {avg_vq_loss_top:.4f}, VQ Bottom: {avg_vq_loss_bottom:.4f}{val_loss_str}")
 
+        # Callbacks Step
+        if loss_plotter:
+            loss_plotter.update(epoch_metrics)
+            loss_plotter.plot()
+            
+        if model_checkpoint:
+            # Use validation loss if available, else training loss
+            metric_to_monitor = avg_val_loss if avg_val_loss is not None else avg_epoch_loss
+            model_checkpoint.step(epoch, avg_epoch_loss, metric_value=metric_to_monitor)
+            
+        if sample_generator:
+            sample_generator.step(epoch)
+
+        # Early Stopping Check
+        if early_stopping and avg_val_loss is not None:
+            early_stopping(avg_val_loss)
+            if early_stopping.early_stop:
+                print("Early stopping triggered.")
+                break
+
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
-        if save_path:
-            # Save latest model checkpoint
-            save_dict = {
-                'model_state': model.state_dict(),
-                'epoch': epoch,
-                'optimizer_state': optimizer.state_dict(),
-                'loss': avg_epoch_loss
-            }
-            torch.save(save_dict, save_path)
-            
-            # Save best model if validation is used
-            if val_dataloader and avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                best_save_path = os.path.join(os.path.dirname(save_path), "best_model.pth")
-                torch.save(save_dict, best_save_path)
-                print(f"New best validation loss: {best_val_loss:.4f}. Saved best model.")
-
-            # Plot losses
-            plot_vqvae_hierarchical_losses(train_losses_dict, save_path=save_path)
-
-            # Generate and save spectrograms for visualization (every epoch)
-            epoch_save_dir = os.path.join(os.path.dirname(save_path), "samples", f"epoch_{epoch+1:03d}")
-            
-            # Take first 4 samples from validation set if available, else training set
-            if val_dataloader:
-                samples = x_val[:4]
-                sample_paths = val_file_paths[:4]
-            else:
-                samples = x_train[:4]
-                sample_paths = train_file_paths[:4]
-            
-            # Find min/max values for these samples
-            spectrograms_dir = os.path.dirname(sample_paths[0])
-            
-            sample_min_max = []
-            for fp in sample_paths:
-                mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
-                if mm is None:
-                    print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
-                    mm = {"min": 0.0, "max": 1.0}
-                sample_min_max.append(mm)
-
-            generate_and_save_hierarchical_spectrograms(model, samples, sample_min_max, epoch_save_dir, device)
-
     return model
-
-def plot_vqvae_hierarchical_losses(train_losses_dict: dict, save_path: str):
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    
-    # --- Training Losses Plot ---
-    save_file_path_train = os.path.join(os.path.dirname(save_path), 'vqvae_hierarchical_losses_train.png')
-    plt.figure(figsize=(12, 6))
-    plt.plot(train_losses_dict['total'], label='Total Loss')
-    plt.plot(train_losses_dict['reconstruction_loss'], label='Reconstruction Loss')
-    plt.plot(train_losses_dict['vq_loss_top'], label='VQ Loss Top')
-    plt.plot(train_losses_dict['vq_loss_bottom'], label='VQ Loss Bottom')
-    
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('VQ-VAE Hierarchical Training Losses')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(save_file_path_train)
-    plt.close()
-
-    # --- Validation Losses Plot ---
-    if 'val_total' in train_losses_dict and len(train_losses_dict['val_total']) > 0:
-        save_file_path_val = os.path.join(os.path.dirname(save_path), 'vqvae_hierarchical_losses_val.png')
-        plt.figure(figsize=(12, 6))
-        
-        val_losses = train_losses_dict['val_total']
-        plt.plot(val_losses, label='Total Loss')
-        plt.plot(train_losses_dict['val_reconstruction_loss'], label='Reconstruction Loss')
-        plt.plot(train_losses_dict['val_vq_loss_top'], label='VQ Loss Top')
-        plt.plot(train_losses_dict['val_vq_loss_bottom'], label='VQ Loss Bottom')
-        
-        # Find best validation epoch (0-indexed)
-        best_val_idx = np.argmin(val_losses)
-        best_val_loss = val_losses[best_val_idx]
-        
-        # Add vertical line at best epoch
-        plt.axvline(x=best_val_idx, color='r', linestyle=':', alpha=0.7, label=f'Best Val (Epoch {best_val_idx+1})')
-        
-        # Add point marker
-        plt.scatter(best_val_idx, best_val_loss, color='red', zorder=5)
-        
-        # Add text annotation
-        plt.annotate(f'Best: {best_val_loss:.4f}', 
-                     xy=(best_val_idx, best_val_loss), 
-                     xytext=(10, 10), textcoords='offset points',
-                     arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=.2'))
-        
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('VQ-VAE Hierarchical Validation Losses')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(save_file_path_val)
-        plt.close()
-
-def generate_and_save_hierarchical_spectrograms(model, specs, min_max_values, save_dir, device):
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Initialize SoundGenerator for audio conversion
-    sound_generator = SoundGenerator(model, hop_length=HOP_LENGTH)
-
-    model.eval()
-    with torch.no_grad():
-        # Prepare input
-        if isinstance(specs, np.ndarray):
-            x = torch.from_numpy(specs.astype(np.float32))
-        else:
-            x = torch.from_numpy(np.array(specs, dtype=np.float32))
-        
-        x = x.permute(0, 3, 1, 2).to(device) # (N, 1, H, W)
-        
-        # Reconstruct
-        x_recon = model.reconstruct(x)
-        reconstructed_specs = x_recon.cpu().permute(0, 2, 3, 1).numpy()
-        
-    # Convert to audio
-    # Note: SoundGenerator expects (N, H, W, 1)
-    # We use the original specs (normalized) and reconstructed specs (normalized)
-    # SoundGenerator handles denormalization internally using min_max_values
-    
-    # Convert original spectrograms to audio
-    original_signals = sound_generator.convert_spectrograms_to_audio(specs, min_max_values)
-    
-    # Convert reconstructed spectrograms to audio
-    reconstructed_signals = sound_generator.convert_spectrograms_to_audio(reconstructed_specs, min_max_values)
-
-    for i, (orig, recon, orig_sig, recon_sig, min_max_val) in enumerate(zip(specs, reconstructed_specs, original_signals, reconstructed_signals, min_max_values)):
-        orig_2d = orig[:, :, 0]
-        recon_2d = recon[:, :, 0]
-        
-        # Create comparison plot
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        
-        # Original
-        im1 = axes[0].imshow(orig_2d, origin='lower', aspect='auto', cmap='viridis', vmin=0, vmax=1)
-        axes[0].set_title(f'Original Spectrogram\n(Sample {i+1})')
-        axes[0].set_xlabel('Time Frames')
-        axes[0].set_ylabel('Frequency Bins')
-        plt.colorbar(im1, ax=axes[0], label='Normalized Magnitude')
-        
-        # Recon
-        im2 = axes[1].imshow(recon_2d, origin='lower', aspect='auto', cmap='viridis', vmin=0, vmax=1)
-        axes[1].set_title(f'VQ-VAE Reconstructed\n(Sample {i+1})')
-        axes[1].set_xlabel('Time Frames')
-        axes[1].set_ylabel('Frequency Bins')
-        plt.colorbar(im2, ax=axes[1], label='Normalized Magnitude')
-        
-        # Handle shape mismatch
-        min_time_frames = min(orig_2d.shape[1], recon_2d.shape[1])
-        orig_cropped = orig_2d[:, :min_time_frames]
-        recon_cropped = recon_2d[:, :min_time_frames]
-
-        # Diff
-        diff = np.abs(orig_cropped - recon_cropped)
-        im3 = axes[2].imshow(diff, origin='lower', aspect='auto', cmap='hot', vmin=0, vmax=0.4)
-        axes[2].set_title(f'Reconstruction Error\n(Sample {i+1})\n(Cropped to {min_time_frames} frames)')
-        axes[2].set_xlabel('Time Frames')
-        axes[2].set_ylabel('Frequency Bins')
-        plt.colorbar(im3, ax=axes[2], label='|Error|')
-
-        # Add statistics as text
-        mse = np.mean((orig_cropped - recon_cropped) ** 2)
-        mae = np.mean(np.abs(orig_cropped - recon_cropped))
-        
-        # Add shape information to the title
-        shape_info = f'Orig: {orig_2d.shape}, Recon: {recon_2d.shape}'
-        fig.suptitle(f'MSE: {mse:.6f}, MAE: {mae:.6f} | {shape_info}', fontsize=10)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f"comparison_{i+1:03d}.png"), dpi=150, bbox_inches='tight')
-        plt.close()
-
-        # Save audio
-        sf.write(os.path.join(save_dir, f"original_{i+1:03d}.wav"), orig_sig, SAMPLE_RATE)
-        sf.write(os.path.join(save_dir, f"reconstructed_{i+1:03d}.wav"), recon_sig, SAMPLE_RATE)
