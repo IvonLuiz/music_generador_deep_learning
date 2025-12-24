@@ -37,6 +37,7 @@ if __name__ == "__main__":
     batch_size = config['training']['batch_size']
     learning_rate = config['training']['learning_rate']
     epochs = config['training']['epochs']
+    early_stopping_patience = config['training'].get('early_stopping_patience', 20)
     spectrograms_path = config['dataset']['processed_path']
     model_save_dir = config['training']['save_dir']
     model_name = config['model']['name']
@@ -115,6 +116,7 @@ if __name__ == "__main__":
         epochs=epochs,
         save_path=model_file_path,
         data_variance=data_variance,
+        early_stopping_patience=early_stopping_patience,
         x_val=x_val,
         val_file_paths=val_file_paths
     )

@@ -36,6 +36,7 @@ config = load_config(config_path)
 batch_size = config['training']['batch_size']
 learning_rate = config['training']['learning_rate']
 epochs = config['training']['epochs']
+early_stopping_patience = config['training'].get('early_stopping_patience', 20)
 
 # Paths from config
 spectrograms_path = config['dataset']['processed_path']
@@ -114,6 +115,7 @@ train_model(
     learning_rate=learning_rate,
     data_variance=data_variance,
     save_path=model_file_path,
+    early_stopping_patience=early_stopping_patience,
     amp=True,
     grad_accum_steps=1,
     max_grad_norm=1.0, # Add gradient clipping to prevent explosion

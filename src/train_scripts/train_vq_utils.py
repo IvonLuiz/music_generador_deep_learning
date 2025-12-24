@@ -33,6 +33,7 @@ def train_vqvae(x_train: np.ndarray,
                 epochs=50,
                 data_variance: float = 1.0,
                 save_path: Optional[str] = None,
+                early_stopping_patience: int = 20,
                 amp: bool = True,
                 grad_accum_steps: int = 1,
                 max_grad_norm: Optional[float] = None,
@@ -67,6 +68,7 @@ def train_vqvae(x_train: np.ndarray,
         learning_rate=learning_rate,
         data_variance=data_variance,
         save_path=save_path,
+        early_stopping_patience=early_stopping_patience,
         amp=amp,
         grad_accum_steps=grad_accum_steps,
         max_grad_norm=max_grad_norm,
@@ -82,6 +84,7 @@ def train_model(model: VQ_VAE,
                 epochs: int = 50,
                 learning_rate: float = 5e-4,
                 data_variance: float = 1.0,
+                early_stopping_patience: int = 20,
                 save_path: Optional[str] = None,
                 amp: bool = True,
                 grad_accum_steps: int = 1,
@@ -98,6 +101,7 @@ def train_model(model: VQ_VAE,
         batch_size: Batch size for training
         epochs: Number of training epochs
         learning_rate: Learning rate for Adam optimizer
+        early_stopping_patience: Patience for early stopping
         data_variance: Data variance for loss calculation
         save_path: Optional path to save the model after training
         model_config: Optional dictionary with model configuration to save
@@ -130,13 +134,13 @@ def train_model(model: VQ_VAE,
                 print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
                 val_dataset = SpectrogramDataset(x_val)
                 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-                early_stopping = EarlyStopping(patience=20, verbose=True)
+                early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
         else:
             # Assume x_val is a Dataset
             print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
             val_dataset = x_val
             val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-            early_stopping = EarlyStopping(patience=20, verbose=True)
+            early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
     
     if val_dataloader is None:
         print(f"Using all {len(x_train)} samples for training (no validation set provided).")
@@ -239,27 +243,71 @@ def train_model(model: VQ_VAE,
         avg_recon = running_recon_loss / len(ds)
         avg_vq = running_vq_loss / len(ds)
 
-        print(f"Epoch {epoch:03d}/{epochs} - losses: running {avg_loss:.6f}; codebook {avg_codebook:.6f}, commitment {avg_commitment:.6f}, recon {avg_recon:.6f}, vq {avg_vq:.6f}")
+        # Validation Loop
+        val_loss_str = ""
+        avg_val_loss = None
+        
+        if val_dataloader:
+            model.eval()
+            val_running_loss = 0.0
+            val_running_recon_loss = 0.0
+            val_running_vq_loss = 0.0
+            val_total_samples = 0
+            
+            with torch.no_grad():
+                for val_specs in val_dataloader:
+                    val_specs = val_specs.to(device, non_blocking=True)
+                    x_hat, _z, vq_loss, codebook_loss, commitment_loss = model(val_specs)
+                    loss_full, recon_loss = vqvae_loss(val_specs, x_hat, vq_loss, variance=max(data_variance, 1e-6))
+                    
+                    batch_size_current = val_specs.size(0)
+                    val_running_loss += loss_full.item() * batch_size_current
+                    val_running_recon_loss += recon_loss.item() * batch_size_current
+                    val_running_vq_loss += vq_loss.item() * batch_size_current
+                    val_total_samples += batch_size_current
+            
+            if val_total_samples > 0:
+                avg_val_loss = val_running_loss / val_total_samples
+                avg_val_recon = val_running_recon_loss / val_total_samples
+                avg_val_vq = val_running_vq_loss / val_total_samples
+                val_loss_str = f"; val_loss {avg_val_loss:.6f}, val_recon {avg_val_recon:.6f}"
+
+        print(f"Epoch {epoch:03d}/{epochs} - losses: running {avg_loss:.6f}; codebook {avg_codebook:.6f}, commitment {avg_commitment:.6f}, recon {avg_recon:.6f}, vq {avg_vq:.6f}{val_loss_str}")
 
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         
         # Callbacks Step
+        metrics = {
+            'total': avg_loss,
+            'codebook': avg_codebook,
+            'commitment': avg_commitment,
+            'reconstruction': avg_recon,
+            'vq': avg_vq
+        }
+        
+        if avg_val_loss is not None:
+            metrics['val_total'] = avg_val_loss
+            metrics['val_reconstruction'] = avg_val_recon
+            metrics['val_vq'] = avg_val_vq
+
         if loss_plotter:
-            loss_plotter.update({
-                'total': avg_loss,
-                'codebook': avg_codebook,
-                'commitment': avg_commitment,
-                'reconstruction': avg_recon,
-                'vq': avg_vq
-            })
+            loss_plotter.update(metrics)
             loss_plotter.plot()
             
         if model_checkpoint:
-            model_checkpoint.step(epoch, avg_loss)
+            metric_to_monitor = avg_val_loss if avg_val_loss is not None else avg_loss
+            model_checkpoint.step(epoch, avg_loss, metric_value=metric_to_monitor)
             
         if sample_generator:
             sample_generator.step(epoch)
+
+        # Early Stopping Check
+        if early_stopping and avg_val_loss is not None:
+            early_stopping(avg_val_loss)
+            if early_stopping.early_stop:
+                print("Early stopping triggered.")
+                break
 
     return model
 

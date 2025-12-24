@@ -29,6 +29,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                              learning_rate: float,
                              save_path: str,
                              device: torch.device,
+                             early_stopping_patience: int = 20,
                              amp: bool = True,
                              x_val: np.ndarray = None,
                              val_file_paths: list = None):
@@ -46,6 +47,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
         learning_rate (float): Learning rate for the optimizer.
         save_path (str): Path to save the trained model.
         device (torch.device): Device to run the training on (CPU or GPU).
+        early_stopping_patience (int, optional): Patience for early stopping. Defaults to 20.
         amp (bool, optional): Whether to use automatic mixed precision (AMP) during training. Defaults to True.
         x_val (np.ndarray, optional): Validation spectrogram data.
         val_file_paths (list, optional): List of file paths corresponding to x_val.
@@ -63,13 +65,13 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                 print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
                 val_dataset = SpectrogramDataset(x_val)
                 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-                early_stopping = EarlyStopping(patience=20, verbose=True)
+                early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
         else:
             # Assume x_val is a Dataset
             print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
             val_dataset = x_val
             val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-            early_stopping = EarlyStopping(patience=20, verbose=True)
+            early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
     
     if val_dataloader is None:
         print(f"Using all {len(x_train)} samples for training (no validation set provided).")
