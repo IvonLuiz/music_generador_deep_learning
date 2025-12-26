@@ -13,7 +13,7 @@ from torch.amp.autocast_mode import autocast
 import torch.nn.functional as F
 
 from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
-from datasets.spectrogram_dataset import SpectrogramDataset, MmapSpectrogramDataset
+from datasets.spectrogram_dataset import SpectrogramDataset
 from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE
 from utils import find_min_max_for_path
 from callbacks import EarlyStopping, ModelCheckpoint, LossPlotter, SampleGenerator
