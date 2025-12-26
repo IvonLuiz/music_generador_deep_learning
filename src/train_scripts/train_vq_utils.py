@@ -17,7 +17,7 @@ from generation.soundgenerator import SoundGenerator
 import soundfile as sf
 
 from modeling.torch.vq_vae import VQ_VAE, vqvae_loss
-from datasets.spectrogram_dataset import SpectrogramDataset, MmapSpectrogramDataset
+from datasets.spectrogram_dataset import SpectrogramDataset
 from callbacks import EarlyStopping, ModelCheckpoint, LossPlotter, SampleGenerator
 
 
