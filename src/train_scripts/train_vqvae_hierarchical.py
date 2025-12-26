@@ -4,6 +4,7 @@ import os
 import yaml
 import sys
 import pickle
+import gc
 
 # Add 'src' to sys.path to allow imports from sibling directories
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -11,8 +12,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
 from generation.generate import *
 from utils import load_maestro, load_config, initialize_vqvae_hierarchical_model
-from train_scripts.train_vqvae2_utils import train_vqvae_hierarquical
+from train_scripts.train_vqvae2_utils import train_vqvae_hierarchical
 from processing.preprocess_audio import TARGET_TIME_FRAMES, MIN_MAX_VALUES_SAVE_DIR
+from datasets.spectrogram_dataset import MmapSpectrogramDataset
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -35,6 +37,7 @@ if __name__ == "__main__":
     batch_size = config['training']['batch_size']
     learning_rate = config['training']['learning_rate']
     epochs = config['training']['epochs']
+    early_stopping_patience = config['training'].get('early_stopping_patience', 20)
     spectrograms_path = config['dataset']['processed_path']
     model_save_dir = config['training']['save_dir']
     model_name = config['model']['name']
@@ -57,8 +60,41 @@ if __name__ == "__main__":
         yaml.dump(config, f)
     
     # Load training data to compute variance
-    x_train, file_paths = load_maestro(spectrograms_path, TARGET_TIME_FRAMES, debug_print=False)
-    data_variance = np.var(x_train)
+    x_all, file_paths_all = load_maestro(spectrograms_path, TARGET_TIME_FRAMES, debug_print=False)
+    data_variance = np.var(x_all)
+
+    # Split into train/val manually to save memory
+    validation_split = config['training'].get('validation_split', 0.0)
+    if validation_split > 0:
+        num_samples = len(x_all)
+        num_val = int(num_samples * validation_split)
+        num_train = num_samples - num_val
+        
+        # Shuffle indices
+        indices = np.random.permutation(num_samples)
+        train_indices = indices[:num_train]
+        val_indices = indices[num_train:]
+        
+        # Use MmapSpectrogramDataset to avoid loading data into RAM
+        x_train = MmapSpectrogramDataset(x_all, train_indices)
+        x_val = MmapSpectrogramDataset(x_all, val_indices)
+        
+        # Handle paths
+        file_paths_all = np.array(file_paths_all)
+        train_file_paths = file_paths_all[train_indices].tolist()
+        val_file_paths = file_paths_all[val_indices].tolist()
+        
+        print(f"Data split: {len(x_train)} training, {len(x_val)} validation samples.")
+        
+        # We keep x_all referenced by datasets, so we don't delete it explicitly, 
+        # but we can delete file_paths_all
+        del file_paths_all
+        gc.collect()
+    else:
+        x_train = MmapSpectrogramDataset(x_all)
+        train_file_paths = file_paths_all
+        x_val = None
+        val_file_paths = None
 
     # Load min_max_values
     min_max_values_path = os.path.join(MIN_MAX_VALUES_SAVE_DIR, "min_max_values.pkl")
@@ -69,16 +105,19 @@ if __name__ == "__main__":
     vqvae_hierarchical_model = initialize_vqvae_hierarchical_model(config['model'], device)
     
     # Train the VQ-VAE Hierarchical model
-    train_vqvae_hierarquical(
+    train_vqvae_hierarchical(
         model=vqvae_hierarchical_model,
         x_train=x_train,
-        train_file_paths=file_paths,
+        train_file_paths=train_file_paths,
         min_max_values=min_max_values,
         device=device,
         batch_size=batch_size,
         learning_rate=learning_rate,
         epochs=epochs,
         save_path=model_file_path,
-        data_variance=data_variance
+        data_variance=data_variance,
+        early_stopping_patience=early_stopping_patience,
+        x_val=x_val,
+        val_file_paths=val_file_paths
     )
     print("Training completed.")

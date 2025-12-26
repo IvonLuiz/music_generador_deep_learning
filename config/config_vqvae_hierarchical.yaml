@@ -21,7 +21,8 @@ training:
   epochs: 150
   validation_split: 0.2
   save_dir: "./models/vq_vae_hierarchical/"
+  early_stopping_patience: 20
 
 testing:
-  specific_run_dir:   # date format: YYYY-MM-DD_HH-MM-SS when was trained (merged in code with trained.save_dir)
-  weights_file_choice: "model.pth"  # options: "model.pth", "best_model.pth" ...
+  specific_run_dir: 2025-12-22_01-26-43  # date format: YYYY-MM-DD_HH-MM-SS when was trained (merged in code with trained.save_dir)
+  weights_file_choice: "best_model.pth"  # options: "model.pth", "best_model.pth" ...

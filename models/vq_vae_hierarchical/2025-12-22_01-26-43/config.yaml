@@ -1,0 +1,24 @@
+dataset:
+  frame_size: 512
+  hop_length: 256
+  processed_path: ./data/processed/maestro_spectrograms_test/
+  raw_path: ./data/raw/maestro-v3.0.0/2011
+  sample_rate: 22050
+  target_time_frames: 256
+model:
+  beta: 0.25
+  dim_bottom: 256
+  dim_top: 512
+  name: vq_vae_hierarchical_maestro2011
+  num_embeddings_bottom: 512
+  num_embeddings_top: 512
+  num_residual_layers: 2
+testing:
+  specific_run_dir: null
+  weights_file_choice: model.pth
+training:
+  batch_size: 32
+  epochs: 150
+  learning_rate: 0.0002
+  save_dir: ./models/vq_vae_hierarchical/
+  validation_split: 0.2
