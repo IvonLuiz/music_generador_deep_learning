@@ -73,12 +73,14 @@ def train_pixel_cnn(pixelcnn_config_path: str, vqvae_model_path: str):
     x_val = spectrograms_data[val_indices]
     print(f"Data split: {len(x_train)} training, {len(x_val)} validation samples.")
     
-    print("Creating Training Dataset...")
-    train_dataset = QuantizedDataset(x_train, vqvae, device)
+    quantization_batch_size = pixelcnn_config['training'].get('quantization_batch_size', 32)
+    
+    print(f"Creating Training Dataset (quantization_batch_size={quantization_batch_size})...")
+    train_dataset = QuantizedDataset(x_train, vqvae, device, batch_size=quantization_batch_size)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     
-    print("Creating Validation Dataset...")
-    val_dataset = QuantizedDataset(x_val, vqvae, device)
+    print(f"Creating Validation Dataset (quantization_batch_size={quantization_batch_size})...")
+    val_dataset = QuantizedDataset(x_val, vqvae, device, batch_size=quantization_batch_size)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     # Initialize PixelCNN

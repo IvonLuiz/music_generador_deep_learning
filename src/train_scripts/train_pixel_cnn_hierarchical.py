@@ -15,38 +15,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modeling.torch.pixel_cnn_hierarchical import HierarchicalCondGatedPixelCNN
 from datasets.hierarchical_quantized_dataset import HierarchicalQuantizedDataset
-from utils import load_maestro, load_config, initialize_vqvae_hierarchical_model
+from utils import load_maestro, load_config, initialize_vqvae_hierarchical_model, load_vqvae_hierarchical_model_wrapper
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
-def load_vqvae_hierarchical_model_wrapper(model_path: str, device: torch.device):
-    """
-    Loads a Hierarchical VQ-VAE model.
-    """
-    if os.path.isdir(model_path):
-        config_path = os.path.join(model_path, "config.yaml")
-    else:
-        config_path = os.path.join(os.path.dirname(model_path), "config.yaml")
-        
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found at {config_path}")
-    
-    config = load_config(config_path)
-    
-    # Determine model file
-    if os.path.isdir(model_path):
-        choice = config.get('testing', {}).get('weights_file_choice')
-        if not choice:
-            choice = "model.pth"
-        model_file = os.path.join(model_path, choice)
-    else:
-        model_file = model_path
-
-    model = initialize_vqvae_hierarchical_model(config, device)
-    print(f"Loading VQ-VAE Hierarchical weights from {model_file}")
-    checkpoint = torch.load(model_file, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint['model_state'])
-    model.eval()
-    return model
 
 def plot_losses(train_losses, val_losses, save_dir):
     plt.figure(figsize=(10, 5))
@@ -101,7 +72,8 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
     
     # Pre-calculate indices
     # Note: num_levels=2 implies we get [top_indices, bottom_indices]
-    dataset = HierarchicalQuantizedDataset(x_all, vqvae, device, num_levels=2)
+    quantization_batch_size = config['training'].get('quantization_batch_size', 32)
+    dataset = HierarchicalQuantizedDataset(x_all, vqvae, device, num_levels=2, batch_size=quantization_batch_size)
     
     # Split Train/Val
     train_size = int((1 - val_split) * len(dataset))
@@ -139,6 +111,7 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
     ).to(device)
     
     optimizer = optim.Adam(pixelcnn.parameters(), lr=config['training']['learning_rate'])
+    scaler = torch.amp.GradScaler('cuda') # mixed precision scaler
     criterion = nn.CrossEntropyLoss()
     
     # Setup Save Dir
@@ -166,22 +139,24 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
             bot_indices = batch_indices[1].to(device)   # (B, H_bot, W_bot)
             
             optimizer.zero_grad()
+            with torch.amp.autocast('cuda'):
+                # 1. Train Top Prior
+                # Forward Top
+                logits_top = pixelcnn(top_indices, level='top') # (B, 256, 1, H, W)
+                # Target for CrossEntropy should be (B, H, W)
+                # Loss input: (B, 256, H, W) (after squeeze)
+                curr_loss_top = criterion(logits_top.squeeze(2), top_indices)
+                
+                # 2. Train Bottom Prior
+                # Forward Bottom (Conditioned on Top)
+                logits_bot = pixelcnn(bot_indices, cond=top_indices, level='bottom')
+                curr_loss_bot = criterion(logits_bot.squeeze(2), bot_indices)
+                
+                loss = curr_loss_top + curr_loss_bot
             
-            # 1. Train Top Prior
-            # Forward Top
-            logits_top = pixelcnn(top_indices, level='top') # (B, 256, 1, H, W)
-            # Target for CrossEntropy should be (B, H, W)
-            # Loss input: (B, 256, H, W) (after squeeze)
-            curr_loss_top = criterion(logits_top.squeeze(2), top_indices)
-            
-            # 2. Train Bottom Prior
-            # Forward Bottom (Conditioned on Top)
-            logits_bot = pixelcnn(bot_indices, cond=top_indices, level='bottom')
-            curr_loss_bot = criterion(logits_bot.squeeze(2), bot_indices)
-            
-            loss = curr_loss_top + curr_loss_bot
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             running_loss += loss.item()
             pbar.set_postfix({'loss': loss.item(), 'top': curr_loss_top.item(), 'bot': curr_loss_bot.item()})
@@ -197,11 +172,12 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
                 top_indices = batch_indices[0].to(device)
                 bot_indices = batch_indices[1].to(device)
                 
-                logits_top = pixelcnn(top_indices, level='top')
-                loss_top = criterion(logits_top.squeeze(2), top_indices)
-                
-                logits_bot = pixelcnn(bot_indices, cond=top_indices, level='bottom')
-                loss_bot = criterion(logits_bot.squeeze(2), bot_indices)
+                with torch.amp.autocast('cuda'):
+                    logits_top = pixelcnn(top_indices, level='top')
+                    loss_top = criterion(logits_top.squeeze(2), top_indices)
+                    
+                    logits_bot = pixelcnn(bot_indices, cond=top_indices, level='bottom')
+                    loss_bot = criterion(logits_bot.squeeze(2), bot_indices)
                 
                 val_running_loss += (loss_top + loss_bot).item()
         
@@ -225,9 +201,10 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
                 'model_state': pixelcnn.state_dict(),
             }, os.path.join(run_dir, f"model_epoch_{epoch+1}.pth"))
             
-        plot_losses(train_losses, val_losses, run_dir)
+    plot_losses(train_losses, val_losses, run_dir)
 
 if __name__ == "__main__":
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='./config/config_pixelcnn_hierarchical.yaml', help='Path to PixelCNN config')
