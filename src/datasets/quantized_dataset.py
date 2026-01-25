@@ -3,7 +3,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 class QuantizedDataset(Dataset):
-    def __init__(self, x_train, vqvae_model, device):
+    def __init__(self, x_train, vqvae_model, device, batch_size=32):
         """
         Dataset that pre-calculates VQ-VAE indices for training a prior model (e.g. PixelCNN).
         """
@@ -11,8 +11,7 @@ class QuantizedDataset(Dataset):
         vqvae_model.eval()
         vqvae_model.to(device)
         
-        print("Pre-calculating VQ-VAE indices for PixelCNN training...")
-        batch_size = 32
+        print(f"Pre-calculating VQ-VAE indices for PixelCNN training (batch_size={batch_size})...")
         num_samples = len(x_train)
         
         with torch.no_grad():
