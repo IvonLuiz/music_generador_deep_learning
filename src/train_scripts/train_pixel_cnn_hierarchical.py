@@ -19,17 +19,24 @@ from utils import load_maestro, load_config, initialize_vqvae_hierarchical_model
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
 
-def plot_losses(train_losses, val_losses, save_dir):
+def plot_losses(train_losses, val_losses, save_dir, best_epoch=None, best_val_loss=None):
     plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
+    epochs = range(1, len(train_losses) + 1)
+    plt.plot(epochs, train_losses, label='Training Loss')
+    plt.plot(epochs, val_losses, label='Validation Loss')
+    
+    if best_epoch is not None and best_val_loss is not None:
+        best_epoch_idx = best_epoch - 1  # 0-based index for plotting
+        plt.scatter(best_epoch, best_val_loss, c='red', marker='*', s=100, label=f'Best Model (Loss: {best_val_loss:.4f})', zorder=5)
+        
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.title('Hierarchical PixelCNN Loss')
+    plt.title('Hierarchical PixelCNN Training and Validation Loss')
     plt.legend()
     plt.grid(True)
     plt.savefig(os.path.join(save_dir, 'loss_plot.png'))
     plt.close()
+
 
 def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: str = None):
     # Load PixelCNN configuration
@@ -127,6 +134,7 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
+    best_epoch = 0
     
     for epoch in range(epochs):
         pixelcnn.train()
@@ -189,6 +197,7 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
         # Save Best
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_epoch = epoch + 1
             torch.save({
                 'model_state': pixelcnn.state_dict(),
                 'config': config
@@ -201,7 +210,10 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
                 'model_state': pixelcnn.state_dict(),
             }, os.path.join(run_dir, f"model_epoch_{epoch+1}.pth"))
             
-    plot_losses(train_losses, val_losses, run_dir)
+        # Updates the loss plot periodically
+        plot_losses(train_losses, val_losses, run_dir, best_epoch, best_val_loss)
+
+    plot_losses(train_losses, val_losses, run_dir, best_epoch, best_val_loss)
 
 if __name__ == "__main__":
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
