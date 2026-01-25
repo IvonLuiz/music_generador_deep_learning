@@ -50,7 +50,7 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
             kernel_size=conv_filter_size[0],
             conditional_dim=None,
             num_classes=num_embeddings[0],
-            num_embeddings=256
+            num_embeddings=num_embeddings[0]
         )
         
         # Bottom level prior PixelCNN conditioned on top level latents
