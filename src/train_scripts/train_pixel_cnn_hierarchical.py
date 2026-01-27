@@ -17,7 +17,7 @@ from modeling.torch.pixel_cnn_hierarchical import HierarchicalCondGatedPixelCNN
 from datasets.hierarchical_quantized_dataset import HierarchicalQuantizedDataset
 from utils import load_maestro, load_config, initialize_vqvae_hierarchical_model, load_vqvae_hierarchical_model_wrapper
 from processing.preprocess_audio import TARGET_TIME_FRAMES
-
+from callbacks import EarlyStopping
 
 def plot_losses(train_losses, val_losses, save_dir, best_epoch=None, best_val_loss=None):
     plt.figure(figsize=(10, 5))
@@ -131,6 +131,9 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
         yaml.dump(config, f)
         
     epochs = config['training']['epochs']
+    early_stopping_patience = config['training'].get('early_stopping_patience', 10)
+    early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
+    
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
@@ -209,6 +212,12 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
             torch.save({
                 'model_state': pixelcnn.state_dict(),
             }, os.path.join(run_dir, f"model_epoch_{epoch+1}.pth"))
+        
+        # Early Stopping
+        early_stopping(val_loss, pixelcnn)
+        if early_stopping.early_stop:
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
             
         # Updates the loss plot periodically
         plot_losses(train_losses, val_losses, run_dir, best_epoch, best_val_loss)
