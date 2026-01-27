@@ -26,7 +26,8 @@ bottom_prior:
   dropout_rate: 0.1
 
 training:
-  batch_size: 64
+  batch_size: 32
+  quantization_batch_size: 32 # Batch size for computing VQ indices (prevents OOM)
   learning_rate: 0.0003
   epochs: 50
   save_dir: "./models/"
