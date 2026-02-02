@@ -1,11 +1,12 @@
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
+import numpy as np
 
 from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
 
 class HierarchicalQuantizedDataset(Dataset):
-    def __init__(self, x_train: torch.Tensor, vqvae_model: VQ_VAE_Hierarchical, device: torch.device, num_levels: int = 2, batch_size: int = 32):
+    def __init__(self, x_train: np.ndarray, vqvae_model: VQ_VAE_Hierarchical, device: torch.device, num_levels: int = 2, batch_size: int = 32):
         """
         Dataset that pre-calculates hierarchical VQ-VAE indices for training a prior model (e.g. PixelCNN).
         
