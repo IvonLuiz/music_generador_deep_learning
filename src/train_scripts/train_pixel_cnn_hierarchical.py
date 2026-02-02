@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
-import numpy as np
 from datetime import datetime
 import yaml
 import matplotlib.pyplot as plt
@@ -15,8 +14,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modeling.torch.pixel_cnn_hierarchical import HierarchicalCondGatedPixelCNN
 from datasets.hierarchical_quantized_dataset import HierarchicalQuantizedDataset
-from utils import load_maestro, load_config, initialize_vqvae_hierarchical_model, load_vqvae_hierarchical_model_wrapper
-from processing.preprocess_audio import TARGET_TIME_FRAMES
+from utils import load_maestro, load_config, load_vqvae_hierarchical_model_wrapper
 from callbacks import EarlyStopping
 
 def plot_losses(train_losses, val_losses, save_dir, best_epoch=None, best_val_loss=None):
@@ -26,7 +24,6 @@ def plot_losses(train_losses, val_losses, save_dir, best_epoch=None, best_val_lo
     plt.plot(epochs, val_losses, label='Validation Loss')
     
     if best_epoch is not None and best_val_loss is not None:
-        best_epoch_idx = best_epoch - 1  # 0-based index for plotting
         plt.scatter(best_epoch, best_val_loss, c='red', marker='*', s=100, label=f'Best Model (Loss: {best_val_loss:.4f})', zorder=5)
         
     plt.xlabel('Epoch')
@@ -49,6 +46,12 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
     batch_size = config['training']['batch_size']
     top_cfg = config['top_prior']
     bot_cfg = config['bottom_prior']
+
+    # Model configuration
+    model_cfg = config.get('model', {})
+    num_prior_levels = model_cfg.get('num_prior_levels', 2)
+    if num_prior_levels != 2:
+        raise ValueError(f"Currently only num_prior_levels=2 is supported, got {num_prior_levels}")
 
     # Load VQ-VAE
     if vqvae_model_path is None:
@@ -80,7 +83,11 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
     # Pre-calculate indices
     # Note: num_levels=2 implies we get [top_indices, bottom_indices]
     quantization_batch_size = config['training'].get('quantization_batch_size', 32)
-    dataset = HierarchicalQuantizedDataset(x_all, vqvae, device, num_levels=2, batch_size=quantization_batch_size)
+    dataset = HierarchicalQuantizedDataset(x_all, vqvae, device, num_levels=num_prior_levels, batch_size=quantization_batch_size)
+
+    # Infer spatial sizes for each prior level from the dataset
+    example_top, example_bottom = dataset[0]
+    input_size = [tuple(example_top.shape), tuple(example_bottom.shape)]
     
     # Split Train/Val
     train_size = int((1 - val_split) * len(dataset))
@@ -100,10 +107,10 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
 
     # Placeholders for other params (using defaults or extending config if needed)
     # The class expects lists for residual_units, attention etc. using sensible defaults or expanding config
-    
+
     pixelcnn = HierarchicalCondGatedPixelCNN(
-        num_prior_levels=2,
-        input_size=[(32, 32), (64, 64)], # Placeholder, model is convolutional so this mainly checks len
+        num_prior_levels=num_prior_levels,
+        input_size=input_size,
         hidden_units=hidden_units,
         num_layers=num_layers,
         conv_filter_size=conv_filter_size,
@@ -113,18 +120,18 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
         residual_units=[1024, 1024], 
         attention_layers=[0, 0],
         attention_heads=[None, None],
-        output_stack_layers=[20, 20],
         conditioning_stack_residual_blocks=[None, 20] 
     ).to(device)
     
     optimizer = optim.Adam(pixelcnn.parameters(), lr=config['training']['learning_rate'])
-    scaler = torch.amp.GradScaler('cuda') # mixed precision scaler
+    use_amp = device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     criterion = nn.CrossEntropyLoss()
     
     # Setup Save Dir
     save_dir = config['training']['save_dir']
     model_name = config['model']['name']
-    run_dir = os.path.join(save_dir, "pixelcnn_hierarchical", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    run_dir = os.path.join(save_dir, f"{model_name}_hierarchical_pixelcnn", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(run_dir, exist_ok=True)
     
     with open(os.path.join(run_dir, "config.yaml"), 'w') as f:
@@ -148,26 +155,38 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
             # batch_indices is a list: [top_indices, bottom_indices]
             top_indices = batch_indices[0].to(device)   # (B, H_top, W_top)
             bot_indices = batch_indices[1].to(device)   # (B, H_bot, W_bot)
-            
+
             optimizer.zero_grad()
-            with torch.amp.autocast('cuda'):
-                # 1. Train Top Prior
-                # Forward Top
-                logits_top = pixelcnn(top_indices, level='top') # (B, 256, 1, H, W)
-                # Target for CrossEntropy should be (B, H, W)
-                # Loss input: (B, 256, H, W) (after squeeze)
+
+            if use_amp:
+                with torch.amp.autocast('cuda'):
+                    # Train Top Prior
+                    logits_top = pixelcnn(top_indices, level='top')  # (B, num_classes_top, 1, H_top, W_top)
+                    curr_loss_top = criterion(logits_top.squeeze(2), top_indices)
+
+                    # Train Bottom Prior (conditioned on Top)
+                    logits_bot = pixelcnn(bot_indices, cond=top_indices, level='bottom')
+                    curr_loss_bot = criterion(logits_bot.squeeze(2), bot_indices)
+
+                    loss = curr_loss_top + curr_loss_bot
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Full precision path (CPU or when AMP is disabled)
+                # Train Top Prior
+                logits_top = pixelcnn(top_indices, level='top')
                 curr_loss_top = criterion(logits_top.squeeze(2), top_indices)
-                
-                # 2. Train Bottom Prior
-                # Forward Bottom (Conditioned on Top)
+
+                # Train Bottom Prior (conditioned on Top)
                 logits_bot = pixelcnn(bot_indices, cond=top_indices, level='bottom')
                 curr_loss_bot = criterion(logits_bot.squeeze(2), bot_indices)
-                
+
                 loss = curr_loss_top + curr_loss_bot
-            
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+
+                loss.backward()
+                optimizer.step()
             
             running_loss += loss.item()
             pbar.set_postfix({'loss': loss.item(), 'top': curr_loss_top.item(), 'bot': curr_loss_bot.item()})
@@ -182,14 +201,21 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
             for batch_indices in val_loader:
                 top_indices = batch_indices[0].to(device)
                 bot_indices = batch_indices[1].to(device)
-                
-                with torch.amp.autocast('cuda'):
+
+                if use_amp:
+                    with torch.amp.autocast('cuda'):
+                        logits_top = pixelcnn(top_indices, level='top')
+                        loss_top = criterion(logits_top.squeeze(2), top_indices)
+
+                        logits_bot = pixelcnn(bot_indices, cond=top_indices, level='bottom')
+                        loss_bot = criterion(logits_bot.squeeze(2), bot_indices)
+                else:
                     logits_top = pixelcnn(top_indices, level='top')
                     loss_top = criterion(logits_top.squeeze(2), top_indices)
-                    
+
                     logits_bot = pixelcnn(bot_indices, cond=top_indices, level='bottom')
                     loss_bot = criterion(logits_bot.squeeze(2), bot_indices)
-                
+
                 val_running_loss += (loss_top + loss_bot).item()
         
         val_loss = val_running_loss / len(val_loader)
