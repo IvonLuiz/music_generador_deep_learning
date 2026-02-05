@@ -8,15 +8,22 @@ from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
 class HierarchicalQuantizedDataset(Dataset):
     def __init__(self, x_train: np.ndarray, vqvae_model: VQ_VAE_Hierarchical, device: torch.device, num_levels: int = 2, batch_size: int = 32):
         """
-        Dataset that pre-calculates hierarchical VQ-VAE indices for training a prior model (e.g. PixelCNN).
-        
+        Pre-compute hierarchical VQ-VAE indices for training a prior (e.g. PixelCNN).
+
         Args:
             x_train: Numpy array of training data (N, H, W, C).
             vqvae_model: Pre-trained VQ-VAE model with multiple levels.
             device: Torch device to perform computations on.
-            num_levels: Number of hierarchical levels in the VQ-VAE.
+            num_levels: Number of hierarchical levels in the VQ-VAE. Currently, this
+                dataset implementation supports exactly two levels (top and bottom),
+                so ``num_levels`` must be set to 2.
             batch_size: Batch size used for pre-calculating indices (to avoid OOM).
         """
+        assert num_levels == 2, (
+            f"HierarchicalQuantizedDataset currently supports exactly 2 levels (top and bottom), "
+            f"got num_levels={num_levels}."
+        )
+
         self.hierarchical_indices = [[] for _ in range(num_levels)]
         vqvae_model.eval()
         vqvae_model.to(device)

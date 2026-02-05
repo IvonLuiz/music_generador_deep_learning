@@ -1,3 +1,5 @@
+from typing import Sequence, Tuple
+
 import torch
 import torch.nn as nn
 
@@ -13,17 +15,17 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
     """
     def __init__(self,
                  num_prior_levels: int = 2,
-                 input_size: int = [(32, 32), (64, 64)],
-                 hidden_units: int = [512, 512],
-                 residual_units: int = [2048, 1024],
-                 num_layers: int = [20, 20],
+                 input_size: Sequence[Tuple[int, int]] = ((32, 32), (64, 64)),
+                 hidden_units: Sequence[int] = (512, 512),
+                 residual_units: Sequence[int] = (2048, 1024),
+                 num_layers: Sequence[int] = (20, 20),
                  num_classes: int = 256,
-                 attention_layers: int = [4, 0],
-                 attention_heads: int = [8, None],
-                 conv_filter_size: int = [5, 5],
-                 conditioning_stack_residual_blocks: int = [None, 20],
-                 dropout: float = [0.1, 0.1],
-                 num_embeddings: int = [512, 512]) -> None:
+                 attention_layers: Sequence[int] = (4, 0),
+                 attention_heads: Sequence[int | None] = (8, None),
+                 conv_filter_size: Sequence[int] = (5, 5),
+                 conditioning_stack_residual_blocks: Sequence[int | None] = (None, 20),
+                 dropout: Sequence[float] = (0.1, 0.1),
+                 num_embeddings: Sequence[int] = (512, 512)) -> None:
         """
         Initialize the Conditional Gated PixelCNN model.
         @param num_prior_levels: Number of hierarchical prior levels (2 or 3)
