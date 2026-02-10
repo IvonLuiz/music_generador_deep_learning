@@ -29,7 +29,9 @@ class VectorQuantizer(nn.Module):
         Returns:
             z_q: quantized tensor with same shape as z_e
             indices: (B, H, W) selected code indices
-            loss: VQ loss (codebook + commitment)
+            vq_loss: VQ loss (codebook_loss + beta * commitment_loss)
+            codebook_loss: Codebook loss component (||sg[z_e] - e||^2)
+            commitment_loss: Beta-scaled commitment loss component (beta * ||z_e - sg[z_q]||^2)
         """
         B, D, H, W = z_e.shape
         assert D == self.embedding_dim, f"Expected channels==embedding_dim ({self.embedding_dim}), got {D}"

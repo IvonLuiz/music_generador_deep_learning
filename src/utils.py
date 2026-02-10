@@ -310,3 +310,34 @@ def load_pixelcnn_model(model_path: str, device: torch.device, weights_file: str
     pixel_cnn.eval()
     
     return pixel_cnn
+
+
+def load_vqvae_hierarchical_model_wrapper(model_path: str, device: torch.device):
+    """
+    Loads a Hierarchical VQ-VAE model.
+    """
+    if os.path.isdir(model_path):
+        config_path = os.path.join(model_path, "config.yaml")
+    else:
+        config_path = os.path.join(os.path.dirname(model_path), "config.yaml")
+        
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found at {config_path}")
+    
+    config = load_config(config_path)
+    
+    # Determine model file
+    if os.path.isdir(model_path):
+        choice = config.get('testing', {}).get('weights_file_choice')
+        if not choice:
+            choice = "model.pth"
+        model_file = os.path.join(model_path, choice)
+    else:
+        model_file = model_path
+
+    model = initialize_vqvae_hierarchical_model(config, device)
+    print(f"Loading VQ-VAE Hierarchical weights from {model_file}")
+    checkpoint = torch.load(model_file, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state'])
+    model.eval()
+    return model

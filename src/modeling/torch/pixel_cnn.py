@@ -47,9 +47,11 @@ class GatedPixelCNNBlock(nn.Module):
                  out_channels: int,
                  mask_type: str = 'B',
                  kernel_size: int = 3,
-                 conditional_dim: int = None) -> None:
+                 conditional_dim: int = None,
+                 spatial_conditioning: bool = False) -> None:
         super().__init__()
         self.mask_type = mask_type
+        self.spatial_conditioning = spatial_conditioning
         padding = kernel_size // 2
 
         # Vertical stack for pixels above
@@ -83,14 +85,22 @@ class GatedPixelCNNBlock(nn.Module):
         # Conditioning
         self.conditional_dim = conditional_dim
         if conditional_dim is not None:
-            # projects the vector h to sum before activations
-            # W_f * h and W_g * h
-            self.cond_proj_vertical = nn.Linear(
-                conditional_dim, 2 * out_channels
-            )
-            self.cond_proj_horizontal = nn.Linear(
-                conditional_dim, 2 * out_channels
-            )
+            if self.spatial_conditioning:
+                # Spatial conditioning: Use 1x1 Convs to project feature map to channels
+                self.cond_proj_vertical = nn.Conv2d(
+                    conditional_dim, 2 * out_channels, kernel_size=1
+                )
+                self.cond_proj_horizontal = nn.Conv2d(
+                    conditional_dim, 2 * out_channels, kernel_size=1
+                )
+            else:
+                # Global conditioning: Use Linear to project vector to channels
+                self.cond_proj_vertical = nn.Linear(
+                    conditional_dim, 2 * out_channels
+                )
+                self.cond_proj_horizontal = nn.Linear(
+                    conditional_dim, 2 * out_channels
+                )
 
     def gated_activation(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -123,11 +133,13 @@ class GatedPixelCNNBlock(nn.Module):
         # Add conditioning if provided
         if self.conditional_dim is not None and cond is not None:
             # Project conditioning vector to match dimensions
-            cond_vert = self.cond_proj_vertical(cond)      # [B, 2*Out]
-            cond_horiz = self.cond_proj_horizontal(cond)   # [B, 2*Out]
-            # Reshape for addition
-            cond_vert = cond_vert.unsqueeze(2).unsqueeze(3)     # [B, 2*Out, 1, 1]
-            cond_horiz = cond_horiz.unsqueeze(2).unsqueeze(3)   # [B, 2*Out, 1, 1]
+            cond_vert = self.cond_proj_vertical(cond)      # [B, 2*Out] or [B, 2*Out, H, W]
+            cond_horiz = self.cond_proj_horizontal(cond)   # [B, 2*Out] or [B, 2*Out, H, W]
+            
+            if not self.spatial_conditioning:
+                # Reshape for addition if global conditioning
+                cond_vert = cond_vert.unsqueeze(2).unsqueeze(3)     # [B, 2*Out, 1, 1]
+                cond_horiz = cond_horiz.unsqueeze(2).unsqueeze(3)   # [B, 2*Out, 1, 1]
             
             # Add conditioning (bias to certain features)
             vert_val = vert_val + cond_vert
@@ -154,6 +166,7 @@ class ConditionalGatedPixelCNN(nn.Module):
                  num_layers: int = 5,
                  kernel_size: int = 3,
                  conditional_dim: int = None,
+                 spatial_conditioning: bool = False,
                  num_classes: int = 256,
                  num_embeddings: int = None) -> None:
         """
@@ -162,7 +175,8 @@ class ConditionalGatedPixelCNN(nn.Module):
         @param hidden_channels: Number of hidden channels
         @param num_layers: Number of Gated PixelCNN layers hidden
         @param kernel_size: Kernel size for convolutions
-        @param conditional_dim: Dimension of the conditional vector
+        @param conditional_dim: Dimension of the conditional vector/map
+        @param spatial_conditioning: Whether to use spatial conditioning (2D map) or global (vector)
         @param num_classes: Number of output classes (e.g., 256 for 8-bit quantization)
         @param num_embeddings: Size of embedding dictionary (if input is discrete indices)
         """
@@ -179,10 +193,10 @@ class ConditionalGatedPixelCNN(nn.Module):
             input_channels = in_channels
 
         # Mask type A for the first layer
-        self.input_conv = GatedPixelCNNBlock(input_channels, hidden_channels, 'A', kernel_size, conditional_dim)
+        self.input_conv = GatedPixelCNNBlock(input_channels, hidden_channels, 'A', kernel_size, conditional_dim, spatial_conditioning)
         # Mask type B for subsequent layers
         self.gated_blocks = nn.ModuleList([
-            GatedPixelCNNBlock(hidden_channels, hidden_channels, 'B', kernel_size, conditional_dim)
+            GatedPixelCNNBlock(hidden_channels, hidden_channels, 'B', kernel_size, conditional_dim, spatial_conditioning)
             for _ in range(num_layers)
         ])
 

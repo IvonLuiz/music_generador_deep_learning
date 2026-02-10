@@ -1,0 +1,34 @@
+dataset:
+  processed_path: "./data/processed/maestro_spectrograms_test/"
+  target_time_frames: 256
+
+vqvae:
+  model_dir: "./models/vq_vae_hierarchical/"
+  specific_run_dir: "2025-12-24_19-01-19"  # Use the latest available run
+  weights_file: "best_model.pth"           # Which weights to load
+
+model:
+  name: "pixelcnn_maestro2011"
+  num_prior_levels: 2
+
+top_prior:
+  hidden_channels: 128
+  num_layers: 15
+  conv_filter_size: 5
+  attention_layers: 0 # PixelCNN usually doesn't strictly require attention at all layers, maybe simplified
+  dropout_rate: 0.1
+
+bottom_prior:
+  hidden_channels: 128
+  num_layers: 15
+  conv_filter_size: 5
+  attention_layers: 0
+  dropout_rate: 0.1
+
+training:
+  batch_size: 32
+  quantization_batch_size: 32 # Batch size for computing VQ indices (prevents OOM)
+  learning_rate: 0.0003
+  epochs: 50
+  save_dir: "./models/"
+  validation_split: 0.2
