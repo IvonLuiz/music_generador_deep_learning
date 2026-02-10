@@ -11,6 +11,7 @@ model:
 
 training:
   batch_size: 128
+  quantization_batch_size: 32 # Batch size for computing VQ indices (prevents OOM)
   learning_rate: 0.001
   epochs: 50
   save_dir: "./models/"
