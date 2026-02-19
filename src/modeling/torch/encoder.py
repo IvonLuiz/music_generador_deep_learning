@@ -8,7 +8,7 @@ from .residual_stack import ResidualStack
 
 
 class EncoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, conv_type=2):
+    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, conv_type=2, num_downsample_blocks=1):
         """!
         @in_channels: Number of input channels
         @out_channels: Number of output channels
@@ -24,22 +24,16 @@ class EncoderBlock(nn.Module):
 
         # Downsampling conv
         # conv_type can be 1 for raw audio or 2 for spectrograms
-        if conv_type == 1:
-            # standard convolution (used for raw audio)
-            self._create_2d_encoder(in_channels, out_channels, num_residual_layers, stride, padding)
-        elif conv_type == 2:
-            # [kernel_size X kernel_size] conv with stride 2 to reduce checkerboard artifacts (used for spectrograms)
-            self._create_2d_encoder(in_channels, out_channels, num_residual_layers, stride, padding)
-        else:
-            raise ValueError(f"Invalid conv_type: {conv_type}. Must be 1 or 2.")
+        self._create_encoder_layer(conv_type, in_channels, out_channels, stride, padding, kernel_size)
 
         self.layers.append(nn.ReLU(inplace=True))
 
         # Residual Stack after downsampling
         self.layers.append(ResidualStack(in_channels=out_channels,
-                                    num_hiddens=out_channels,
-                                    num_residual_hiddens=out_channels // 2,
-                                    num_residual_layers=num_residual_layers))
+                                        num_hiddens=out_channels,
+                                        num_residual_hiddens=out_channels // 2,
+                                        num_residual_layers=num_residual_layers,
+                                        conv_type=conv_type))
 
         self._net = nn.Sequential(*self.layers)
     
@@ -47,20 +41,20 @@ class EncoderBlock(nn.Module):
         x = self._net(x)
         return x
 
-    def _create_2d_encoder(self, in_channels, out_channels, num_residual_layers, stride, padding, kernel_size=4):
-        """Create a 2D encoder block with the given parameters."""
-        self.layers.append(nn.Conv2d(in_channels,
-                                     out_channels,
-                                     kernel_size=kernel_size,
-                                     stride=stride,
-                                     padding=padding))
-        self.layers.append(nn.BatchNorm2d(out_channels))
+    def _create_encoder_layer(self, conv_size, in_channels, out_channels, stride, padding, kernel_size=4):
+        """Create a 2D or 1D encoder block with the given parameters."""
+        if conv_size == 1:
+            conv_type = nn.Conv1d
+            batch_norm = nn.BatchNorm1d
+        elif conv_size == 2:
+            conv_type = nn.Conv2d
+            batch_norm = nn.BatchNorm2d
+        else:
+            raise ValueError(f"Unsupported conv_size: {conv_size}")
 
-    def _create_1d_encoder(self, in_channels, out_channels, num_residual_layers, stride, padding, kernel_size=4):
-        """Create a 1D encoder block with the given parameters."""
-        self.layers.append(nn.Conv1d(in_channels,
-                                     out_channels,
-                                     kernel_size=kernel_size,
-                                     stride=stride,
-                                     padding=padding))
-        self.layers.append(nn.BatchNorm1d(out_channels))
+        self.layers.append(conv_type(in_channels,
+                                        out_channels,
+                                        kernel_size=kernel_size,
+                                    stride=stride,
+                                    padding=padding))
+        self.layers.append(batch_norm(out_channels))

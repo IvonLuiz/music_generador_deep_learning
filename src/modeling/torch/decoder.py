@@ -8,7 +8,7 @@ from .residual_stack import ResidualStack
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, conv_type=2):
+    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, conv_type=2, num_downsample_blocks=1):
         """!
         @in_channels: Number of input channels
         @out_channels: Number of output channels
@@ -17,6 +17,7 @@ class DecoderBlock(nn.Module):
         @kernel_size: Kernel size for the upsampling convolution
         @padding: Padding for the upsampling convolution
         @param conv_type: Convolution type. 1 for standard conv, 2 for [kernel_size X kernel_size] conv with stride 2 to reduce checkerboard artifacts
+        @param num_downsample_blocks: Number of downsampling blocks to apply before the residual stack (for deeper decoders)
         """
         super().__init__()
         self.layers = []
@@ -29,12 +30,7 @@ class DecoderBlock(nn.Module):
                                     num_residual_layers=num_residual_layers))
 
         # Upsampling conv (Transpose Conv)
-        if conv_type == 1:
-            # standard transpose convolution (used for raw audio)
-            self._create_1d_decoder(in_channels, out_channels, num_residual_layers, stride, padding, kernel_size)
-        elif conv_type == 2:
-            # [kernel_size X kernel_size] transpose conv with stride 2 (used for spectrograms)
-            self._create_2d_decoder(in_channels, out_channels, num_residual_layers, stride, padding, kernel_size)
+        self._create_decoding_layer(conv_type, in_channels, stride, padding, kernel_size, num_downsample_blocks)
 
         self.layers.append(nn.ReLU(inplace=True))
 
@@ -44,20 +40,22 @@ class DecoderBlock(nn.Module):
         x = self._net(x)
         return x
 
-    def _create_2d_decoder(self, in_channels, out_channels, num_residual_layers, stride, padding, kernel_size=4):
-        """Create a 2D decoder block with the given parameters."""
-        self.layers.append(nn.ConvTranspose2d(in_channels,
-                                     out_channels,
-                                     kernel_size=kernel_size,
-                                     stride=stride,
-                                     padding=padding))
-        self.layers.append(nn.BatchNorm2d(out_channels))
+    def _create_decoding_layer(self, conv_type, in_channels, stride, padding, kernel_size=4, num_downsample_blocks=1):
+        """Create a 2D or 1D decoder block with the given parameters."""
+        if conv_type == 2:
+            conv_block = nn.ConvTranspose2d
+            batch_norm = nn.BatchNorm2d
+        elif conv_type == 1:
+            conv_block = nn.ConvTranspose1d
+            batch_norm = nn.BatchNorm1d
+        else:
+            raise ValueError(f"Unsupported conv_type: {conv_type}")
 
-    def _create_1d_decoder(self, in_channels, out_channels, num_residual_layers, stride, padding, kernel_size=4):
-        """Create a 1D decoder block with the given parameters."""
-        self.layers.append(nn.ConvTranspose1d(in_channels,
-                                     out_channels,
-                                     kernel_size=kernel_size,
-                                     stride=stride,
-                                     padding=padding))
-        self.layers.append(nn.BatchNorm1d(out_channels))
+
+        for _ in range(num_downsample_blocks):
+            self.layers.append(conv_block(in_channels,
+                                         in_channels,
+                                         kernel_size=kernel_size,
+                                         stride=stride,
+                                         padding=padding))
+            self.layers.append(batch_norm(in_channels))
