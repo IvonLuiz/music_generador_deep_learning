@@ -21,16 +21,18 @@ class DecoderBlock(nn.Module):
         """
         super().__init__()
         self.layers = []
-        stride = (stride, stride) if isinstance(stride, int) else stride  # normalize stride to tuple if it's an int
+        if conv_type == 2:
+            stride = (stride, stride) if isinstance(stride, int) else stride
 
         # Residual Stack before upsampling
         self.layers.append(ResidualStack(in_channels=in_channels,
                                     num_hiddens=in_channels,
                                     num_residual_hiddens=in_channels // 2,
-                                    num_residual_layers=num_residual_layers))
+                                    num_residual_layers=num_residual_layers,
+                                    conv_type=conv_type))
 
         # Upsampling conv (Transpose Conv)
-        self._create_decoding_layer(conv_type, in_channels, stride, padding, kernel_size, num_downsample_blocks)
+        self._create_decoding_layer(conv_type, in_channels, out_channels, stride, padding, kernel_size, num_downsample_blocks)
 
         self.layers.append(nn.ReLU(inplace=True))
 
@@ -40,7 +42,7 @@ class DecoderBlock(nn.Module):
         x = self._net(x)
         return x
 
-    def _create_decoding_layer(self, conv_type, in_channels, stride, padding, kernel_size=4, num_downsample_blocks=1):
+    def _create_decoding_layer(self, conv_type, in_channels, out_channels, stride, padding, kernel_size=4, num_downsample_blocks=1):
         """Create a 2D or 1D decoder block with the given parameters."""
         if conv_type == 2:
             conv_block = nn.ConvTranspose2d
@@ -52,10 +54,13 @@ class DecoderBlock(nn.Module):
             raise ValueError(f"Unsupported conv_type: {conv_type}")
 
 
-        for _ in range(num_downsample_blocks):
-            self.layers.append(conv_block(in_channels,
-                                         in_channels,
+        current_in = in_channels
+        for block_idx in range(num_downsample_blocks):
+            current_out = out_channels if block_idx == num_downsample_blocks - 1 else current_in
+            self.layers.append(conv_block(current_in,
+                                         current_out,
                                          kernel_size=kernel_size,
                                          stride=stride,
                                          padding=padding))
-            self.layers.append(batch_norm(in_channels))
+            self.layers.append(batch_norm(current_out))
+            current_in = current_out
