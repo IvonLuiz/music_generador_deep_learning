@@ -32,7 +32,9 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                              early_stopping_patience: int = 20,
                              amp: bool = True,
                              x_val: np.ndarray = None,
-                             val_file_paths: list = None):
+                             val_file_paths: list = None,
+                             num_workers: int = 4,
+                             pin_memory: bool = True):
     """
     Train a VQ-VAE Hierarchical model.
 
@@ -64,13 +66,13 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
             if len(x_val) > 0:
                 print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
                 val_dataset = SpectrogramDataset(x_val)
-                val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+                val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
                 early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
         else:
             # Assume x_val is a Dataset
             print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
             val_dataset = x_val
-            val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+            val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
             early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
     
     if val_dataloader is None:
@@ -81,7 +83,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
     else:
         dataset = x_train
         
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner for potential speedup
