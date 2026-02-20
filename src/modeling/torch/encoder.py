@@ -20,7 +20,8 @@ class EncoderBlock(nn.Module):
         """
         super().__init__()
         self.layers = []
-        stride = (stride, stride) if isinstance(stride, int) else stride  # normalize stride to tuple if it's an int
+        if conv_type == 2:
+            stride = (stride, stride) if isinstance(stride, int) else stride
 
         # Downsampling conv
         # conv_type can be 1 for raw audio or 2 for spectrograms

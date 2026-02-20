@@ -6,12 +6,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Add 'src' to sys.path to allow imports from sibling directories
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from .encoder import EncoderBlock
-from .decoder import DecoderBlock
-from .residual_stack import ResidualStack
-from modeling.torch.vector_quantizer import VectorQuantizer
+# Setup path to find siblings when running this file directly
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir) # src/modeling
+grandparent_dir = os.path.dirname(parent_dir) # src
+
+sys.path.append(grandparent_dir)
+
+try:
+    # When importing as a module from elsewhere in the project
+    from modeling.torch.encoder import EncoderBlock
+    from modeling.torch.decoder import DecoderBlock
+    from modeling.torch.vector_quantizer import VectorQuantizer
+except ImportError:
+    # When running this script directly
+    from encoder import EncoderBlock
+    from decoder import DecoderBlock
+    from vector_quantizer import VectorQuantizer
 
 
 class JukeboxVQVAE(nn.Module):
@@ -32,7 +43,8 @@ class JukeboxVQVAE(nn.Module):
                  beta: float = 0.25,
                  conv_type: int = 2,
                  activation_layer: torch.Optional[nn.Module] = None,
-                 dilation_growth_rate: int = 3):
+                 dilation_growth_rate: int = 3,
+                 channel_growth: int = 1):
         """
         Args:
             input_channels: Number of input channels (e.g., 1 for mono audio, 2 for stereo, 1 for spectrogram).
@@ -41,14 +53,19 @@ class JukeboxVQVAE(nn.Module):
             num_residual_layers: ResBlocks per level.
             conv_type: 1 for 1D (Audio), 2 for 2D (Spectrograms).
             dilation_growth_rate: Factor to grow dilation in residual stack (Jukebox uses 3).
+            channel_growth: Channel multiplier per downsampling level. For Jukebox-style stability,
+                            keep this at 1 (constant width).
         """
         if conv_type != 1 and conv_type != 2:
             raise ValueError("conv_type must be either 1 (Conv1d) or 2 (Conv2d)")
+        if channel_growth < 1:
+            raise ValueError("channel_growth must be >= 1")
         
         super().__init__()
         self.levels = levels
         self.conv_type = conv_type
         self.activation_layer = activation_layer
+        self.channel_growth = channel_growth
         Conv = nn.Conv1d if conv_type == 1 else nn.Conv2d
 
         ## ENCODERS
@@ -63,11 +80,10 @@ class JukeboxVQVAE(nn.Module):
         
         # Stack levels
         for level in range(levels):
-            # In Jukebox paper, dimension often stays constant or changes specifically.
-            # Here we assume constant hidden_dim for simplicity, or you can widen it.
+            next_dim = current_dim * self.channel_growth
             encoder_layers.append(
                 EncoderBlock(in_channels=current_dim,
-                             out_channels=current_dim * 2,
+                             out_channels=next_dim,
                              num_residual_layers=num_residual_layers,
                              stride=2,         # standard stride of 2 for downsampling
                              kernel_size=4,
@@ -76,7 +92,9 @@ class JukeboxVQVAE(nn.Module):
                              num_downsample_blocks=1 # done per loop iteration to allow for different conv types per level if needed
                              )
                 )
-            current_dim *= 2
+            current_dim = next_dim
+        
+        self.encoder = nn.Sequential(*encoder_layers)
 
         ## PRE-QUANT CONVS
         # conv to adjust channels before quantization if needed
@@ -94,25 +112,26 @@ class JukeboxVQVAE(nn.Module):
         decoder_layers.append(Conv(embedding_dim, current_dim, kernel_size=3, padding=1))
         
         for level in reversed(range(self.levels)):
+            next_dim = current_dim // self.channel_growth if self.channel_growth > 1 else current_dim
             decoder_layers.append(
                 DecoderBlock(in_channels=current_dim,
-                             out_channels=current_dim // 2,
+                             out_channels=next_dim,
                              num_residual_layers=num_residual_layers,
                              stride=2,         # standard stride of 2 for upsampling
                              kernel_size=4,
                              padding=1,
                              conv_type=conv_type,
-                             num_upsample_blocks=1 # done per loop iteration to allow for different conv types per level if needed
+                             num_downsample_blocks=1 # done per loop iteration to allow for different conv types per level if needed
                              )
                 )
-            current_dim //= 2
-            
-            # Final block for projection back to input channels after all upsampling is done
-            decoder_layers.append(Conv(current_dim, input_channels, kernel_size=3, padding=1))
-            
-            # Final activation? Jukebox raw audio usually entails no activation (Linear) or Tanh.
-            # For spectrograms, we want a sigmoid
-            self.decoder = nn.Sequential(*decoder_layers)
+            current_dim = next_dim
+
+        # Final block for projection back to input channels after all upsampling is done
+        decoder_layers.append(Conv(current_dim, input_channels, kernel_size=3, padding=1))
+
+        # Final activation? Jukebox raw audio usually entails no activation (Linear) or Tanh.
+        # For spectrograms, we want a sigmoid
+        self.decoder = nn.Sequential(*decoder_layers)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """
@@ -166,6 +185,18 @@ def vqvae_hierarchical_loss(x, x_recon, vq_losses_top, vq_losses_bottom, varianc
     return recon + total_vq_loss, recon
 
 if __name__ == "__main__":
-    # Example instantiation
-    model = JukeboxVQVAE(input_channels=1, hidden_dim=128, levels=3, num_residual_layers=2, num_embeddings=512, embedding_dim=64, beta=0.25, conv_type=2)
-    print(model)
+    # Test block
+    print("Initializing Jukebox VQ-VAE...")
+    
+    # 1D Audio Test
+    model_1d = JukeboxVQVAE(input_channels=1, hidden_dim=64, levels=3, conv_type=1)
+    x_1d = torch.randn(2, 1, 8000) # (Batch, Channels, Time)
+    y_1d, _, _ = model_1d(x_1d)
+    print(f"1D Input: {x_1d.shape}, Output: {y_1d.shape}")
+    
+    # 2D Spectrogram Test
+    model_2d = JukeboxVQVAE(input_channels=1, hidden_dim=64, levels=2, conv_type=2, 
+                           activation_layer=nn.Sigmoid())
+    x_2d = torch.randn(2, 1, 128, 128) # (Batch, Channels, H, W)
+    y_2d, _, _ = model_2d(x_2d)
+    print(f"2D Input: {x_2d.shape}, Output: {y_2d.shape}")
