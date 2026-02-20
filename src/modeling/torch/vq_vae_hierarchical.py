@@ -14,7 +14,7 @@ class VQ_VAE_Hierarchical(nn.Module):
     """
     Hierarchical VQ-VAE model with two levels of encoders, decoders, and vector quantizers.
     
-    This implementation on the paper Jukebox: A Generative Model for Music (https://arxiv.org/abs/).
+    This implementation on the paper Generating Diverse High-Fidelity Images with VQ-VAE-2 (https://arxiv.org/abs/1906.00446).
     """
 
     def __init__(self,
