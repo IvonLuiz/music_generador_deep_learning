@@ -11,6 +11,20 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+## Train Jukebox VQ-VAE (Bottom → Middle → Top)
+
+Run all 3 Jukebox VQ-VAE levels sequentially:
+
+```bash
+bash src/train_scripts/train_vqvae_jukebox_all_levels.sh
+```
+
+Optional: pass extra arguments through to each run (for example, any future trainer flags):
+
+```bash
+bash src/train_scripts/train_vqvae_jukebox_all_levels.sh <extra-args>
+```
+
 ## Project Roadmap
 
 - **VQ-VAE TODO**:
