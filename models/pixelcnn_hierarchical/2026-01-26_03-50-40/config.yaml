@@ -1,0 +1,29 @@
+bottom_prior:
+  attention_layers: 0
+  conv_filter_size: 5
+  dropout_rate: 0.1
+  hidden_channels: 128
+  num_layers: 15
+dataset:
+  processed_path: ./data/processed/maestro_spectrograms_test/
+  target_time_frames: 256
+model:
+  name: pixelcnn_maestro2011
+  num_prior_levels: 2
+top_prior:
+  attention_layers: 0
+  conv_filter_size: 5
+  dropout_rate: 0.1
+  hidden_channels: 128
+  num_layers: 15
+training:
+  batch_size: 32
+  epochs: 50
+  learning_rate: 0.0003
+  quantization_batch_size: 32
+  save_dir: ./models/
+  validation_split: 0.2
+vqvae:
+  model_dir: ./models/vq_vae_hierarchical/
+  specific_run_dir: 2025-12-24_19-01-19
+  weights_file: best_model.pth
