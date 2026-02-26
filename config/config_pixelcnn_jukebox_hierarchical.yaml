@@ -1,0 +1,40 @@
+dataset:
+  processed_path: "./data/processed/maestro_spectrograms_test/"
+  target_time_frames: 256
+
+vqvae:
+  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_top/2026-02-21_02-47-18"
+  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_middle/2026-02-20_10-21-05"
+  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_bottom/2026-02-20_02-30-56"
+  weights_file: "best_model.pth"
+
+model:
+  name: "pixelcnn_jukebox_maestro2011"
+  num_prior_levels: 3
+
+top_prior:
+  hidden_channels: 128
+  num_layers: 15
+  conv_filter_size: 5
+  dropout_rate: 0.1
+
+middle_prior:
+  hidden_channels: 128
+  num_layers: 15
+  conv_filter_size: 5
+  dropout_rate: 0.1
+
+bottom_prior:
+  hidden_channels: 128
+  num_layers: 15
+  conv_filter_size: 5
+  dropout_rate: 0.1
+
+training:
+  batch_size: 16
+  quantization_batch_size: 32
+  learning_rate: 0.0003
+  epochs: 50
+  save_dir: "./models/"
+  validation_split: 0.2
+  early_stopping_patience: 10
