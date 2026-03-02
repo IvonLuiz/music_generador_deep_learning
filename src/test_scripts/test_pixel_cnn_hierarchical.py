@@ -2,6 +2,7 @@ import os
 import argparse
 import torch
 import torch.nn.functional as F
+from typing import List, Tuple
 from datetime import datetime
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -15,6 +16,47 @@ from generation.generate import save_multiple_signals
 from utils import load_config, load_vqvae_hierarchical_model_wrapper
 from modeling.torch.pixel_cnn_hierarchical import HierarchicalCondGatedPixelCNN
 from processing.preprocess_audio import TARGET_TIME_FRAMES
+
+
+def _normalize_state_dict_keys(state_dict: dict) -> dict:
+    keys = list(state_dict.keys())
+    if not keys:
+        return state_dict
+
+    if all(k.startswith('module.') for k in keys):
+        return {k[len('module.'):]: v for k, v in state_dict.items()}
+    return state_dict
+
+
+def _infer_num_embeddings_from_state_dict(state_dict: dict) -> List[int]:
+    top_key_candidates = [
+        'top_prior.embedding.weight',
+        'top_prior.output_conv.3.weight',
+    ]
+    bottom_key_candidates = [
+        'bottom_level.embedding.weight',
+        'bottom_level.output_conv.3.weight',
+    ]
+
+    top_num = None
+    for k in top_key_candidates:
+        if k in state_dict:
+            top_num = state_dict[k].shape[0]
+            break
+
+    bottom_num = None
+    for k in bottom_key_candidates:
+        if k in state_dict:
+            bottom_num = state_dict[k].shape[0]
+            break
+
+    if top_num is None and bottom_num is None:
+        return [512, 512]
+    if top_num is None:
+        top_num = bottom_num
+    if bottom_num is None:
+        bottom_num = top_num
+    return [top_num, bottom_num]
 
 def load_hierarchical_pixelcnn_model(model_dir: str, device: torch.device, weights_file="best_model.pth"):
     """
@@ -48,19 +90,8 @@ def load_hierarchical_pixelcnn_model(model_dir: str, device: torch.device, weigh
     if 'config' in checkpoint:
         config = checkpoint['config']
         
-    state_dict = checkpoint['model_state']
-    
-    try:
-        num_embeddings_top = state_dict['top_prior.out_conv.weight'].shape[0] 
-        # Check bottom prior if exists
-        if 'bottom_level.out_conv.weight' in state_dict:
-            num_embeddings_bot = state_dict['bottom_level.out_conv.weight'].shape[0]
-            num_embeddings = [num_embeddings_top, num_embeddings_bot]
-        else:
-            num_embeddings = [num_embeddings_top, num_embeddings_top] # Fallback if single level? but this is hierarchical loader
-    except KeyError:
-        print("Could not infer num_embeddings from state_dict keys (top_prior.out_conv.weight not found). Using default [512, 512].")
-        num_embeddings = [512, 512] 
+    state_dict = _normalize_state_dict_keys(checkpoint['model_state'])
+    num_embeddings = _infer_num_embeddings_from_state_dict(state_dict)
     
     pixelcnn = HierarchicalCondGatedPixelCNN(
         num_prior_levels=2,
@@ -82,7 +113,7 @@ def load_hierarchical_pixelcnn_model(model_dir: str, device: torch.device, weigh
     pixelcnn.eval()
     return pixelcnn
 
-def generate_hierarchical_samples(pixelcnn_model: HierarchicalCondGatedPixelCNN, num_samples: int, latent_shapes: list[tuple[int, int]], device: torch.device):
+def generate_hierarchical_samples(pixelcnn_model: HierarchicalCondGatedPixelCNN, num_samples: int, latent_shapes: List[Tuple[int, int]], device: torch.device):
     """
     Generate samples using Hierarchical PixelCNN.
     latent_shapes: List of tuples [(H_top, W_top), (H_bot, W_bot)]
