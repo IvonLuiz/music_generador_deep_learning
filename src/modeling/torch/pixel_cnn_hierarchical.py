@@ -1,7 +1,8 @@
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
 
@@ -19,11 +20,11 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
                  hidden_units: Sequence[int] = (512, 512),
                  residual_units: Sequence[int] = (2048, 1024),
                  num_layers: Sequence[int] = (20, 20),
-                 num_classes: int = 256,
+                 num_classes: int = 256, # not used for now
                  attention_layers: Sequence[int] = (4, 0),
-                 attention_heads: Sequence[int | None] = (8, None),
+                 attention_heads: Sequence[Optional[int]] = (8, None),
                  conv_filter_size: Sequence[int] = (5, 5),
-                 conditioning_stack_residual_blocks: Sequence[int | None] = (None, 20),
+                 conditioning_stack_residual_blocks: Sequence[Optional[int]] = (None, 20),
                  dropout: Sequence[float] = (0.1, 0.1),
                  num_embeddings: Sequence[int] = (512, 512)) -> None:
         """
@@ -43,6 +44,7 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
         @param num_embeddings: Size of embedding dictionary (if input is discrete indices)
         """
         super().__init__()
+        self.num_prior_levels = num_prior_levels
 
         if num_prior_levels <= 1 or num_prior_levels > 3:
             raise ValueError("num_prior_levels must be 2 or 3")
@@ -52,11 +54,7 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
             assert isinstance(hidden_units[prior_levels], int), "hidden_units must be a list of integers"
             assert isinstance(residual_units[prior_levels], int), "residual_units must be a list of integers"
             assert isinstance(num_layers[prior_levels], int), "num_layers must be a list of integers"
-            assert isinstance(attention_layers[prior_levels], int), "attention_layers must be a list of integers"
-            assert (attention_heads[prior_levels] is None) or isinstance(attention_heads[prior_levels], int), "attention_heads must be a list of integers or None"
             assert isinstance(conv_filter_size[prior_levels], int), "conv_filter_size must be a list of integers"
-            assert (conditioning_stack_residual_blocks[prior_levels] is None) or isinstance(conditioning_stack_residual_blocks[prior_levels], int), "conditioning_stack_residual_blocks must be a list of integers or None"
-            assert isinstance(dropout[prior_levels], float), "dropout must be a list of floats"
             assert isinstance(num_embeddings[prior_levels], int), "num_embeddings must be a list of integers"
 
         # Prior levels acccording to num_prior_levels
@@ -69,46 +67,85 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
             num_classes=num_embeddings[0],
             num_embeddings=num_embeddings[0]
         )
-        
-        # Bottom level prior PixelCNN conditioned on top level latents
-        ## the values would always be the last in the list
-        if num_prior_levels >= 2:
+
+        # Two-level setup: top -> bottom
+        if num_prior_levels == 2:
             self.bottom_level = ConditionalGatedPixelCNN(
                 in_channels=1,
                 hidden_channels=hidden_units[-1],
                 num_layers=num_layers[-1],
                 kernel_size=conv_filter_size[-1],
-                conditional_dim=128, # Assuming conditioning stack outputs 128 channels (hidden dim of prior)
+                conditional_dim=hidden_units[-1],
                 spatial_conditioning=True,
                 num_classes=num_embeddings[-1],
                 num_embeddings=num_embeddings[-1]
             )
-            
-            # Conditioning stack (Upsampler) for Top -> Bottom
-            # Assumes 2x upsampling needed (e.g. 32x32 -> 64x64)
-            # Input: Top indices (embedded) (N, hidden, H, W)
+
+            self.top_embedding_for_cond = nn.Embedding(num_embeddings[0], hidden_units[-1])
             self.conditioning_stack = nn.Sequential(
-                nn.ConvTranspose2d(hidden_units[-1], 128, kernel_size=4, stride=2, padding=1), # Emb size 256 -> 128
+                nn.Conv2d(hidden_units[-1], hidden_units[-1], kernel_size=3, padding=1),
                 nn.ReLU(),
-                nn.Conv2d(128, 128, kernel_size=3, padding=1),
+                nn.Conv2d(hidden_units[-1], hidden_units[-1], kernel_size=3, padding=1),
                 nn.ReLU()
             )
-            self.top_embedding_for_cond = nn.Embedding(num_embeddings[0], hidden_units[-1]) # Embed indices before upsampling
 
-        
-        # Middle level prior PixelCNN conditioned on top level latents
-        ## only if 3 levels are used, and uses the middle values in the list
+        # Three-level setup: top -> middle -> bottom
         if num_prior_levels == 3:
-            self.mid_prior = ConditionalGatedPixelCNN(
+            # Middle prior conditioned on top
+            self.middle_level = ConditionalGatedPixelCNN(
                 in_channels=1,
                 hidden_channels=hidden_units[1],
                 num_layers=num_layers[1],
                 kernel_size=conv_filter_size[1],
                 conditional_dim=hidden_units[1],
                 spatial_conditioning=True,
-                num_classes=num_classes,
+                num_classes=num_embeddings[1],
                 num_embeddings=num_embeddings[1]
             )
+
+            self.top_embedding_for_middle_cond = nn.Embedding(num_embeddings[0], hidden_units[1])
+            self.top_to_middle_conditioning = nn.Sequential(
+                nn.Conv2d(hidden_units[1], hidden_units[1], kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(hidden_units[1], hidden_units[1], kernel_size=3, padding=1),
+                nn.ReLU(),
+            )
+
+            # Bottom prior conditioned on middle
+            self.bottom_level = ConditionalGatedPixelCNN(
+                in_channels=1,
+                hidden_channels=hidden_units[2],
+                num_layers=num_layers[2],
+                kernel_size=conv_filter_size[2],
+                conditional_dim=hidden_units[2],
+                spatial_conditioning=True,
+                num_classes=num_embeddings[2],
+                num_embeddings=num_embeddings[2]
+            )
+
+            self.middle_embedding_for_bottom_cond = nn.Embedding(num_embeddings[1], hidden_units[2])
+            self.middle_to_bottom_conditioning = nn.Sequential(
+                nn.Conv2d(hidden_units[2], hidden_units[2], kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(hidden_units[2], hidden_units[2], kernel_size=3, padding=1),
+                nn.ReLU(),
+            )
+
+    def _prepare_indices(self, cond: torch.Tensor) -> torch.Tensor:
+        if cond.ndim == 4 and cond.shape[1] == 1:
+            cond = cond.squeeze(1)
+        return cond.long()
+
+    def _build_spatial_condition(self,
+                                 cond_indices: torch.Tensor,
+                                 embedding_layer: nn.Embedding,
+                                 conditioning_stack: nn.Module,
+                                 target_spatial_shape: Tuple[int, int]) -> torch.Tensor:
+        cond_emb = embedding_layer(cond_indices).permute(0, 3, 1, 2).contiguous()
+        cond_map = conditioning_stack(cond_emb)
+        if cond_map.shape[-2:] != target_spatial_shape:
+            cond_map = F.interpolate(cond_map, size=target_spatial_shape, mode='nearest')
+        return cond_map
         
     def forward(self, x, cond=None, level='top'):
         """
@@ -124,28 +161,47 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
         """
         if level == 'top':
             return self.top_prior(x)
+
         elif level == 'mid':
-            if not hasattr(self, 'mid_prior'):
+            if self.num_prior_levels < 3 or not hasattr(self, 'middle_level'):
                 raise ValueError("Mid level prior is not defined for num_prior_levels < 3")
-            return self.mid_prior(x, cond)
+            if cond is None:
+                raise ValueError("Conditioning information (top level indices) required for mid level.")
+
+            cond = self._prepare_indices(cond)
+            cond_map = self._build_spatial_condition(
+                cond_indices=cond,
+                embedding_layer=self.top_embedding_for_middle_cond,
+                conditioning_stack=self.top_to_middle_conditioning,
+                target_spatial_shape=x.shape[-2:],
+            )
+            return self.middle_level(x, cond=cond_map)
+
         elif level == 'bottom':
             if not hasattr(self, 'bottom_level'):
                 raise ValueError("Bottom level prior is not defined for num_prior_levels < 2")
-            
-            # Process conditioning information (Top Level Indices)
+
             if cond is None:
-                raise ValueError("Conditioning information (top level indices) required for bottom level.")
-                
-            # cond is expected to be [B, 1, H_top, W_top] or [B, H_top, W_top]
-            if cond.ndim == 4 and cond.shape[1] == 1:
-                cond = cond.squeeze(1)
-            
-            cond = cond.long() # [B, H_top, W_top]
-            cond_emb = self.top_embedding_for_cond(cond).permute(0, 3, 1, 2) # [B, hidden_units[-1], H_top, W_top]
-            
-            # Upsample to bottom resolution for conditioning
-            cond_map = self.conditioning_stack(cond_emb) # [B, 128, H_bottom, W_bottom]
-            
+                expected = "top" if self.num_prior_levels == 2 else "middle"
+                raise ValueError(f"Conditioning information ({expected} level indices) required for bottom level.")
+
+            cond = self._prepare_indices(cond)
+
+            if self.num_prior_levels == 2:
+                cond_map = self._build_spatial_condition(
+                    cond_indices=cond,
+                    embedding_layer=self.top_embedding_for_cond,
+                    conditioning_stack=self.conditioning_stack,
+                    target_spatial_shape=x.shape[-2:],
+                )
+            else:
+                cond_map = self._build_spatial_condition(
+                    cond_indices=cond,
+                    embedding_layer=self.middle_embedding_for_bottom_cond,
+                    conditioning_stack=self.middle_to_bottom_conditioning,
+                    target_spatial_shape=x.shape[-2:],
+                )
+
             return self.bottom_level(x, cond=cond_map)
         else:
             raise ValueError("level must be 'top', 'mid', or 'bottom'")
@@ -186,7 +242,7 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
         if level == 'top':
             return self._sample_autoregressive(shape, cond=None, level='top')
         elif level == 'mid':
-            if not hasattr(self, 'mid_prior'):
+            if self.num_prior_levels < 3 or not hasattr(self, 'middle_level'):
                 raise ValueError("Mid level prior is not defined for num_prior_levels < 3")
             return self._sample_autoregressive(shape, cond=cond, level='mid')
         elif level == 'bottom':
