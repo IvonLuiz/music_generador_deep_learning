@@ -240,7 +240,7 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
             }, os.path.join(run_dir, f"model_epoch_{epoch+1}.pth"))
         
         # Early Stopping
-        early_stopping(val_loss, pixelcnn)
+        early_stopping(val_loss)
         if early_stopping.early_stop:
             print(f"Early stopping triggered at epoch {epoch+1}")
             break
