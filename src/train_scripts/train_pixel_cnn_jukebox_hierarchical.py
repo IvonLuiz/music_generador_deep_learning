@@ -22,6 +22,13 @@ from utils import load_maestro, load_config
 from callbacks import EarlyStopping
 
 
+def _get_prior_cfg(config: dict, name: str) -> dict:
+    priors = config.get('priors')
+    if priors and name in priors:
+        return priors[name]
+    return config[name]
+
+
 def plot_losses(train_losses, val_losses, save_dir, best_epoch=None, best_val_loss=None):
     plt.figure(figsize=(10, 5))
     epochs = range(1, len(train_losses) + 1)
@@ -182,9 +189,9 @@ def train_jukebox_hierarchical_pixelcnn(config_path: str):
     train_loader = DataLoader(train_dataset, batch_size=train_cfg['batch_size'], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=train_cfg['batch_size'], shuffle=False)
 
-    top_cfg = config['top_prior']
-    mid_cfg = config['middle_prior']
-    bot_cfg = config['bottom_prior']
+    top_cfg = _get_prior_cfg(config, 'top_prior')
+    mid_cfg = _get_prior_cfg(config, 'middle_prior')
+    bot_cfg = _get_prior_cfg(config, 'bottom_prior')
 
     hidden_units = [top_cfg['hidden_channels'], mid_cfg['hidden_channels'], bot_cfg['hidden_channels']]
     num_layers = [top_cfg['num_layers'], mid_cfg['num_layers'], bot_cfg['num_layers']]
@@ -204,6 +211,7 @@ def train_jukebox_hierarchical_pixelcnn(config_path: str):
         attention_layers=[0, 0, 0],
         attention_heads=[None, None, None],
         conditioning_stack_residual_blocks=[None, 20, 20],
+        two_level_conditioning_mode=config.get('model', {}).get('two_level_conditioning_mode', 'deconv'),
     ).to(device)
 
     optimizer = optim.Adam(pixelcnn.parameters(), lr=train_cfg['learning_rate'])
