@@ -3,32 +3,32 @@ dataset:
   target_time_frames: 256
 
 vqvae:
-  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_top/2026-02-21_02-47-18"
-  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_middle/2026-02-20_10-21-05"
-  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_bottom/2026-02-20_02-30-56"
+  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_top/2026-03-05_01-54-37"
+  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_middle/2026-03-04_07-45-47"
+  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_bottom/2026-03-04_02-21-00"
   weights_file: "best_model.pth"
 
 model:
   name: "pixelcnn_jukebox_maestro2011"
   num_prior_levels: 3
+  two_level_conditioning_mode: "deconv"
 
-top_prior:
-  hidden_channels: 128
-  num_layers: 15
-  conv_filter_size: 5
-  dropout_rate: 0.1
-
-middle_prior:
-  hidden_channels: 128
-  num_layers: 15
-  conv_filter_size: 5
-  dropout_rate: 0.1
-
-bottom_prior:
-  hidden_channels: 128
-  num_layers: 15
-  conv_filter_size: 5
-  dropout_rate: 0.1
+priors:
+  top_prior:
+    hidden_channels: 128
+    num_layers: 15
+    conv_filter_size: 5
+    dropout_rate: 0.1
+  middle_prior:
+    hidden_channels: 128
+    num_layers: 15
+    conv_filter_size: 5
+    dropout_rate: 0.1
+  bottom_prior:
+    hidden_channels: 128
+    num_layers: 15
+    conv_filter_size: 5
+    dropout_rate: 0.1
 
 training:
   batch_size: 16
