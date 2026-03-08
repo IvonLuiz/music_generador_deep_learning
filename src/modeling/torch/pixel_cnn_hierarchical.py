@@ -26,7 +26,8 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
                  conv_filter_size: Sequence[int] = (5, 5),
                  conditioning_stack_residual_blocks: Sequence[Optional[int]] = (None, 20),
                  dropout: Sequence[float] = (0.1, 0.1),
-                 num_embeddings: Sequence[int] = (512, 512)) -> None:
+                 num_embeddings: Sequence[int] = (512, 512),
+                 two_level_conditioning_mode: str = 'deconv') -> None:
         """
         Initialize the Conditional Gated PixelCNN model.
         @param num_prior_levels: Number of hierarchical prior levels (2 or 3)
@@ -45,6 +46,10 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
         """
         super().__init__()
         self.num_prior_levels = num_prior_levels
+        self.two_level_conditioning_mode = two_level_conditioning_mode
+
+        if two_level_conditioning_mode not in ('deconv', 'conv'):
+            raise ValueError("two_level_conditioning_mode must be 'deconv' or 'conv'")
 
         if num_prior_levels <= 1 or num_prior_levels > 3:
             raise ValueError("num_prior_levels must be 2 or 3")
@@ -82,12 +87,20 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
             )
 
             self.top_embedding_for_cond = nn.Embedding(num_embeddings[0], hidden_units[-1])
-            self.conditioning_stack = nn.Sequential(
-                nn.Conv2d(hidden_units[-1], hidden_units[-1], kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(hidden_units[-1], hidden_units[-1], kernel_size=3, padding=1),
-                nn.ReLU()
-            )
+            if self.two_level_conditioning_mode == 'deconv':
+                self.conditioning_stack = nn.Sequential(
+                    nn.ConvTranspose2d(hidden_units[-1], hidden_units[-1], kernel_size=4, stride=2, padding=1),
+                    nn.ReLU(),
+                    nn.Conv2d(hidden_units[-1], hidden_units[-1], kernel_size=3, padding=1),
+                    nn.ReLU()
+                )
+            else:
+                self.conditioning_stack = nn.Sequential(
+                    nn.Conv2d(hidden_units[-1], hidden_units[-1], kernel_size=3, padding=1),
+                    nn.ReLU(),
+                    nn.Conv2d(hidden_units[-1], hidden_units[-1], kernel_size=3, padding=1),
+                    nn.ReLU()
+                )
 
         # Three-level setup: top -> middle -> bottom
         if num_prior_levels == 3:
@@ -206,7 +219,12 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
         else:
             raise ValueError("level must be 'top', 'mid', or 'bottom'")
 
-    def _sample_autoregressive(self, shape, cond=None, level: str = 'top'):
+    def _sample_autoregressive(self,
+                               shape,
+                               cond=None,
+                               level: str = 'top',
+                               temperature: float = 1.0,
+                               top_k: Optional[int] = None):
         """Naive autoregressive sampling by raster-scan over H and W."""
         device = next(self.parameters()).device
         if len(shape) != 4:
@@ -224,13 +242,33 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
                 # Forward pass through the chosen level
                 logits = self.forward(x, cond=cond, level=level)  # (B, C, 1, H, W)
                 logits_hw = logits.squeeze(2)[:, :, i, j]         # (B, C)
+
+                # Temperature scaling
+                if temperature <= 0:
+                    raise ValueError(f"temperature must be > 0, got {temperature}")
+                logits_hw = logits_hw / temperature
+
+                # Top-k filtering
+                if top_k is not None and top_k > 0 and top_k < logits_hw.shape[1]:
+                    kth_vals = torch.topk(logits_hw, k=top_k, dim=1).values[:, -1].unsqueeze(1)
+                    logits_hw = torch.where(
+                        logits_hw < kth_vals,
+                        torch.full_like(logits_hw, float('-inf')),
+                        logits_hw,
+                    )
+
                 probs = torch.softmax(logits_hw, dim=1)           # (B, C)
                 samples = torch.multinomial(probs, num_samples=1).squeeze(1)
                 x[:, 0, i, j] = samples
 
         return x
 
-    def generate(self, shape, cond=None, level='top'):
+    def generate(self,
+                 shape,
+                 cond=None,
+                 level='top',
+                 temperature: float = 1.0,
+                 top_k: Optional[int] = None):
         """
         Generate samples from the hierarchical PixelCNN.
 
@@ -240,16 +278,16 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
             level (str): 'top', 'mid', or 'bottom' to specify which prior to use.
         """
         if level == 'top':
-            return self._sample_autoregressive(shape, cond=None, level='top')
+            return self._sample_autoregressive(shape, cond=None, level='top', temperature=temperature, top_k=top_k)
         elif level == 'mid':
             if self.num_prior_levels < 3 or not hasattr(self, 'middle_level'):
                 raise ValueError("Mid level prior is not defined for num_prior_levels < 3")
-            return self._sample_autoregressive(shape, cond=cond, level='mid')
+            return self._sample_autoregressive(shape, cond=cond, level='mid', temperature=temperature, top_k=top_k)
         elif level == 'bottom':
             if not hasattr(self, 'bottom_level'):
                 raise ValueError("Bottom level prior is not defined for num_prior_levels < 2")
             if cond is None:
                 raise ValueError("Conditioning information (top level indices) required for bottom level generation.")
-            return self._sample_autoregressive(shape, cond=cond, level='bottom')
+            return self._sample_autoregressive(shape, cond=cond, level='bottom', temperature=temperature, top_k=top_k)
         else:
             raise ValueError("level must be 'top', 'mid', or 'bottom'")
