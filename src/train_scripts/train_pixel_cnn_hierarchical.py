@@ -17,6 +17,13 @@ from datasets.hierarchical_quantized_dataset import HierarchicalQuantizedDataset
 from utils import load_maestro, load_config, load_vqvae_hierarchical_model_wrapper
 from callbacks import EarlyStopping
 
+
+def _get_prior_cfg(config: dict, name: str) -> dict:
+    priors = config.get('priors')
+    if priors and name in priors:
+        return priors[name]
+    return config[name]
+
 def plot_losses(train_losses, val_losses, save_dir, best_epoch=None, best_val_loss=None):
     plt.figure(figsize=(10, 5))
     epochs = range(1, len(train_losses) + 1)
@@ -44,8 +51,8 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
     target_time_frames = config['dataset']['target_time_frames']
     val_split = config['training'].get('validation_split', 0.1)
     batch_size = config['training']['batch_size']
-    top_cfg = config['top_prior']
-    bot_cfg = config['bottom_prior']
+    top_cfg = _get_prior_cfg(config, 'top_prior')
+    bot_cfg = _get_prior_cfg(config, 'bottom_prior')
 
     # Model configuration
     model_cfg = config.get('model', {})
@@ -104,6 +111,7 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
     conv_filter_size = [top_cfg['conv_filter_size'], bot_cfg['conv_filter_size']]
     dropout = [top_cfg.get('dropout_rate', 0.0), bot_cfg.get('dropout_rate', 0.0)]
     num_embeddings = [vqvae.vq_top.num_embeddings, vqvae.vq_bottom.num_embeddings]
+    two_level_conditioning_mode = config.get('model', {}).get('two_level_conditioning_mode', 'deconv')
 
     # Placeholders for other params (using defaults or extending config if needed)
     # The class expects lists for residual_units, attention etc. using sensible defaults or expanding config
@@ -120,7 +128,8 @@ def train_pixel_cnn_hierarchical(pixelcnn_config_path: str, vqvae_model_path: st
         residual_units=[1024, 1024], 
         attention_layers=[0, 0],
         attention_heads=[None, None],
-        conditioning_stack_residual_blocks=[None, 20] 
+        conditioning_stack_residual_blocks=[None, 20],
+        two_level_conditioning_mode=two_level_conditioning_mode,
     ).to(device)
     
     optimizer = optim.Adam(pixelcnn.parameters(), lr=config['training']['learning_rate'])

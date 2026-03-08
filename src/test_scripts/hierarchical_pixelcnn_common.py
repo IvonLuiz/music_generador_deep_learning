@@ -127,6 +127,7 @@ def load_hierarchical_pixelcnn_model(model_dir_or_file: str, device: torch.devic
 
     hidden_units, num_layers, conv_filter_size, dropout = parse_prior_arrays(config, num_prior_levels)
 
+    print(f"Loading Hierarchical PixelCNN from {model_path} with config {config_path}")
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     if "config" in checkpoint:
         config = checkpoint["config"]

@@ -50,7 +50,7 @@ class ResidualStack(nn.Module):
         self._num_residual_layers = num_residual_layers
         layers = []
 
-        current_dilation = 1
+        current_dilation = dilation
         for _ in range(self._num_residual_layers):
             layers.append(ResidualLayer(in_channels, num_hiddens, num_residual_hiddens,
                                         dilation=current_dilation, conv_type=conv_type))
