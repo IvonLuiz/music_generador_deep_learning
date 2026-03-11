@@ -199,6 +199,11 @@ def train_jukebox_hierarchical_pixelcnn(config_path: str):
     dropout = [top_cfg.get('dropout_rate', 0.0), mid_cfg.get('dropout_rate', 0.0), bot_cfg.get('dropout_rate', 0.0)]
     num_embeddings = [top_model.vq.num_embeddings, middle_model.vq.num_embeddings, bottom_model.vq.num_embeddings]
 
+    # Free VQ-VAE models from GPU — all indices are pre-computed and stored on CPU
+    del top_model, middle_model, bottom_model
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
     pixelcnn = HierarchicalCondGatedPixelCNN(
         num_prior_levels=3,
         input_size=input_size,
