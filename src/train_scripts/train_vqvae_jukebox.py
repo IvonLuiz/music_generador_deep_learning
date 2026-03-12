@@ -24,8 +24,9 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 class JukeboxHierarchicalAdapter(nn.Module):
     """
-    Adapter to reuse train_vqvae_hierarchical utility without modifying it.
-    It maps single-level JukeboxVQVAE outputs to the expected 2-level VQ loss structure.
+    Thin wrapper so train_vqvae_hierarchical can call model(x) and reconstruct(x)
+    on a JukeboxVQVAE, which already returns the expected
+    (x_recon, total_vq_loss, [(vq_loss, codebook_loss, commitment_loss)]) format.
     """
     def __init__(self, model: JukeboxVQVAE):
         super().__init__()
