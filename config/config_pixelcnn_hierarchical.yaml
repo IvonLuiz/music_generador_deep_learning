@@ -10,20 +10,21 @@ vqvae:
 model:
   name: "pixelcnn_maestro2011"
   num_prior_levels: 2
+  two_level_conditioning_mode: "deconv"
 
-top_prior:
-  hidden_channels: 128
-  num_layers: 15
-  conv_filter_size: 5
-  attention_layers: 0 # PixelCNN usually doesn't strictly require attention at all layers, maybe simplified
-  dropout_rate: 0.1
-
-bottom_prior:
-  hidden_channels: 128
-  num_layers: 15
-  conv_filter_size: 5
-  attention_layers: 0
-  dropout_rate: 0.1
+priors:
+  top_prior:
+    hidden_channels: 128
+    num_layers: 15
+    conv_filter_size: 5
+    attention_layers: 0 # PixelCNN usually doesn't strictly require attention at all layers, maybe simplified
+    dropout_rate: 0.1
+  bottom_prior:
+    hidden_channels: 128
+    num_layers: 15
+    conv_filter_size: 5
+    attention_layers: 0
+    dropout_rate: 0.1
 
 training:
   batch_size: 32
