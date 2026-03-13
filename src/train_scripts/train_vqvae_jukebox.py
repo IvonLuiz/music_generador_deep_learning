@@ -63,7 +63,9 @@ if __name__ == "__main__":
         default=None,
         help="Override config model.selected_level.",
     )
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"Warning: ignoring unrecognized arguments: {unknown}")
 
     # Load configuration
     config_path = "./config/config_jukebox.yaml"
