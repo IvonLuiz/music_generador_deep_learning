@@ -8,7 +8,7 @@ from .residual_stack import ResidualStack
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, conv_type=2, num_downsample_blocks=1):
+    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, conv_type=2, num_downsample_blocks=1, dilation_growth_rate=1):
         """!
         @in_channels: Number of input channels
         @out_channels: Number of output channels
@@ -29,6 +29,8 @@ class DecoderBlock(nn.Module):
                                     num_hiddens=in_channels,
                                     num_residual_hiddens=in_channels // 2,
                                     num_residual_layers=num_residual_layers,
+                                    dilation=1,
+                                    dilation_growth_rate=dilation_growth_rate,
                                     conv_type=conv_type))
 
         # Upsampling conv (Transpose Conv)

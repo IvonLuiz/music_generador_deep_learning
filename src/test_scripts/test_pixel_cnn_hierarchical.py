@@ -2,6 +2,7 @@ import os
 import argparse
 import torch
 import torch.nn.functional as F
+from typing import List, Tuple
 from datetime import datetime
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -14,75 +15,10 @@ from generation.soundgenerator import SoundGenerator
 from generation.generate import save_multiple_signals
 from utils import load_config, load_vqvae_hierarchical_model_wrapper
 from modeling.torch.pixel_cnn_hierarchical import HierarchicalCondGatedPixelCNN
+from test_scripts.hierarchical_pixelcnn_common import load_hierarchical_pixelcnn_model
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
-def load_hierarchical_pixelcnn_model(model_dir: str, device: torch.device, weights_file="best_model.pth"):
-    """
-    Loads a trained Hierarchical PixelCNN model and its config.
-    """
-    if os.path.isfile(model_dir):
-        config_path = os.path.join(os.path.dirname(model_dir), 'config.yaml')
-        model_path = model_dir
-    else:
-        config_path = os.path.join(model_dir, 'config.yaml')
-        model_path = os.path.join(model_dir, weights_file)
-
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found at {config_path}")
-    
-    config = load_config(config_path)
-    
-    # Reconstruct the model parameters as done in training
-    top_cfg = config['top_prior']
-    bot_cfg = config['bottom_prior']
-    
-    hidden_units = [top_cfg['hidden_channels'], bot_cfg['hidden_channels']]
-    num_layers = [top_cfg['num_layers'], bot_cfg['num_layers']]
-    conv_filter_size = [top_cfg['conv_filter_size'], bot_cfg['conv_filter_size']]
-    dropout = [top_cfg.get('dropout_rate', 0.0), bot_cfg.get('dropout_rate', 0.0)]
-    
-    print(f"Loading Hierarchical PixelCNN weights from {model_path}")
-    checkpoint = torch.load(model_path, map_location=device)
-    
-    # If config was saved in checkpoint (as done in recent scripts), prefer that
-    if 'config' in checkpoint:
-        config = checkpoint['config']
-        
-    state_dict = checkpoint['model_state']
-    
-    try:
-        num_embeddings_top = state_dict['top_prior.out_conv.weight'].shape[0] 
-        # Check bottom prior if exists
-        if 'bottom_level.out_conv.weight' in state_dict:
-            num_embeddings_bot = state_dict['bottom_level.out_conv.weight'].shape[0]
-            num_embeddings = [num_embeddings_top, num_embeddings_bot]
-        else:
-            num_embeddings = [num_embeddings_top, num_embeddings_top] # Fallback if single level? but this is hierarchical loader
-    except KeyError:
-        print("Could not infer num_embeddings from state_dict keys (top_prior.out_conv.weight not found). Using default [512, 512].")
-        num_embeddings = [512, 512] 
-    
-    pixelcnn = HierarchicalCondGatedPixelCNN(
-        num_prior_levels=2,
-        input_size=[(32, 32), (64, 64)], 
-        hidden_units=hidden_units,
-        num_layers=num_layers,
-        conv_filter_size=conv_filter_size,
-        dropout=dropout,
-        num_embeddings=num_embeddings,
-        residual_units=[1024, 1024], 
-        attention_layers=[0, 0],
-        attention_heads=[None, None],
-        conditioning_stack_residual_blocks=[None, 20] 
-    ).to(device)
-    
-    # Load weights
-    pixelcnn.load_state_dict(state_dict)
-        
-    pixelcnn.eval()
-    return pixelcnn
-
-def generate_hierarchical_samples(pixelcnn_model: HierarchicalCondGatedPixelCNN, num_samples: int, latent_shapes: list[tuple[int, int]], device: torch.device):
+def generate_hierarchical_samples(pixelcnn_model: HierarchicalCondGatedPixelCNN, num_samples: int, latent_shapes: List[Tuple[int, int]], device: torch.device):
     """
     Generate samples using Hierarchical PixelCNN.
     latent_shapes: List of tuples [(H_top, W_top), (H_bot, W_bot)]
@@ -141,7 +77,7 @@ def test_hierarchical_pixelcnn(pixelcnn_path, vqvae_path, num_samples=3,
     print(f"Loading VQ-VAE from {vqvae_path}")
     vqvae = load_vqvae_hierarchical_model_wrapper(vqvae_path, device)
     print(f"Loading PixelCNN from {pixelcnn_path}")
-    hierarchical_pixelcnn = load_hierarchical_pixelcnn_model(pixelcnn_path, device)
+    hierarchical_pixelcnn, _ = load_hierarchical_pixelcnn_model(pixelcnn_path, device)
         
     # Determine shapes by running dummy input
     dummy = torch.zeros((1, 1, TARGET_TIME_FRAMES, TARGET_TIME_FRAMES)).to(device)

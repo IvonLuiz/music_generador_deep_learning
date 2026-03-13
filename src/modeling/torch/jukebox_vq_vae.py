@@ -89,7 +89,8 @@ class JukeboxVQVAE(nn.Module):
                              kernel_size=4,
                              padding=1,
                              conv_type=conv_type,
-                             num_downsample_blocks=1 # done per loop iteration to allow for different conv types per level if needed
+                             num_downsample_blocks=1, # done per loop iteration to allow for different conv types per level if needed
+                             dilation_growth_rate=dilation_growth_rate
                              )
                 )
             current_dim = next_dim
@@ -121,7 +122,8 @@ class JukeboxVQVAE(nn.Module):
                              kernel_size=4,
                              padding=1,
                              conv_type=conv_type,
-                             num_downsample_blocks=1 # done per loop iteration to allow for different conv types per level if needed
+                             num_downsample_blocks=1, # done per loop iteration to allow for different conv types per level if needed
+                             dilation_growth_rate=dilation_growth_rate
                              )
                 )
             current_dim = next_dim
