@@ -1,0 +1,44 @@
+dataset:
+  raw_path: "./data/raw/maestro-v3.0.0/2011"
+  processed_path: "./data/processed/maestro_spectrograms_test/"
+  sample_rate: 22050
+  hop_length: 256
+  frame_size: 512
+  target_time_frames: 256
+
+model:
+  name: "jukebox_vqvae_maestro2011"
+  selected_level: "bottom"  # options: "bottom", "middle", "top"
+  input_channels: 1
+  hidden_dim: 64
+  num_embeddings: 2048
+  embedding_dim: 64
+  beta: 0.25
+  conv_type: 2
+  dilation_growth_rate: 3
+  channel_growth: 1
+  activation: "sigmoid"
+  level_profiles:
+    bottom:
+      levels: 3
+      num_residual_layers: 8
+    middle:
+      levels: 5
+      num_residual_layers: 4
+    top:
+      levels: 7
+      num_residual_layers: 4
+
+training:
+  batch_size: 32 # 12GB GPU can handle 32, to handle 64 will probably need 16GB
+  learning_rate: 0.0002
+  epochs: 150
+  validation_split: 0.2
+  save_dir: "./models/jukebox_vq_vae/"
+  early_stopping_patience: 7
+  num_workers: 0
+  pin_memory: false
+
+testing:
+  specific_run_dir: null
+  weights_file_choice: "best_model.pth"

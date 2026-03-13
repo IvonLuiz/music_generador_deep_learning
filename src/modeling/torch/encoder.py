@@ -8,7 +8,7 @@ from .residual_stack import ResidualStack
 
 
 class EncoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, conv_type=2, num_downsample_blocks=1):
+    def __init__(self, in_channels, out_channels, num_residual_layers, stride, kernel_size=4, padding=1, conv_type=2, num_downsample_blocks=1, dilation_growth_rate=1):
         """!
         @in_channels: Number of input channels
         @out_channels: Number of output channels
@@ -16,7 +16,8 @@ class EncoderBlock(nn.Module):
         @stride: Stride for the downsampling convolution. Can be an int or a tuple (stride_h, stride_w)
         @kernel_size: Kernel size for the downsampling convolution
         @padding: Padding for the downsampling convolution
-        @param conv_type: Convolution type. 1 for standard conv, 2 for [kernel_size X kernel_size] conv with stride 2 to reduce checkerboard artifacts 
+        @param conv_type: Convolution type. 1 for standard conv, 2 for [kernel_size X kernel_size] conv with stride 2 to reduce checkerboard artifacts
+        @param dilation_growth_rate: Factor to grow dilation in residual stack
         """
         super().__init__()
         self.layers = []
@@ -31,10 +32,12 @@ class EncoderBlock(nn.Module):
 
         # Residual Stack after downsampling
         self.layers.append(ResidualStack(in_channels=out_channels,
-                                        num_hiddens=out_channels,
-                                        num_residual_hiddens=out_channels // 2,
-                                        num_residual_layers=num_residual_layers,
-                                        conv_type=conv_type))
+                                         num_hiddens=out_channels,
+                                         num_residual_hiddens=out_channels // 2,
+                                         num_residual_layers=num_residual_layers,
+                                         dilation=1,
+                                         dilation_growth_rate=dilation_growth_rate,
+                                         conv_type=conv_type))
 
         self._net = nn.Sequential(*self.layers)
     

@@ -50,12 +50,27 @@ class SampleGenerator:
                 x_recon = reconstruction_output
                 
             reconstructed_specs = x_recon.cpu().permute(0, 2, 3, 1).numpy()
+
+        # Keep spectrograms finite before Griffin-Lim inversion
+        safe_original_specs = np.nan_to_num(self.samples, nan=0.0, posinf=1.0, neginf=0.0)
+        safe_original_specs = np.clip(safe_original_specs, 0.0, 1.0)
+        reconstructed_specs = np.nan_to_num(reconstructed_specs, nan=0.0, posinf=1.0, neginf=0.0)
+        reconstructed_specs = np.clip(reconstructed_specs, 0.0, 1.0)
             
         # Convert to audio
-        original_signals = self.sound_generator.convert_spectrograms_to_audio(self.samples, self.min_max_values)
-        reconstructed_signals = self.sound_generator.convert_spectrograms_to_audio(reconstructed_specs, self.min_max_values)
+        try:
+            original_signals = self.sound_generator.convert_spectrograms_to_audio(safe_original_specs, self.min_max_values)
+        except Exception as e:
+            print(f"Warning: failed to convert original spectrograms to audio at epoch {epoch+1}: {e}")
+            original_signals = [np.zeros(SAMPLE_RATE, dtype=np.float32) for _ in range(len(safe_original_specs))]
 
-        for i, (orig, recon, orig_sig, recon_sig, min_max_val) in enumerate(zip(self.samples, reconstructed_specs, original_signals, reconstructed_signals, self.min_max_values)):
+        try:
+            reconstructed_signals = self.sound_generator.convert_spectrograms_to_audio(reconstructed_specs, self.min_max_values)
+        except Exception as e:
+            print(f"Warning: failed to convert reconstructed spectrograms to audio at epoch {epoch+1}: {e}")
+            reconstructed_signals = [np.zeros(SAMPLE_RATE, dtype=np.float32) for _ in range(len(reconstructed_specs))]
+
+        for i, (orig, recon, orig_sig, recon_sig, min_max_val) in enumerate(zip(safe_original_specs, reconstructed_specs, original_signals, reconstructed_signals, self.min_max_values)):
             orig_2d = orig[:, :, 0]
             recon_2d = recon[:, :, 0]
             

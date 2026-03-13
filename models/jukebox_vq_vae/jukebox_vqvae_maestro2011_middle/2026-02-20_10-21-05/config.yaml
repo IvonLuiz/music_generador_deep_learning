@@ -1,0 +1,41 @@
+dataset:
+  frame_size: 512
+  hop_length: 256
+  processed_path: ./data/processed/maestro_spectrograms_test/
+  raw_path: ./data/raw/maestro-v3.0.0/2011
+  sample_rate: 22050
+  target_time_frames: 256
+model:
+  activation: sigmoid
+  beta: 0.25
+  channel_growth: 1
+  conv_type: 2
+  dilation_growth_rate: 3
+  embedding_dim: 64
+  hidden_dim: 64
+  input_channels: 1
+  level_profiles:
+    bottom:
+      levels: 3
+      num_residual_layers: 8
+    middle:
+      levels: 5
+      num_residual_layers: 4
+    top:
+      levels: 7
+      num_residual_layers: 4
+  name: jukebox_vqvae_maestro2011
+  num_embeddings: 2048
+  selected_level: bottom
+testing:
+  specific_run_dir: null
+  weights_file_choice: best_model.pth
+training:
+  batch_size: 32
+  early_stopping_patience: 7
+  epochs: 150
+  learning_rate: 0.0002
+  num_workers: 0
+  pin_memory: false
+  save_dir: ./models/jukebox_vq_vae/
+  validation_split: 0.2

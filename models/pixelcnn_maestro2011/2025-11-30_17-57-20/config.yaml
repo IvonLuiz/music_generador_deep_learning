@@ -9,7 +9,7 @@ model:
   num_layers: 15
 training:
   batch_size: 128
-  epochs: 300
+  epochs: 50
   learning_rate: 0.001
   save_dir: ./models/
   validation_split: 0.2

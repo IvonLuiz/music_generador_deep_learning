@@ -32,7 +32,9 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                              early_stopping_patience: int = 20,
                              amp: bool = True,
                              x_val: np.ndarray = None,
-                             val_file_paths: list = None):
+                             val_file_paths: list = None,
+                             num_workers: int = 4,
+                             pin_memory: bool = True):
     """
     Train a VQ-VAE Hierarchical model.
 
@@ -64,13 +66,13 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
             if len(x_val) > 0:
                 print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
                 val_dataset = SpectrogramDataset(x_val)
-                val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+                val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
                 early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
         else:
             # Assume x_val is a Dataset
             print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
             val_dataset = x_val
-            val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+            val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
             early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
     
     if val_dataloader is None:
@@ -81,7 +83,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
     else:
         dataset = x_train
         
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner for potential speedup
@@ -148,9 +150,15 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
         epoch_vq_loss_top = 0.0
         epoch_vq_loss_bottom = 0.0
         total_samples = 0
+        skipped_non_finite_batches = 0
         
         for batch in progress_bar:
             batch = batch.to(device)
+
+            if not torch.isfinite(batch).all():
+                skipped_non_finite_batches += 1
+                print(f"Warning: non-finite values in training batch at epoch {epoch+1}. Skipping batch.")
+                continue
 
             optimizer.zero_grad()
             with autocast(device_type=device.type, enabled=scaler.is_enabled()):
@@ -163,6 +171,12 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                 
                 recon_loss = F.mse_loss(reconstructions, batch) / (2 * data_variance)
                 loss = recon_loss + total_vq_loss
+
+            if not torch.isfinite(loss):
+                skipped_non_finite_batches += 1
+                print(f"Warning: non-finite training loss at epoch {epoch+1}. Skipping optimizer step for this batch.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             scaler.scale(loss).backward()
             
@@ -182,11 +196,18 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
 
             progress_bar.set_postfix(loss=epoch_loss / total_samples)
 
+        if skipped_non_finite_batches > 0:
+            print(f"Epoch {epoch+1}: skipped {skipped_non_finite_batches} non-finite training batches.")
+
         # Calculate average losses for the epoch
-        avg_epoch_loss = epoch_loss / len(dataset)
-        avg_recon_loss = epoch_recon_loss / len(dataset)
-        avg_vq_loss_top = epoch_vq_loss_top / len(dataset)
-        avg_vq_loss_bottom = epoch_vq_loss_bottom / len(dataset)
+        if total_samples == 0:
+            print(f"Epoch {epoch+1}: no valid training batches remained after filtering non-finite values. Stopping training.")
+            break
+
+        avg_epoch_loss = epoch_loss / total_samples
+        avg_recon_loss = epoch_recon_loss / total_samples
+        avg_vq_loss_top = epoch_vq_loss_top / total_samples
+        avg_vq_loss_bottom = epoch_vq_loss_bottom / total_samples
 
         # Update Loss Plotter
         epoch_metrics = {
@@ -207,10 +228,17 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
             val_epoch_vq_loss_top = 0.0
             val_epoch_vq_loss_bottom = 0.0
             val_total_samples = 0
+            skipped_non_finite_val_batches = 0
             
             with torch.no_grad():
                 for batch in tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
                     batch = batch.to(device)
+
+                    if not torch.isfinite(batch).all():
+                        skipped_non_finite_val_batches += 1
+                        print(f"Warning: non-finite values in validation batch at epoch {epoch+1}. Skipping batch.")
+                        continue
+
                     reconstructions, total_vq_loss, vq_losses_details = model(batch)
                     
                     (vq_loss_top, _, _) = vq_losses_details[0]
@@ -218,6 +246,11 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                     
                     recon_loss = F.mse_loss(reconstructions, batch) / (2 * data_variance)
                     loss = recon_loss + total_vq_loss
+
+                    if not torch.isfinite(loss):
+                        skipped_non_finite_val_batches += 1
+                        print(f"Warning: non-finite validation loss at epoch {epoch+1}. Skipping batch.")
+                        continue
                     
                     batch_size_current = batch.size(0)
                     val_epoch_loss += loss.item() * batch_size_current
@@ -225,11 +258,20 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                     val_epoch_vq_loss_top += vq_loss_top.item() * batch_size_current
                     val_epoch_vq_loss_bottom += vq_loss_bottom.item() * batch_size_current
                     val_total_samples += batch_size_current
-            
-            avg_val_loss = val_epoch_loss / len(val_dataset)
-            avg_val_recon_loss = val_epoch_recon_loss / len(val_dataset)
-            avg_val_vq_loss_top = val_epoch_vq_loss_top / len(val_dataset)
-            avg_val_vq_loss_bottom = val_epoch_vq_loss_bottom / len(val_dataset)
+
+            if skipped_non_finite_val_batches > 0:
+                print(f"Epoch {epoch+1}: skipped {skipped_non_finite_val_batches} non-finite validation batches.")
+
+            if val_total_samples == 0:
+                avg_val_loss = float('nan')
+                avg_val_recon_loss = float('nan')
+                avg_val_vq_loss_top = float('nan')
+                avg_val_vq_loss_bottom = float('nan')
+            else:
+                avg_val_loss = val_epoch_loss / val_total_samples
+                avg_val_recon_loss = val_epoch_recon_loss / val_total_samples
+                avg_val_vq_loss_top = val_epoch_vq_loss_top / val_total_samples
+                avg_val_vq_loss_bottom = val_epoch_vq_loss_bottom / val_total_samples
             
             epoch_metrics.update({
                 'val_total': avg_val_loss,
@@ -257,6 +299,9 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
 
         # Early Stopping Check
         if early_stopping and avg_val_loss is not None:
+            if not np.isfinite(avg_val_loss):
+                print("Validation loss is non-finite. Stopping training to prevent unstable checkpointing.")
+                break
             early_stopping(avg_val_loss)
             if early_stopping.early_stop:
                 print("Early stopping triggered.")

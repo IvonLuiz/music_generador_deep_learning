@@ -70,10 +70,12 @@ class SoundGenerator:
         for spectrogram, min_max_value in zip(spectrograms, min_max_values):
             # Reshape the log spectrogram to remove the third dimension (channels) used for the autoencoder
             log_spectrogram = spectrogram[:, :, 0]
+            log_spectrogram = np.nan_to_num(log_spectrogram, nan=0.0, posinf=1.0, neginf=0.0)
             
             denorm_log_spec = self.__min_max_normalizer.denormalize(
                 log_spectrogram, min_max_value["min"], min_max_value["max"]
             )
+            denorm_log_spec = np.nan_to_num(denorm_log_spec, nan=0.0, posinf=80.0, neginf=-120.0)
 
             signal = self.__invert_log_spectrogram_to_audio(denorm_log_spec, method=method)
             signals.append(signal)
@@ -91,6 +93,8 @@ class SoundGenerator:
         """
         # Log spectrogram (dB) to amplitude domain
         amplitude_spectrogram = librosa.db_to_amplitude(log_spectrogram)
+        amplitude_spectrogram = np.nan_to_num(amplitude_spectrogram, nan=0.0, posinf=1e6, neginf=0.0)
+        amplitude_spectrogram = np.maximum(amplitude_spectrogram, 0.0)
         
         # Pad the spectrogram to restore the Nyquist frequency bin if it was trimmed
         # STFT produces (n_fft // 2 + 1) bins, which is odd for even n_fft.
@@ -104,5 +108,9 @@ class SoundGenerator:
         elif method == "istft":
             # STFT to get audio signal (robotic without phase reconstruction)
             audio_signal = librosa.istft(amplitude_spectrogram, hop_length=self.hop_length)
+        else:
+            raise ValueError(f"Unsupported inversion method: {method}")
+
+        audio_signal = np.nan_to_num(audio_signal, nan=0.0, posinf=0.0, neginf=0.0)
         
         return audio_signal
