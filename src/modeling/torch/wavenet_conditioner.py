@@ -44,6 +44,7 @@ class WaveNetConditioner(nn.Module):
         num_channels: int = 1024,
         kernel_size: int = 3,
         dilation_growth: int = 3,
+        dilation_cycle: int = 8,
         upsample_stride: int = 4,
         dropout: float = 0.1,
     ):
@@ -56,6 +57,7 @@ class WaveNetConditioner(nn.Module):
         @param num_channels The number of channels in the convolutional layers.
         @param kernel_size The kernel size for the convolutions. Defaults to 3.
         @param dilation_growth The growth factor for the dilation. Defaults to 3.
+        @param dilation_cycle The cycle length for the dilation. Defaults to 8.
         @param upsample_stride The stride for the upsampling convolution.
         Ratio between the hop_length of the upsampled signal and the original signal. Defaults to 4.
         @param dropout The dropout probability. Defaults to 0.1.
@@ -65,24 +67,26 @@ class WaveNetConditioner(nn.Module):
         self.embedding_dim = embedding_dim
 
         # project discrete tokens to embedding space
-        self.token_embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.token_embedding = nn.Embedding(num_embeddings, num_channels)
 
         self.layers = nn.ModuleList()
         for i in range(num_layers):
             # calculate dilation for layer: 1, 3, 9, 27, ... (if growth by factor of 3)
-            dilation = dilation_growth ** i
+            dilation = dilation_growth ** (i % dilation_cycle)
             self.layers.append(
                 WaveNetResidualBlock(num_channels, kernel_size, dilation, dropout)
             )
         
         # Upsampling layer to match the temporal resolution of the target sequence (e.g., for audio, this would upsample from the token rate to the audio sample rate)
+        # also project back down to embedding_dim
         self.upsample = nn.ConvTranspose1d(
-            in_channels=embedding_dim, out_channels=num_channels,
-            kernel_size=upsample_stride, stride=upsample_stride, padding=1
+            in_channels=num_channels, out_channels=embedding_dim,
+            kernel_size=upsample_stride, stride=upsample_stride, padding=0 # no padding for transposed convolution since we want to exactly upsample by the stride factor
         )
+        print(f"Upsample layer shape: {self.upsample.weight.shape}")
 
         # layer norm and final projection to logits before summing with the embeddings from the inferior transformer
-        self.layer_norm = nn.LayerNorm(num_channels)
+        self.layer_norm = nn.LayerNorm(embedding_dim)
     
     def forward(self, x):
         """!
@@ -105,3 +109,38 @@ class WaveNetConditioner(nn.Module):
         
         return x  # return the conditioned representation to be combined with the inferior transformer's output before final projection to logits
 
+if __name__ == "__main__":
+    # Example usage
+    batch_size = 4
+    seq_len = 16
+    num_embeddings = 512
+    embedding_dim = 1920
+    num_channels = 1024
+    upsample_stride = 4  # Ratio between the upper and lower sequence lengths
+    padding = 0
+    kernel_size = 3
+
+    model = WaveNetConditioner(
+        num_embeddings=num_embeddings, 
+        embedding_dim=embedding_dim,
+        num_channels=num_channels,
+        upsample_stride=upsample_stride,
+        padding=padding,
+        kernel_size=kernel_size
+    )
+    print("Model architecture:\n", model)
+    
+    # dummy input tokens
+    input_tokens = torch.randint(0, num_embeddings, (batch_size, seq_len))
+    print("Input tokens shape:", input_tokens.shape)  # Expected shape: (batch_size, seq_len * upsample_stride, embedding_dim)
+    
+    # $L_{out} = (L_{in} - 1) \times \text{stride} - 2 \times \text{padding} + \text{kernel\_size}$
+    # L_out = L_in * stride - 2 * padding + kernel_size
+    # L_{out} = (16 - 1) * 4 - 2 * 0 + 4 = 64
+    output = model(input_tokens)
+    print("Output shape:", output.shape)  # Expected shape: (batch_size, seq_len * upsample_stride, embedding_dim)
+    
+    expected_shape = (batch_size, seq_len * upsample_stride, embedding_dim)
+    assert output.shape == expected_shape, f"Shape mismatch! Expected {expected_shape}, got {output.shape}"
+    
+    print("Test passed successfully!")
