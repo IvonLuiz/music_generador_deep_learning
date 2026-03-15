@@ -35,6 +35,9 @@ class FactoredAttention(nn.Module):
         """
         batch_size, seq_len, model_dim = x.size()
         num_blocks = seq_len // self.block_len
+        
+        assert model_dim == self.num_heads * self.head_dim, "model_dim must be equal to num_heads * head_dim"
+        assert seq_len % self.block_len == 0, "seq_len must be divisible by block_len"
 
         # project input to Q, K, V
         qkv = self.qkv_proj(x)  # (batch_size, seq_len, 3 * model_dim)
@@ -56,7 +59,7 @@ class FactoredAttention(nn.Module):
             k = k.transpose(2,3).reshape(batch_size * num_blocks, self.num_heads, self.block_len, self.head_dim)
             v = v.transpose(2,3).reshape(batch_size * num_blocks, self.num_heads, self.block_len, self.head_dim)
 
-            # SDPA thinks it is processing Batch * Num_Blocks completely separate sequences of length Block_Len. The blocks cannot see each other.
+            # SDPA thinks it is processing Batch * Num_Blocks completely separate sequences of length Block_Len. The blocks cannot see each other
             # apply standard casual mask here since it's autoregressive within each block
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (batch_size * num_blocks, block_len, model_dim)
             out = out.transpose(1,2).reshape(batch_size, num_blocks, self.block_len, model_dim)  # (batch_size, num_blocks, block_len, model_dim)
@@ -74,12 +77,13 @@ class FactoredAttention(nn.Module):
             v = v.permute(0, 2, 3, 1, 4).reshape(
                 batch_size * self.block_len, self.num_heads, num_blocks, self.head_dim
             )
-            
-    
+
+            # SDPA thinks it is processing Batch * Block_Len completely separate sequences of length Num_Blocks
+            # the positions within the block can see each other, but they cannot see other positions in the same block
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True) # apply causal mask because you can't attend to future blocks
             # reshape back to the 2D block grid
             out = out.reshape(batch_size, self.block_len, self.num_heads, num_blocks, self.head_dim)
-            out = out.transpose(1, 2).reshape(batch_size, num_blocks, self.block_len, model_dim)  # (batch_size, num_blocks, block_len, model_dim)
+            out = out.permute(0, 3, 1, 2, 4).reshape(batch_size, num_blocks, self.block_len, model_dim)  # (batch_size, num_blocks, block_len, model_dim)
 
         elif self.attention_type == 'previous_row':
             raise NotImplementedError("previous_row attention is not yet implemented!")
