@@ -17,9 +17,11 @@ sys.path.append(grandparent_dir)
 try:
     # When importing as a module from elsewhere in the project
     from modeling.torch.wavenet_conditioner import WaveNetConditioner
+    from modeling.torch.factored_transformer_layer import FactoredTransformerLayer
 except ImportError:
     # When running this script directly
     from wavenet_conditioner import WaveNetConditioner
+    from factored_transformer_layer import FactoredTransformerLayer
 
 
 class TransformerPriorConditioned(nn.Module):
@@ -43,6 +45,7 @@ class TransformerPriorConditioned(nn.Module):
         num_layers: int,
         dim_feedforward: int,
         max_seq_len: int,
+        block_len: int = 16,
         is_upsampler: bool = False,
         cond_num_embeddings: Optional[int] = None,
         upsample_stride: Optional[int] = None,
@@ -75,21 +78,15 @@ class TransformerPriorConditioned(nn.Module):
         self.num_layers = num_layers
         self.dim_feedforward = dim_feedforward
         self.max_seq_len = max_seq_len
+        self.block_len = block_len
         self.dropout = dropout
-        
+
+        # Embedding layers for tokens and positions        
         self.token_embedding = nn.Embedding(num_embeddings, model_dim)
         self.pos_embedding = nn.Embedding(max_seq_len, model_dim)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=model_dim,
-            nhead=num_heads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers)
+        # Initialize the transformer layers
+        self._init_factored_transformer_layers()
         self.norm = nn.LayerNorm(model_dim)
         self.to_logits = nn.Linear(model_dim, num_embeddings, bias=False)
 
@@ -106,6 +103,38 @@ class TransformerPriorConditioned(nn.Module):
                 upsample_stride=upsample_stride, # This should match the upsampling factor between levels
                 dropout=dropout,
             )
+
+    def _init_factored_transformer_layers(self):
+        """!
+        @brief Initializes the factored transformer layers for the model. This is separated into its own method for clarity and potential future customization.
+        """
+        attention_patterns = ['row', 'column'] # TODO: will add 'previous_row' here later
+
+        self.transformer = nn.Sequential(*[
+            FactoredTransformerLayer(
+                model_dim=self.model_dim,
+                num_heads=self.num_heads,
+                block_len=self.block_len,
+                attention_type = attention_patterns[num_layer % len(attention_patterns)],
+                mlp_dim=self.dim_feedforward,
+                dropout=self.dropout,
+            ) for num_layer in range(self.num_layers)
+        ])
+
+    def _init_standard_transformer_layers(self):
+        """!
+        @brief Initializes the transformer layers for the model. This is separated into its own method for clarity and potential future customization.
+        """
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.model_dim,
+            nhead=self.num_heads,
+            dim_feedforward=self.dim_feedforward,
+            dropout=self.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=self.num_layers)
 
     def forward(self, indices: torch.Tensor, upper_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -133,13 +162,29 @@ class TransformerPriorConditioned(nn.Module):
             if upper_indices is None:
                 raise ValueError('upper_indices must be provided for upsampler priors')
             # Process the conditioning input through the WaveNet conditioner
-            cond_emb = self.conditioner(upper_indices)  # Shape: [batch_size, model_dim, seq_len]
+            cond_emb = self.conditioner(upper_indices)  # [batch_size, model_dim, seq_len]
             #cond_emb = cond_emb.permute(0, 2, 1)  # Shape: [batch_size, seq_len, model_dim]
             # Add the conditioning embeddings to the token embeddings
-            x = x + cond_emb
+            x = x + cond_emb[:, :seq_len, :]  # Ensure the conditioning embeddings are added only up to the current sequence length (in case of any length mismatch)
 
         # pass through transformer layers
-        x = self.transformer(x, mask=self._causal_mask(seq_len, device))
+        # FactoredAttention requires seq_len to be a multiple of block_len
+        # During token-by-token generation, we pad the sequence temporarily
+        # x = self.transformer(x, mask=self._causal_mask(seq_len, device))
+        remainder = seq_len % self.block_len
+        pad_len = 0
+        if remainder != 0:
+            pad_len = self.block_len - remainder
+            # pad format for 3D tensor (batch, seq, dim): (dim_left, dim_right, seq_left, seq_right)
+            x = F.pad(x, (0, 0, 0, pad_len), value=0)  # Pad the sequence dimension with zeros
+        
+        # Pass through our alternating Factored Transformer layers
+        x = self.transformer(x)
+        
+        # Slice off the padding if we added any
+        if pad_len > 0:
+            x = x[:, :-pad_len, :]
+
         x = self.norm(x)
         logits = self.to_logits(x)
         
