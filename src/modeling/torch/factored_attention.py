@@ -17,8 +17,10 @@ class FactoredAttention(nn.Module):
         """
         super().__init__()
         assert attention_type in ['row', 'column', 'previous_row'], "attention_type must be one of 'row', 'column', or 'previous_row'"
-        
+        assert model_dim % num_heads == 0, "model_dim must be divisible by num_heads"
+
         self.num_heads = num_heads
+        self.head_dim = model_dim // num_heads # dimension per head
         self.block_len = block_len
         self.attention_type = attention_type
 
@@ -32,42 +34,59 @@ class FactoredAttention(nn.Module):
         @return: Output tensor of shape (batch_size, seq_len, model_dim).
         """
         batch_size, seq_len, model_dim = x.size()
-        
-        # reshape the 1D sequence into 2D grid of blocks
         num_blocks = seq_len // self.block_len
-        x_2d = x.view(batch_size, num_blocks, self.block_len, model_dim)  # (batch_size, num_blocks, block_len, model_dim)
-    
-        # Project input to Q, K, V
-        qkv = self.qkv_proj(x_2d)  # (batch_size, num_blocks, block_len, 3 * model_dim)
-        q, k, v = torch.chunk(qkv, 3, dim=-1)  # Each of shape (batch_size, num_blocks, block_len, model_dim)
+
+        # project input to Q, K, V
+        qkv = self.qkv_proj(x)  # (batch_size, seq_len, 3 * model_dim)
+        # reshape into 2d grid and split into attention heads
+        qkv = qkv.view(batch_size, num_blocks, self.block_len, 3, self.num_heads, self.head_dim) # (batch_size, num_blocks, block_len, 3, num_heads, head_dim)
+        # split into q, k, v
+        q, k, v = qkv.unbind(dim=3)  # Each of shape (batch_size, num_blocks, block_len, num_heads, head_dim)
 
         # Compute attention scores based on the specified attention type
+        # jukebox paper: 
+        #   Row attention attends within the block_len dimension, while column attention attends across the num_blocks dimension. 
+        #   Both types of attention are causal, meaning that they cannot attend to future positions.
         if self.attention_type == 'row':
-            # ROW ATTENTION: treat 'num_blocks' as part of the batch dimension and attend within each block
-            # every block attends internally to its own tokens
-            q = q.view(batch_size * num_blocks, self.block_len, model_dim)
-            k = k.view(batch_size * num_blocks, self.block_len, model_dim)
-            v = v.view(batch_size * num_blocks, self.block_len, model_dim)
-            
+            # ROW ATTENTION: Attend within the block_len
+            # treat 'num_blocks' as part of the batch dimension and attend within each block
+            # SDPA expects [Batch, Heads, Seq, Head_Dim]
+            # merge `B` and `num_blocks` into the batch dimension
+            q = q.transpose(2,3).reshape(batch_size * num_blocks, self.num_heads, self.block_len, self.head_dim)
+            k = k.transpose(2,3).reshape(batch_size * num_blocks, self.num_heads, self.block_len, self.head_dim)
+            v = v.transpose(2,3).reshape(batch_size * num_blocks, self.num_heads, self.block_len, self.head_dim)
+
+            # SDPA thinks it is processing Batch * Num_Blocks completely separate sequences of length Block_Len. The blocks cannot see each other.
             # apply standard casual mask here since it's autoregressive within each block
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (batch_size * num_blocks, block_len, model_dim)
-            out = out.view(batch_size, num_blocks, self.block_len, model_dim)  # (batch_size, num_blocks, block_len, model_dim)
+            out = out.transpose(1,2).reshape(batch_size, num_blocks, self.block_len, model_dim)  # (batch_size, num_blocks, block_len, model_dim)
         
         elif self.attention_type == 'column':
-            # COLUMN ATTENTION: We treat 'Block_Len' as part of the batch dimension.
-            # Token `i` in block `j` attends to token `i` in blocks `0` to `j-1`.
-            q = q.transpose(1, 2).reshape(batch_size * self.block_len, num_blocks, model_dim)
-            k = k.transpose(1, 2).reshape(batch_size * self.block_len, num_blocks, model_dim)
-            v = v.transpose(1, 2).reshape(batch_size * self.block_len, num_blocks, model_dim)
+            # COLUMN ATTENTION: Attend across num_blocks
+            # treat 'Block_Len' as part of the batch dimension.
+            # merge `B` and `block_len` into the batch dimension.
+            q = q.permute(0, 2, 3, 1, 4).reshape(
+                batch_size * self.block_len, self.num_heads, num_blocks, self.head_dim
+            )  # (batch_size * block_len, num_heads, num_blocks, head_dim)
+            k = k.permute(0, 2, 3, 1, 4).reshape(
+                batch_size * self.block_len, self.num_heads, num_blocks, self.head_dim
+            )
+            v = v.permute(0, 2, 3, 1, 4).reshape(
+                batch_size * self.block_len, self.num_heads, num_blocks, self.head_dim
+            )
             
-            # Apply causal mask because you can't attend to future blocks
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            out = out.view(batch_size, self.block_len, num_blocks, model_dim).transpose(1, 2) # (batch_size, num_blocks, block_len, model_dim)
-            
-        # flatten back to 1D sequence and project
-        out = out.contiguous().view(batch_size, seq_len, model_dim)  # (batch_size, seq_len, model_dim)
-        out = self.out_proj(out)  # (batch_size, seq_len, model_dim
-        return out
+    
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True) # apply causal mask because you can't attend to future blocks
+            # reshape back to the 2D block grid
+            out = out.reshape(batch_size, self.block_len, self.num_heads, num_blocks, self.head_dim)
+            out = out.transpose(1, 2).reshape(batch_size, num_blocks, self.block_len, model_dim)  # (batch_size, num_blocks, block_len, model_dim)
+
+        elif self.attention_type == 'previous_row':
+            raise NotImplementedError("previous_row attention is not yet implemented!")
+
+        # Flatten back to 1D sequence and project
+        out = out.reshape(batch_size, seq_len, model_dim)   # (batch_size, seq_len, model_dim)
+        return self.out_proj(out)   # (batch_size, seq_len, model_dim)
 
 
 if __name__ == "__main__":
