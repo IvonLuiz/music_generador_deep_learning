@@ -99,8 +99,8 @@ class TransformerPriorConditioned(nn.Module):
             # instantiate the WaveNet Conditioner for processing the conditioning input
             self.conditioner = WaveNetConditioner(
                 num_embeddings=cond_num_embeddings,
-                embedding_dim=model_dim, # Must match the Transformer's model_dim
-                upsample_stride=upsample_stride, # This should match the upsampling factor between levels
+                embedding_dim=model_dim,
+                upsample_stride=upsample_stride,
                 dropout=dropout,
             )
 
@@ -120,21 +120,6 @@ class TransformerPriorConditioned(nn.Module):
                 dropout=self.dropout,
             ) for num_layer in range(self.num_layers)
         ])
-
-    def _init_standard_transformer_layers(self):
-        """!
-        @brief Initializes the transformer layers for the model. This is separated into its own method for clarity and potential future customization.
-        """
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.model_dim,
-            nhead=self.num_heads,
-            dim_feedforward=self.dim_feedforward,
-            dropout=self.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=self.num_layers)
 
     def forward(self, indices: torch.Tensor, upper_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -162,15 +147,13 @@ class TransformerPriorConditioned(nn.Module):
             if upper_indices is None:
                 raise ValueError('upper_indices must be provided for upsampler priors')
             # Process the conditioning input through the WaveNet conditioner
-            cond_emb = self.conditioner(upper_indices)  # [batch_size, model_dim, seq_len]
-            #cond_emb = cond_emb.permute(0, 2, 1)  # Shape: [batch_size, seq_len, model_dim]
+            cond_emb = self.conditioner(upper_indices)  # [batch_size, upper_seq_len, model_dim]
             # Add the conditioning embeddings to the token embeddings
             x = x + cond_emb[:, :seq_len, :]  # Ensure the conditioning embeddings are added only up to the current sequence length (in case of any length mismatch)
 
         # pass through transformer layers
         # FactoredAttention requires seq_len to be a multiple of block_len
         # During token-by-token generation, we pad the sequence temporarily
-        # x = self.transformer(x, mask=self._causal_mask(seq_len, device))
         remainder = seq_len % self.block_len
         pad_len = 0
         if remainder != 0:
@@ -209,6 +192,7 @@ class TransformerPriorConditioned(nn.Module):
     @torch.no_grad()
     def generate(
         self, 
+        batch_size: int,
         start_tokens: torch.Tensor,
         upper_indices: Optional[torch.Tensor] = None,
         seq_len: int = 64,
@@ -238,13 +222,12 @@ class TransformerPriorConditioned(nn.Module):
         if start_tokens is not None:
             if start_tokens.ndim != 2:
                 raise ValueError(f"start_tokens must have shape (B, T), got {tuple(start_tokens.shape)}")
+            if start_tokens.shape[0] != batch_size:
+                raise ValueError("start_tokens batch size does not match requested batch_size")
             tokens = start_tokens.to(device).long()
         else:
             tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
         
-        tokens = start_tokens.to(device).long()
-        if tokens.shape[0] != batch_size:
-            raise ValueError("start_tokens batch size does not match batch_size")
         if tokens.shape[1] > seq_len:
             raise ValueError("start_tokens length cannot exceed requested seq_len")
         
@@ -273,18 +256,6 @@ class TransformerPriorConditioned(nn.Module):
             return logits
         kth_vals = torch.topk(logits, k=top_k, dim=-1).values[..., -1].unsqueeze(-1)
         return torch.where(logits < kth_vals, torch.full_like(logits, float("-inf")), logits)
-
-    @staticmethod
-    def _causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
-        """!
-        @brief Creates a causal mask for self-attention to prevent attending to future tokens.
-        @param seq_len The length of the sequence to generate the mask for.
-        @param device The device on which to create the mask tensor.
-        @return A (seq_len, seq_len) tensor mask where positions (i, j) are -inf if j > i (future tokens) and 0 otherwise.
-        """
-        # Shape (T, T) with -inf above the diagonal (future positions masked).
-        mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
-        return torch.triu(mask, diagonal=1)
 
 
 if __name__ == "__main__":
@@ -369,7 +340,8 @@ if __name__ == "__main__":
     # test generation
     print("\nTesting generation for upsampler prior:")
     
-    generated_tokens = model.generate(start_tokens=lower_input_tokens,
+    generated_tokens = model.generate(batch_size=batch_size, 
+                                      start_tokens=lower_input_tokens,
                                       upper_indices=upper_input_tokens,
                                       seq_len=seq_len, top_k=10)
     print("Generated tokens shape:", generated_tokens.shape)  # Expected shape: (batch_size
