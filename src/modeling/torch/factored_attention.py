@@ -68,3 +68,29 @@ class FactoredAttention(nn.Module):
         out = out.contiguous().view(batch_size, seq_len, model_dim)  # (batch_size, seq_len, model_dim)
         out = self.out_proj(out)  # (batch_size, seq_len, model_dim
         return out
+
+
+if __name__ == "__main__":
+    print("--- Testing FactoredAttention ---")
+    BATCH_SIZE = 32
+    NUM_HEADS = 4
+    MODEL_DIM = 256 # equivalent to embeddings dim (must be divisible by NUM_HEADS)
+    BLOCK_LEN = 16
+    NUM_BLOCKS = 4
+    SEQ_LEN = BLOCK_LEN * NUM_BLOCKS  # 64
+    
+    dummy_x = torch.randn(BATCH_SIZE, SEQ_LEN, MODEL_DIM)
+    
+    print("Testing Row Attention...")
+    row_attn = FactoredAttention(MODEL_DIM, NUM_HEADS, BLOCK_LEN, 'row')
+    out_row = row_attn(dummy_x)
+    assert out_row.shape == (BATCH_SIZE, SEQ_LEN, MODEL_DIM), "Row attention shape mismatch!"
+    print(f"Row Attention Output Shape: {out_row.shape} - PASSED")
+    
+    print("\nTesting Column Attention...")
+    col_attn = FactoredAttention(MODEL_DIM, NUM_HEADS, BLOCK_LEN, 'column')
+    out_col = col_attn(dummy_x)
+    assert out_col.shape == (BATCH_SIZE, SEQ_LEN, MODEL_DIM), "Column attention shape mismatch!"
+    print(f"Column Attention Output Shape: {out_col.shape} - PASSED")
+    
+    print("\nAll implemented attention patterns passed successfully!")
