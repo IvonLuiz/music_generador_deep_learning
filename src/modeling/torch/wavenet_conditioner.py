@@ -117,7 +117,6 @@ if __name__ == "__main__":
     embedding_dim = 1920
     num_channels = 1024
     upsample_stride = 4  # Ratio between the upper and lower sequence lengths
-    padding = 0
     kernel_size = 3
 
     model = WaveNetConditioner(
@@ -125,7 +124,6 @@ if __name__ == "__main__":
         embedding_dim=embedding_dim,
         num_channels=num_channels,
         upsample_stride=upsample_stride,
-        padding=padding,
         kernel_size=kernel_size
     )
     print("Model architecture:\n", model)
