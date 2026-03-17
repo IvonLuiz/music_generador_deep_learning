@@ -3,38 +3,58 @@ dataset:
   target_time_frames: 256
 
 vqvae:
-  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_top/2026-03-05_01-54-37"
-  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_middle/2026-03-04_07-45-47"
-  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_bottom/2026-03-04_02-21-00"
+  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_top/2026-03-11_07-47-14"
+  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_middle/2026-03-11_03-53-44"
+  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_bottom/2026-03-11_01-22-52"
   weights_file: "best_model.pth"
 
 model:
   name: "pixelcnn_jukebox_maestro2011"
   num_prior_levels: 3
+  selected_level: "top"  # options: top, middle, bottom
   two_level_conditioning_mode: "deconv"
 
 priors:
   top_prior:
-    hidden_channels: 128
+    hidden_channels: 512
     num_layers: 15
     conv_filter_size: 5
     dropout_rate: 0.1
   middle_prior:
-    hidden_channels: 128
-    num_layers: 15
+    hidden_channels: 512
+    num_layers: 16
     conv_filter_size: 5
     dropout_rate: 0.1
   bottom_prior:
-    hidden_channels: 128
+    hidden_channels: 512
     num_layers: 15
     conv_filter_size: 5
     dropout_rate: 0.1
 
+conditioning_priors:
+  # Used only when training.conditioning_mode=generated.
+  # Example: to train middle with generated top, set top_model_dir to a trained top prior run directory.
+  # You can also set top_model_dir/middle_model_dir to: latest, newest, auto, most_recent
+  # to automatically resolve the newest run in ./models/<model.name>_<level>_prior/<timestamp>/.
+  top_model_dir: "latest"
+  middle_model_dir: "latest"
+  weights_file: "best_model.pth"
+
+pixelcnn_models:
+  # Optional paths for test script (one model per level).
+  # You can also set *_model_dir to: latest, newest, auto, most_recent
+  # to automatically resolve the newest run in ./models/<model.name>_<level>_prior/<timestamp>/.
+  top_model_dir: "latest"
+  middle_model_dir: "latest"
+  bottom_model_dir: "latest"
+  weights_file: "best_model.pth"
+
 training:
   batch_size: 16
   quantization_batch_size: 32
+  conditioning_mode: "real"  # options: real, generated
   learning_rate: 0.0003
   epochs: 50
   save_dir: "./models/"
   validation_split: 0.2
-  early_stopping_patience: 10
+  early_stopping_patience: 4
