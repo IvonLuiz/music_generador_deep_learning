@@ -317,7 +317,7 @@ def train_transformer_prior(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train Jukebox Transformer priors (top/middle/bottom).')
-    parser.add_argument('--config', type=str, default='./config/config_transformer_prior_top.yaml')
+    parser.add_argument('--config', type=str, default='./config/config_transformer_prior.yaml')
     parser.add_argument('--level', type=str, default=None, help='Override model.selected_level in config')
     parser.add_argument('--top_model_dir', type=str, default=None, help='Override vqvae.top_model_dir from config')
     parser.add_argument('--middle_model_dir', type=str, default=None, help='Override vqvae.middle_model_dir from config')
