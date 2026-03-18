@@ -4,10 +4,12 @@ import os
 import sys
 import argparse
 from datetime import datetime
+import pickle
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+import soundfile as sf
 
 # Add 'src' to sys.path to allow imports from sibling directories
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -16,6 +18,9 @@ from test_scripts.hierarchical_pixelcnn_common import resolve_model_paths
 from utils import load_config
 
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
+from generation.soundgenerator import SoundGenerator
+from processing.preprocess_audio import MIN_MAX_VALUES_SAVE_DIR, SAMPLE_RATE, HOP_LENGTH
+from train_scripts.jukebox_utils import load_jukebox_model
 
 
 def _extract_num_embeddings(state_dict: dict) -> int:
@@ -123,10 +128,59 @@ def _save_indices(indices: np.ndarray, save_dir: str, name: str, grid: Optional[
             plt.close()
 
 
+def _prepare_min_max_values(min_max_values: object, count: int) -> list:
+    if isinstance(min_max_values, dict):
+        values = list(min_max_values.values())
+    elif isinstance(min_max_values, list):
+        values = min_max_values
+    else:
+        raise ValueError('min_max_values must be a dict or list')
+
+    if not values:
+        raise ValueError('min_max_values is empty')
+
+    if len(values) >= count:
+        return values[:count]
+
+    repeats = (count + len(values) - 1) // len(values)
+    tiled = (values * repeats)[:count]
+    return tiled
+
+
+def _decode_bottom_indices(
+    vqvae,
+    indices: torch.Tensor,
+    grid: Optional[list],
+    device: torch.device,
+) -> np.ndarray:
+    if indices.ndim != 2:
+        raise ValueError(f'Expected indices shape (B, T), got {tuple(indices.shape)}')
+    if not (isinstance(grid, list) and len(grid) == 2):
+        raise ValueError('Bottom grid is required to reshape indices into (H, W)')
+
+    h, w = int(grid[0]), int(grid[1])
+    if h * w != indices.shape[1]:
+        raise ValueError(f'Grid {grid} does not match seq_len={indices.shape[1]}')
+
+    idx_2d = indices.view(indices.shape[0], h, w).long().to(device)
+    vqvae.eval()
+    with torch.no_grad():
+        emb = vqvae.vq.embedding[idx_2d]  # (B, H, W, D)
+        z_q = emb.permute(0, 3, 1, 2).contiguous()  # (B, D, H, W)
+        x_hat = vqvae.decoder(z_q)
+        if vqvae.activation_layer is not None:
+            x_hat = vqvae.activation_layer(x_hat)
+
+    return x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()
+
+
 def test_transformer_prior(
     top_prior_path: str,
     middle_prior_path: str,
     bottom_prior_path: str,
+    bottom_vqvae_path: Optional[str],
+    min_max_values_path: Optional[str],
+    audio_method: str,
     num_samples: int,
     temperature: float,
     top_k: int,
@@ -190,12 +244,46 @@ def test_transformer_prior(
     _save_indices(middle_tokens.cpu().numpy().astype(np.int64), save_dir, 'middle', middle_grid)
     _save_indices(bottom_tokens.cpu().numpy().astype(np.int64), save_dir, 'bottom', bottom_grid)
 
+    vqvae_cfg = bottom_config.get('vqvae', {}) if isinstance(bottom_config, dict) else {}
+    effective_bottom_vqvae = bottom_vqvae_path or vqvae_cfg.get('bottom_model_dir')
+    effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
+
+    if effective_bottom_vqvae is not None:
+        print(f'Loading bottom VQ-VAE from {effective_bottom_vqvae}')
+        vqvae = load_jukebox_model(effective_bottom_vqvae, 'bottom', device, effective_weights_file)
+
+        if min_max_values_path is None:
+            min_max_values_path = os.path.join(MIN_MAX_VALUES_SAVE_DIR, 'min_max_values.pkl')
+
+        if not os.path.exists(min_max_values_path):
+            raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
+
+        with open(min_max_values_path, 'rb') as f:
+            min_max_values = pickle.load(f)
+
+        decoded_specs = _decode_bottom_indices(vqvae, bottom_tokens, bottom_grid, device)
+        min_max_list = _prepare_min_max_values(min_max_values, decoded_specs.shape[0])
+
+        sound_generator = SoundGenerator(vqvae, hop_length=HOP_LENGTH)
+        audio_signals = sound_generator.convert_spectrograms_to_audio(
+            decoded_specs, min_max_list, method=audio_method
+        )
+
+        audio_dir = os.path.join(save_dir, 'audio')
+        os.makedirs(audio_dir, exist_ok=True)
+        for i, signal in enumerate(audio_signals):
+            sf.write(os.path.join(audio_dir, f'sample_{i}.wav'), signal, SAMPLE_RATE)
+        print(f'Saved audio to {audio_dir}')
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Sample top/middle/bottom VQ indices from trained Transformer priors')
     parser.add_argument('--top_prior', type=str, required=True, help='Path to top prior run directory, config, or .pth')
     parser.add_argument('--middle_prior', type=str, required=True, help='Path to middle prior run directory, config, or .pth')
     parser.add_argument('--bottom_prior', type=str, required=True, help='Path to bottom prior run directory, config, or .pth')
+    parser.add_argument('--bottom_vqvae', type=str, default=None, help='Path to bottom VQ-VAE run directory, config, or .pth')
+    parser.add_argument('--min_max_values', type=str, default=None, help='Path to min_max_values.pkl (optional)')
+    parser.add_argument('--audio_method', type=str, default='griffinlim', help='Audio inversion: griffinlim or istft')
     parser.add_argument('--weights_file', type=str, default='best_model.pth')
     parser.add_argument('--n_samples', type=int, default=6)
     parser.add_argument('--temperature', type=float, default=0.9)
@@ -207,10 +295,16 @@ if __name__ == '__main__':
     if args.top_k < 0:
         raise ValueError(f'--top_k must be >= 0, got {args.top_k}')
 
+    if args.audio_method not in ('griffinlim', 'istft'):
+        raise ValueError("--audio_method must be 'griffinlim' or 'istft'")
+
     test_transformer_prior(
         top_prior_path=args.top_prior,
         middle_prior_path=args.middle_prior,
         bottom_prior_path=args.bottom_prior,
+        bottom_vqvae_path=args.bottom_vqvae,
+        min_max_values_path=args.min_max_values,
+        audio_method=args.audio_method,
         num_samples=args.n_samples,
         temperature=args.temperature,
         top_k=args.top_k,
