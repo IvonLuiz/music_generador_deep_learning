@@ -19,10 +19,10 @@ model:
       levels: 3
       num_residual_layers: 8
     middle:
-      levels: 5
+      levels: 4
       num_residual_layers: 4
     top:
-      levels: 7
+      levels: 5
       num_residual_layers: 4
   name: jukebox_vqvae_maestro2011
   num_embeddings: 2048
