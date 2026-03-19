@@ -164,6 +164,7 @@ def train_transformer_prior(
 
     optimizer = optim.AdamW(prior.parameters(), lr=float(train_cfg['learning_rate']), weight_decay=float(train_cfg.get('weight_decay', 0.01)))
 
+    # Use mixed precision training if on CUDA for potential speedup and reduced memory usage
     use_amp = device.type == 'cuda'
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
@@ -232,6 +233,7 @@ def train_transformer_prior(
                 with torch.amp.autocast('cuda'):
                     loss = prior.loss(target_seq, upper_indices=cond_seq)
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer) # unscale the gradients back to their original values before clipping
                 torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
