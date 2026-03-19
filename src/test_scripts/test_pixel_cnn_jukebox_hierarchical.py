@@ -17,7 +17,6 @@ from generation.generate import save_multiple_signals
 from generation.soundgenerator import SoundGenerator
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from modeling.torch.pixel_cnn_jukebox_levels import JukeboxLevelPixelCNN
-from modeling.torch.transformer_prior import TransformerPrior
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 from test_scripts.hierarchical_pixelcnn_common import resolve_model_paths
 from utils import load_config, load_maestro
@@ -96,37 +95,6 @@ def _load_jukebox_level_model(model_dir_or_file: str, level_name: str, device: t
     model.load_state_dict(state_dict)
     model.eval()
     return model
-
-
-def _load_transformer_top_prior(model_dir_or_file: str, device: torch.device, weights_file: str = 'best_model.pth'):
-    config_path, model_path = resolve_model_paths(model_dir_or_file, weights_file)
-
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f'Config file not found at {config_path}')
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f'Weights file not found at {model_path}')
-
-    config = load_config(config_path)
-    model_cfg = config['model']
-    seq_len = int(model_cfg.get('inferred_seq_len', 0))
-    if seq_len <= 0:
-        raise ValueError('Transformer prior config must contain model.inferred_seq_len')
-
-    prior = TransformerPrior(
-        num_embeddings=int(model_cfg['num_embeddings']),
-        model_dim=int(model_cfg['model_dim']),
-        num_heads=int(model_cfg['num_heads']),
-        num_layers=int(model_cfg['num_layers']),
-        dim_feedforward=int(model_cfg['dim_feedforward']),
-        max_seq_len=seq_len,
-        dropout=float(model_cfg.get('dropout', 0.1)),
-    ).to(device)
-
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    state_dict = checkpoint['model_state'] if 'model_state' in checkpoint else checkpoint
-    prior.load_state_dict(state_dict)
-    prior.eval()
-    return prior, config
 
 
 def _extract_num_embeddings_from_state_dict(state_dict: dict) -> Tuple[int, Optional[int]]:
@@ -221,8 +189,6 @@ def _decode_bottom_from_indices(bottom_indices: torch.Tensor, bottom_model: Juke
 
 
 def _load_or_generate_top_codes(top_codes_file: Optional[str],
-                                transformer_prior_path: Optional[str],
-                                transformer_weights_file: str,
                                 top_prior_model: Optional[JukeboxLevelPixelCNN],
                                 num_samples: int,
                                 top_shape: Tuple[int, int],
@@ -247,26 +213,6 @@ def _load_or_generate_top_codes(top_codes_file: Optional[str],
         actual_n = min(num_samples, top_np.shape[0])
         top_codes = torch.from_numpy(top_np[:actual_n]).long().to(device)
         print(f'Loaded top codes from {top_codes_file} with shape {tuple(top_codes.shape)}')
-        return top_codes
-
-    if transformer_prior_path:
-        prior, prior_config = _load_transformer_top_prior(transformer_prior_path, device, transformer_weights_file)
-        inferred_grid = prior_config.get('model', {}).get('inferred_top_grid', None)
-        if isinstance(inferred_grid, list) and len(inferred_grid) == 2:
-            inferred_grid = (int(inferred_grid[0]), int(inferred_grid[1]))
-            if inferred_grid != (top_h, top_w):
-                raise ValueError(f'Transformer prior top grid {inferred_grid} does not match expected {(top_h, top_w)}')
-
-        top_k_value = top_k if top_k > 0 else None
-        top_seq = prior.generate(
-            batch_size=num_samples,
-            seq_len=top_seq_len,
-            temperature=temperature,
-            top_k=top_k_value,
-            device=device,
-        )
-        top_codes = top_seq.view(num_samples, top_h, top_w)
-        print(f'Generated top codes from Transformer prior with shape {tuple(top_codes.shape)}')
         return top_codes
 
     if top_prior_model is None:
@@ -369,8 +315,6 @@ def test_jukebox_hierarchical_pixelcnn(
     temperature: float = 1.0,
     top_k: int = 0,
     top_codes_file: str = None,
-    transformer_prior_path: str = None,
-    transformer_weights_file: str = 'best_model.pth',
     top_pixelcnn: str = None,
     middle_pixelcnn: str = None,
     bottom_pixelcnn: str = None,
@@ -399,8 +343,8 @@ def test_jukebox_hierarchical_pixelcnn(
         pixelcnn_config, top_pixelcnn, middle_pixelcnn, bottom_pixelcnn
     )
 
-    need_top_prior = stage_mode == 'fully_generated' and not (top_codes_file or transformer_prior_path)
-    need_mid_prior = stage_mode in ('fully_generated', 'real_top') or bool(top_codes_file or transformer_prior_path)
+    need_top_prior = stage_mode == 'fully_generated' and not top_codes_file
+    need_mid_prior = stage_mode in ('fully_generated', 'real_top') or bool(top_codes_file)
     need_bot_prior = True
 
     top_prior = _load_single_level_prior(top_path, 'top', device, pixelcnn_weights_file) if need_top_prior else None
@@ -420,8 +364,6 @@ def test_jukebox_hierarchical_pixelcnn(
     if stage_mode == 'fully_generated':
         generated_codes[0] = _load_or_generate_top_codes(
             top_codes_file=top_codes_file,
-            transformer_prior_path=transformer_prior_path,
-            transformer_weights_file=transformer_weights_file,
             top_prior_model=top_prior,
             num_samples=num_samples,
             top_shape=latent_shapes[0],
@@ -519,12 +461,7 @@ if __name__ == '__main__':
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (>0).')
     parser.add_argument('--top_k', type=int, default=0, help='Top-k filtering; 0 disables it.')
     parser.add_argument('--top_codes_file', type=str, default=None, help='Optional .npy file with top codes shaped (B,T) or (B,H,W). If set, top generation uses these codes.')
-    parser.add_argument('--transformer_prior', type=str, default=None, help='Optional trained Transformer top prior path. If set, top codes are generated from it.')
-    parser.add_argument('--transformer_weights_file', type=str, default='best_model.pth', help='Weights filename for --transformer_prior when passing a run directory.')
     args = parser.parse_args()
-
-    if args.top_codes_file and args.transformer_prior:
-        raise ValueError('Use only one of --top_codes_file or --transformer_prior')
 
     test_jukebox_hierarchical_pixelcnn(
         pixelcnn_config_path=args.pixelcnn_config,
@@ -535,8 +472,6 @@ if __name__ == '__main__':
         temperature=args.temperature,
         top_k=args.top_k,
         top_codes_file=args.top_codes_file,
-        transformer_prior_path=args.transformer_prior,
-        transformer_weights_file=args.transformer_weights_file,
         top_pixelcnn=args.top_pixelcnn,
         middle_pixelcnn=args.middle_pixelcnn,
         bottom_pixelcnn=args.bottom_pixelcnn,
