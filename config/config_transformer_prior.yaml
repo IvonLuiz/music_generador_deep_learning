@@ -1,0 +1,47 @@
+dataset:
+  processed_path: "./data/processed/maestro_spectrograms_test/"
+  target_time_frames: 256
+
+vqvae:
+  # Update to your latest trained Jukebox VQ-VAE runs per level.
+  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_top/2026-03-09_08-30-58"
+  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_middle/2026-03-09_04-38-06"
+  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_bottom/2026-03-09_01-09-07"
+  weights_file: "best_model.pth"
+
+model:
+  name: "jukebox_maestro2011"
+  selected_level: "top"  # options: top, middle, bottom
+
+priors:
+  top_prior:
+    model_dim: 512
+    num_heads: 8
+    num_layers: 12
+    dim_feedforward: 2048
+    dropout: 0.1
+    block_len: 16
+  middle_prior:
+    model_dim: 512
+    num_heads: 8
+    num_layers: 12
+    dim_feedforward: 2048
+    dropout: 0.1
+    block_len: 16
+  bottom_prior:
+    model_dim: 512
+    num_heads: 8
+    num_layers: 12
+    dim_feedforward: 2048
+    dropout: 0.1
+    block_len: 16
+
+training:
+  batch_size: 16
+  quantization_batch_size: 32
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  epochs: 150
+  validation_split: 0.2
+  early_stopping_patience: 10
+  save_dir: "./models/transformer_prior/"

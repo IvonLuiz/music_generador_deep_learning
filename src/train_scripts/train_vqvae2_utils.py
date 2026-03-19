@@ -19,6 +19,20 @@ from utils import find_min_max_for_path
 from callbacks import EarlyStopping, ModelCheckpoint, LossPlotter, SampleGenerator
 
 
+EXPECTED_VQ_LEVELS = 2
+
+
+def _split_two_level_vq_losses(vq_losses_details, context: str):
+    if len(vq_losses_details) != EXPECTED_VQ_LEVELS:
+        raise ValueError(
+            f"{context}: expected exactly {EXPECTED_VQ_LEVELS} VQ levels for VQ-VAE2, "
+            f"got {len(vq_losses_details)}"
+        )
+    top_vq_loss = vq_losses_details[0][0]
+    bottom_vq_loss = vq_losses_details[1][0]
+    return top_vq_loss, bottom_vq_loss
+
+
 def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                              x_train: np.ndarray,
                              train_file_paths: list,
@@ -147,8 +161,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
 
         epoch_loss = 0.0
         epoch_recon_loss = 0.0
-        epoch_vq_loss_top = 0.0
-        epoch_vq_loss_bottom = 0.0
+        epoch_vq_losses = [0.0, 0.0]  # [top, bottom]
         total_samples = 0
         skipped_non_finite_batches = 0
         
@@ -163,12 +176,11 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
             optimizer.zero_grad()
             with autocast(device_type=device.type, enabled=scaler.is_enabled()):
                 reconstructions, total_vq_loss, vq_losses_details = model(batch)
-                
-                # Unpack losses
-                # vq_losses_details is [(vq_loss_top, codebook_loss_top, commitment_loss_top), (vq_loss_bottom, ...)]
-                (vq_loss_top, codebook_loss_top, commitment_loss_top) = vq_losses_details[0]
-                (vq_loss_bottom, codebook_loss_bottom, commitment_loss_bottom) = vq_losses_details[1]
-                
+                top_vq_loss, bottom_vq_loss = _split_two_level_vq_losses(
+                    vq_losses_details,
+                    context='Training forward pass',
+                )
+
                 recon_loss = F.mse_loss(reconstructions, batch) / (2 * data_variance)
                 loss = recon_loss + total_vq_loss
 
@@ -190,8 +202,8 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
             batch_size_current = batch.size(0)
             epoch_loss += loss.item() * batch_size_current
             epoch_recon_loss += recon_loss.item() * batch_size_current
-            epoch_vq_loss_top += vq_loss_top.item() * batch_size_current
-            epoch_vq_loss_bottom += vq_loss_bottom.item() * batch_size_current
+            epoch_vq_losses[0] += top_vq_loss.item() * batch_size_current
+            epoch_vq_losses[1] += bottom_vq_loss.item() * batch_size_current
             total_samples += batch_size_current
 
             progress_bar.set_postfix(loss=epoch_loss / total_samples)
@@ -206,16 +218,12 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
 
         avg_epoch_loss = epoch_loss / total_samples
         avg_recon_loss = epoch_recon_loss / total_samples
-        avg_vq_loss_top = epoch_vq_loss_top / total_samples
-        avg_vq_loss_bottom = epoch_vq_loss_bottom / total_samples
+        avg_vq_losses = [v / total_samples for v in epoch_vq_losses]
 
         # Update Loss Plotter
-        epoch_metrics = {
-            'total': avg_epoch_loss,
-            'reconstruction_loss': avg_recon_loss,
-            'vq_loss_top': avg_vq_loss_top,
-            'vq_loss_bottom': avg_vq_loss_bottom
-        }
+        epoch_metrics = {'total': avg_epoch_loss, 'reconstruction_loss': avg_recon_loss}
+        epoch_metrics['vq_loss_top'] = avg_vq_losses[0]
+        epoch_metrics['vq_loss_bottom'] = avg_vq_losses[1]
 
         # Validation Loop
         val_loss_str = ""
@@ -225,8 +233,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
             model.eval()
             val_epoch_loss = 0.0
             val_epoch_recon_loss = 0.0
-            val_epoch_vq_loss_top = 0.0
-            val_epoch_vq_loss_bottom = 0.0
+            val_epoch_vq_losses = [0.0, 0.0]  # [top, bottom]
             val_total_samples = 0
             skipped_non_finite_val_batches = 0
             
@@ -240,10 +247,11 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                         continue
 
                     reconstructions, total_vq_loss, vq_losses_details = model(batch)
-                    
-                    (vq_loss_top, _, _) = vq_losses_details[0]
-                    (vq_loss_bottom, _, _) = vq_losses_details[1]
-                    
+                    top_vq_loss, bottom_vq_loss = _split_two_level_vq_losses(
+                        vq_losses_details,
+                        context='Validation forward pass',
+                    )
+
                     recon_loss = F.mse_loss(reconstructions, batch) / (2 * data_variance)
                     loss = recon_loss + total_vq_loss
 
@@ -255,8 +263,8 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                     batch_size_current = batch.size(0)
                     val_epoch_loss += loss.item() * batch_size_current
                     val_epoch_recon_loss += recon_loss.item() * batch_size_current
-                    val_epoch_vq_loss_top += vq_loss_top.item() * batch_size_current
-                    val_epoch_vq_loss_bottom += vq_loss_bottom.item() * batch_size_current
+                    val_epoch_vq_losses[0] += top_vq_loss.item() * batch_size_current
+                    val_epoch_vq_losses[1] += bottom_vq_loss.item() * batch_size_current
                     val_total_samples += batch_size_current
 
             if skipped_non_finite_val_batches > 0:
@@ -264,25 +272,20 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
 
             if val_total_samples == 0:
                 avg_val_loss = float('nan')
-                avg_val_recon_loss = float('nan')
-                avg_val_vq_loss_top = float('nan')
-                avg_val_vq_loss_bottom = float('nan')
+                avg_val_vq_losses_val = [float('nan'), float('nan')]
             else:
                 avg_val_loss = val_epoch_loss / val_total_samples
-                avg_val_recon_loss = val_epoch_recon_loss / val_total_samples
-                avg_val_vq_loss_top = val_epoch_vq_loss_top / val_total_samples
-                avg_val_vq_loss_bottom = val_epoch_vq_loss_bottom / val_total_samples
-            
-            epoch_metrics.update({
-                'val_total': avg_val_loss,
-                'val_reconstruction_loss': avg_val_recon_loss,
-                'val_vq_loss_top': avg_val_vq_loss_top,
-                'val_vq_loss_bottom': avg_val_vq_loss_bottom
-            })
-            
+                avg_val_vq_losses_val = [v / val_total_samples for v in val_epoch_vq_losses]
+
+            epoch_metrics['val_total'] = avg_val_loss
+            epoch_metrics['val_reconstruction_loss'] = val_epoch_recon_loss / val_total_samples if val_total_samples else float('nan')
+            epoch_metrics['val_vq_loss_top'] = avg_val_vq_losses_val[0]
+            epoch_metrics['val_vq_loss_bottom'] = avg_val_vq_losses_val[1]
+
             val_loss_str = f", Val Loss: {avg_val_loss:.4f}"
 
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_epoch_loss:.4f}, Recon: {avg_recon_loss:.4f}, VQ Top: {avg_vq_loss_top:.4f}, VQ Bottom: {avg_vq_loss_bottom:.4f}{val_loss_str}")
+        vq_str = f"VQ Top: {avg_vq_losses[0]:.4f}, VQ Bottom: {avg_vq_losses[1]:.4f}"
+        print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_epoch_loss:.4f}, Recon: {avg_recon_loss:.4f}, {vq_str}{val_loss_str}")
 
         # Callbacks Step
         if loss_plotter:
