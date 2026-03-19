@@ -34,7 +34,11 @@ class WaveNetConditioner(nn.Module):
     
     @details This module implements a WaveNet architecture to model the conditional distribution 
     of discrete tokens (e.g., from a VQ-VAE) given some conditioning information (e.g., class labels, 
-    speaker embeddings). It uses dilated causal convolutions to capture long-range dependencies in the token sequence.
+    speaker embeddings). It uses non-causal (symmetric) dilated convolutions to capture long-range
+    dependencies in the upper-level token sequence, as the entire conditioning sequence is fully
+    available during ancestral sampling. The output is upsampled to match the temporal resolution
+    of the target sequence (e.g., audio samples) and can be combined with the output of an inferior
+    transformer before final projection to logits.
     """
     def __init__(
         self,
@@ -83,7 +87,6 @@ class WaveNetConditioner(nn.Module):
             in_channels=num_channels, out_channels=embedding_dim,
             kernel_size=upsample_stride, stride=upsample_stride, padding=0 # no padding for transposed convolution since we want to exactly upsample by the stride factor
         )
-        print(f"Upsample layer shape: {self.upsample.weight.shape}")
 
         # layer norm and final projection to logits before summing with the embeddings from the inferior transformer
         self.layer_norm = nn.LayerNorm(embedding_dim)
