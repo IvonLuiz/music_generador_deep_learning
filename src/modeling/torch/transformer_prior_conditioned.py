@@ -182,8 +182,8 @@ class TransformerPriorConditioned(nn.Module):
         
         # For next-token prediction, the input to the model is the sequence excluding the last token,
         # and the target is the sequence excluding the first token.
-        input_tokens = indices[:, :-1]
-        target = indices[:, 1:]
+        input_tokens = indices[:, :-1]  # Length: T - 1
+        target = indices[:, 1:]         # Length: T - 1
         
         # Pass upper_indices through to forward
         logits = self.forward(input_tokens, upper_indices=upper_indices)
@@ -193,7 +193,7 @@ class TransformerPriorConditioned(nn.Module):
     def generate(
         self, 
         batch_size: int,
-        start_tokens: torch.Tensor,
+        start_tokens: Optional[torch.Tensor] = None,
         upper_indices: Optional[torch.Tensor] = None,
         seq_len: int = 64,
         temperature: float = 1.0,  
@@ -202,11 +202,13 @@ class TransformerPriorConditioned(nn.Module):
     ) -> torch.Tensor:
         """!
         @brief Generates a sequence of token indices autoregressively given an initial input and optional conditioning.
-        @param start_tokens The initial input token indices (shape: [batch_size, initial_seq_len]).
+        @param batch_size The number of sequences to generate in parallel.
+        @param start_tokens The initial input token indices (shape: [batch_size, initial_seq_len]). Defaults to None (start with a single token).
         @param upper_indices The input token indices from the upper level prior for conditioning (shape: [batch_size, upper_seq_len]). Defaults to None (no conditioning).
         @param seq_len The length of the generated sequence (including the initial input). Defaults to 64.
         @param top_k The number of top logits to keep for sampling. If None or <= 0, no filtering is applied. Defaults to None.
         @paramm temperature The sampling temperature. Must be > 0. Defaults to 1.0.
+        @param device The device to perform generation on. If None, uses the same device as the model's parameters. Defaults to None.
         @return A tensor of generated token indices (shape: [batch_size, generated_seq_len]) where generated_seq_len <= seq_len.
         """
         if temperature <= 0:
