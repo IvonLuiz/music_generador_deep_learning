@@ -18,7 +18,7 @@ model:
     top: 64
   inferred_upsample_stride: 4
   name: jukebox_maestro2011
-  selected_level: bottom
+  selected_level: middle
 priors:
   bottom_prior:
     block_len: 16
@@ -42,10 +42,10 @@ priors:
     num_heads: 8
     num_layers: 12
 training:
-  batch_size: 16
-  early_stopping_patience: 10
+  batch_size: 32
+  early_stopping_patience: 7
   epochs: 150
-  learning_rate: 0.0003
+  learning_rate: 1.0e-05
   quantization_batch_size: 32
   save_dir: ./models/transformer_prior/
   validation_split: 0.2
