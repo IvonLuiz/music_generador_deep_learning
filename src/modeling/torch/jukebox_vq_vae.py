@@ -17,12 +17,12 @@ try:
     # When importing as a module from elsewhere in the project
     from modeling.torch.encoder import EncoderBlock
     from modeling.torch.decoder import DecoderBlock
-    from modeling.torch.vector_quantizer import VectorQuantizer
+    from modeling.torch.ema_vector_quantizer import EMAVectorQuantizer
 except ImportError:
     # When running this script directly
     from encoder import EncoderBlock
     from decoder import DecoderBlock
-    from vector_quantizer import VectorQuantizer
+    from ema_vector_quantizer import EMAVectorQuantizer
 
 
 class JukeboxVQVAE(nn.Module):
@@ -44,7 +44,11 @@ class JukeboxVQVAE(nn.Module):
                  conv_type: int = 2,
                  activation_layer: torch.Optional[nn.Module] = None,
                  dilation_growth_rate: int = 3,
-                 channel_growth: int = 1):
+                 channel_growth: int = 1,
+                 ema_decay: float = 0.99,
+                 epsilon: float = 1e-5,
+                 restart_threshold: float = 0.5
+                 ):
         """
         Args:
             input_channels: Number of input channels (e.g., 1 for mono audio, 2 for stereo, 1 for spectrogram).
@@ -52,9 +56,13 @@ class JukeboxVQVAE(nn.Module):
             levels: Number of downsampling levels (Jukebox: Bottom=3, Mid=5, Top=7 approx).
             num_residual_layers: ResBlocks per level.
             conv_type: 1 for 1D (Audio), 2 for 2D (Spectrograms).
+            activation_layer: Optional activation after final decoder layer (e.g., Tanh for raw audio, Sigmoid for spectrograms).
             dilation_growth_rate: Factor to grow dilation in residual stack (Jukebox uses 3).
             channel_growth: Channel multiplier per downsampling level. For Jukebox-style stability,
                             keep this at 1 (constant width).
+            ema_decay: Decay factor for EMA updates in the vector quantizer.
+            epsilon: Small constant for numerical stability in EMA updates.
+            restart_threshold: Threshold for triggering random restarts in the codebook to prevent collapse.
         """
         if conv_type != 1 and conv_type != 2:
             raise ValueError("conv_type must be either 1 (Conv1d) or 2 (Conv2d)")
@@ -104,9 +112,12 @@ class JukeboxVQVAE(nn.Module):
                                 kernel_size=1)
 
         ## VECTOR QUANTIZERS
-        self.vq = VectorQuantizer(num_embeddings=num_embeddings,
-                                  embedding_dim=embedding_dim,
-                                  beta=beta)
+        self.vq = EMAVectorQuantizer(num_embeddings=num_embeddings,
+                                     embedding_dim=embedding_dim,
+                                     beta=beta,
+                                     ema_decay=ema_decay,
+                                     epsilon=epsilon,
+                                     restart_threshold=restart_threshold)
 
         ## DECODERS
         decoder_layers = []
@@ -178,13 +189,6 @@ class JukeboxVQVAE(nn.Module):
             x_recon, _, _ = self.forward(x)
         return x_recon
 
-def vqvae_hierarchical_loss(x, x_recon, vq_losses_top, vq_losses_bottom, variance: float = 1.0):
-    # Likelihood term ~ scaled MSE
-    recon = F.mse_loss(x_recon, x) / (2 * variance)
-    vq_loss_top, codebook_loss_top, commitment_loss_top = vq_losses_top
-    vq_loss_bottom, codebook_loss_bottom, commitment_loss_bottom = vq_losses_bottom
-    total_vq_loss = vq_loss_top + vq_loss_bottom
-    return recon + total_vq_loss, recon
 
 if __name__ == "__main__":
     # Test block
