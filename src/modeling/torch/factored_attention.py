@@ -92,14 +92,11 @@ class FactoredAttention(nn.Module):
             # We want to shift K and V down by one row along the `num_blocks` dimension (dim=1), so that each row attends to the previous row
             # The first row will attend to an all-zero row (since there is no previous row), and the last row will be dropped (since there is no next row to attend to it)
             previous_row_zeros = torch.zeros_like(k[:, :1, ...]) # getting right shape from slicing the first row
-            print(f"previous_row_zeros shape: {previous_row_zeros.shape}") # (batch_size, 1, block_len, num_heads, head_dim)
 
             # Shift K and V down by 1 row along the `num_blocks` dimension (dim=1)
             # We concatenate the zeros at the top, and slice off the last row
             k_shifted = torch.cat([previous_row_zeros, k[:, :-1, ...]], dim=1)
             v_shifted = torch.cat([previous_row_zeros, v[:, :-1, ...]], dim=1)
-            print(f"k_shifted shape: {k_shifted.shape}") # (batch_size, num_blocks, block_len, num_heads, head_dim)
-            print(f"v_shifted shape: {v_shifted.shape}") # (batch_size, num_blocks, block_len, num_heads, head_dim)
             
             # Apply the exact same reshaping as Row Attention
             # Merge B and num_blocks so SDPA processes each row pairing independently
