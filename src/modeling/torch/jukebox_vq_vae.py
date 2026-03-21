@@ -47,7 +47,7 @@ class JukeboxVQVAE(nn.Module):
                  channel_growth: int = 1,
                  ema_decay: float = 0.99,
                  epsilon: float = 1e-5,
-                 restart_threshold: float = 0.5
+                 restart_threshold: float = 0.5,
                  ):
         """
         Args:
