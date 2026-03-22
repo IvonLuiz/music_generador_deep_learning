@@ -37,11 +37,14 @@ class LossPlotter:
             ('total', 'Total Loss'),
             ('reconstruction_loss', 'Reconstruction Loss'),
             ('reconstruction', 'Reconstruction Loss'),
+            ('vq_loss', 'VQ Loss'),
             ('vq_loss_top', 'VQ Loss Top'),
             ('vq_loss_bottom', 'VQ Loss Bottom'),
             ('vq', 'VQ Loss'),
             ('codebook', 'Codebook Loss'),
-            ('commitment', 'Commitment Loss')
+            ('codebook_loss', 'Codebook Loss'),
+            ('commitment', 'Commitment Loss'),
+            ('commitment_loss', 'Commitment Loss'),
         ]
 
         for key, label in keys_to_plot:

@@ -15,34 +15,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from generation.generate import *
 from utils import load_maestro, load_config
-from train_scripts.train_vqvae2_utils import train_vqvae_hierarchical
+from train_scripts.train_vqvae_utils import train_vqvae_jukebox
 from processing.preprocess_audio import TARGET_TIME_FRAMES, MIN_MAX_VALUES_SAVE_DIR
 from datasets.spectrogram_dataset import MmapSpectrogramDataset
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-
-class JukeboxHierarchicalAdapter(nn.Module):
-    """
-    Thin wrapper so train_vqvae_hierarchical can call model(x) and reconstruct(x)
-    on a JukeboxVQVAE, which already returns the expected
-    (x_recon, total_vq_loss, [(vq_loss, codebook_loss, commitment_loss)]) format.
-    """
-    def __init__(self, model: JukeboxVQVAE):
-        super().__init__()
-        self.model = model
-
-    def forward(self, x):
-        x_recon, total_vq_loss, vq_details = self.model(x)
-        vq_loss, codebook_loss, commitment_loss = vq_details[0]
-        zero = torch.zeros_like(vq_loss)
-        return x_recon, total_vq_loss, [
-            (vq_loss, codebook_loss, commitment_loss),
-            (zero, zero, zero),
-        ]
-
-    def reconstruct(self, x):
-        return self.model.reconstruct(x)
 
 if __name__ == "__main__":
     # Optional: faster matmul on Ampere+ GPUs
@@ -187,11 +165,8 @@ if __name__ == "__main__":
         channel_growth=model_cfg.get('channel_growth', 1),
     ).to(device)
 
-    train_model = JukeboxHierarchicalAdapter(jukebox_model)
-    
-    # Train the VQ-VAE Hierarchical model
-    train_vqvae_hierarchical(
-        model=train_model,
+    train_vqvae_jukebox(
+        model=jukebox_model,
         x_train=x_train,
         train_file_paths=train_file_paths,
         min_max_values=min_max_values,
