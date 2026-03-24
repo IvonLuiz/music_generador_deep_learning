@@ -43,6 +43,7 @@ def _prepare_min_max_values(min_max_values: object, count: int) -> list:
     repeats = (count + len(values) - 1) // len(values)
     tiled = (values * repeats)[:count]
     return tiled
+
 def _save_decoded_spectrograms(specs: np.ndarray, save_dir: str) -> None:
     spec_dir = os.path.join(save_dir, 'spectrograms')
     os.makedirs(spec_dir, exist_ok=True)
@@ -69,11 +70,11 @@ def _decode_bottom_indices(
     if not (isinstance(grid, list) and len(grid) == 2):
         raise ValueError('Bottom grid is required to reshape indices into (H, W)')
 
-    h, w = int(grid[0]), int(grid[1])
+    h, w = int(grid[0]), int(grid[1]) # (frequency, time) dimensions of the spectrogram
     if h * w != indices.shape[1]:
         raise ValueError(f'Grid {grid} does not match seq_len={indices.shape[1]}')
 
-    idx_2d = indices.view(indices.shape[0], h, w).long().to(device)
+    idx_2d = indices.view(indices.shape[0], w, h).transpose(1, 2).contiguous().long().to(device)
     vqvae.eval()
     with torch.no_grad():
         emb = vqvae.vq.embedding[idx_2d]  # (B, H, W, D)
@@ -84,9 +85,21 @@ def _decode_bottom_indices(
 
     return x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()
 
-bottom_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_bottom_transformer_prior/2026-03-23_17-55-25/config.yaml"
-middle_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_middle_transformer_prior/2026-03-22_14-09-31/config.yaml"
-top_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_top_transformer_prior/2026-03-22_13-55-04/config.yaml"
+def extract_right_half(tokens_1d, grid):
+    """Reshapes 1D tokens to 2D, slices the right half of time, and flattens back."""
+    if tokens_1d is None: return None
+    h, w = int(grid[0]), int(grid[1])
+    # Reshape to (Batch, Height, Width)
+    tokens_2d = tokens_1d.reshape(tokens_1d.shape[0], h, w)
+    # Slice the right half of the width (Time)
+    right_half = tokens_2d[:, :, w//2:]
+    # Flatten back to 1D
+    return right_half.reshape(tokens_1d.shape[0], -1)
+
+
+bottom_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_bottom_transformer_prior/2026-03-24_04-45-45/config.yaml"
+middle_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_middle_transformer_prior/2026-03-24_04-01-47/config.yaml"
+top_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_top_transformer_prior/2026-03-24_03-48-41/config.yaml"
 
 config_top = load_config(top_transformer_prior_config_path)
 config_middle = load_config(middle_transformer_prior_config_path)
@@ -118,10 +131,11 @@ vqvae_bottom_decoder.eval()
 # Step 1: Top-Level Unrolling (The Composer)
 ## TODO: remove hardcoded generation parameters and make them configurable
 temperature = 1.0
-top_k = 100
+top_k = None
 
 ## loop until generated amount of audio is reached, generating in blocks of top_seq_len and using the last part of the previous block as context for the next block
-chunks_to_generate = 4  # Example value
+chunks_to_generate = 10  # Example value
+
 curr_start_token = None
 top_tokens_list = []
 for chunk in range(chunks_to_generate):
@@ -139,10 +153,12 @@ for chunk in range(chunks_to_generate):
     ## overlap extract 
     ### take second half of the current tokens 
     ### and use it as the start tokens for the next level's generation
-    overlap_len = len(top_grid) // 2 if top_grid else 0
-    curr_start_token = top_tokens[:, -overlap_len:] if overlap_len > 0 else None
-    curr_start_token = torch.from_numpy(curr_start_token).to(device) if curr_start_token is not None else None
+    overlap_len = top_seq_len // 2
+    curr_start_token = top_tokens[:, -overlap_len:]
+    curr_start_token = torch.from_numpy(curr_start_token).to(device)
     top_tokens_list.append(top_tokens)
+
+print("Top-level generation complete. Generated tokens for each block have shape:", top_tokens_list[0].shape if top_tokens_list else None)
 
 # Step 2: Hierarchical Upsampling (The Performers)
 curr_start_token = None
@@ -161,11 +177,13 @@ for chunk in range(chunks_to_generate):
     ).cpu().numpy()
     
     ## overlap extract for middle tokens to use as context for the next block
-    overlap_len = len(middle_grid) // 2 if middle_grid else 0
-    curr_start_token = middle_tokens[:, -overlap_len:] if overlap_len > 0 else None
-    curr_start_token = torch.from_numpy(curr_start_token).to(device) if curr_start_token is not None else None
+    overlap_len = middle_seq_len // 2
+    curr_start_token = middle_tokens[:, -overlap_len:]
+    curr_start_token = torch.from_numpy(curr_start_token).to(device)
     middle_tokens_list.append(middle_tokens)
     
+print("Middle-level generation complete. Generated tokens for each block have shape:", middle_tokens_list[0].shape if middle_tokens_list else None)
+
 curr_start_token = None
 bottom_tokens_list = []
 for chunk in range(chunks_to_generate):
@@ -182,10 +200,14 @@ for chunk in range(chunks_to_generate):
     ).cpu().numpy()
     
     ## overlap extract for bottom tokens to use as context for the next block
-    overlap_len = len(bottom_grid) // 2 if bottom_grid else 0
-    curr_start_token = bottom_tokens[:, -overlap_len:] if overlap_len > 0 else None
-    curr_start_token = torch.from_numpy(curr_start_token).to(device) if curr_start_token is not None else None
+    overlap_len = bottom_seq_len // 2
+    curr_start_token = bottom_tokens[:, -overlap_len:]
+    curr_start_token = torch.from_numpy(curr_start_token).to(device)
     bottom_tokens_list.append(bottom_tokens)
+
+print("Generation complete. Bottom tokens length:", len(bottom_tokens_list),
+      "with each block having shape:", bottom_tokens_list[0].shape if bottom_tokens_list else None)
+print("Decoding bottom tokens into spectrograms...")
 
 # At this point, bottom_tokens_list contains the generated token indices for each block, which can be decoded back
 # into spectrograms using the VQ-VAE decoder. The overlapping regions between blocks can be blended together using
@@ -203,17 +225,24 @@ def linear_crossfading(spec_chunk_1, spec_chunk_2, overlap_len):
     @returns: Blended spectrogram chunk with the same shape as the input chunks
     """
     assert overlap_len > 0, "Overlap length must be greater than 0 for crossfading"
+
+    # Make copies to prevent in-place mutation bugs
+    c1 = spec_chunk_1.copy()
+    c2 = spec_chunk_2.copy()
     
-    # We reshape to (1, overlap_len, 1, 1) assuming shape is (Batch, time_frames, freq_bins, channels)
-    fade_in = np.linspace(0, 1, num=overlap_len).reshape(1, overlap_len, 1, 1)
+    fade_in = np.linspace(0, 1, num=overlap_len).reshape(1, 1, overlap_len, 1)
     fade_out = 1 - fade_in
-    
-    # Apply crossfade to the overlapping regions
-    spec_chunk_1[:, -overlap_len:] *= fade_out
-    spec_chunk_2[:, :overlap_len] *= fade_in
-    # Combine the two chunks
-    combined_chunk = np.concatenate([spec_chunk_1[:, :-overlap_len], spec_chunk_1[:, -overlap_len:] + spec_chunk_2[:, :overlap_len], spec_chunk_2[:, overlap_len:]], axis=1)
-    return combined_chunk
+
+    # Apply crossfade to the overlapping regions in the Time dimension (index 2)
+    blended_overlap = (c1[:, :, -overlap_len:] * fade_out) + (c2[:, :, :overlap_len] * fade_in)
+
+    # Concatenate along the Time dimension (axis=2)
+    combined = np.concatenate([
+        c1[:, :, :-overlap_len], 
+        blended_overlap, 
+        c2[:, :, overlap_len:]
+    ], axis=2)
+    return combined
 
 reconstructed_spectrograms = []
 for bottom_tokens in bottom_tokens_list:
@@ -221,13 +250,18 @@ for bottom_tokens in bottom_tokens_list:
     with torch.no_grad():
         decoded_specs = _decode_bottom_indices(vqvae_bottom_decoder, bottom_tokens_tensor, bottom_grid, device)
     reconstructed_spectrograms.append(decoded_specs)
-
+print("Decoded spectrograms for all blocks. Each block has shape:", reconstructed_spectrograms[0].shape if reconstructed_spectrograms else None)
 
 final_spectrogram = reconstructed_spectrograms[0].copy()
+overlap_option = "none"  # or "linear_crossfade"
 for i in range(1, len(reconstructed_spectrograms)):
-    next_chunk = reconstructed_spectrograms[i].copy()
-    overlap_len = min(final_spectrogram.shape[1], next_chunk.shape[1]) // 4
-    final_spectrogram = linear_crossfading(final_spectrogram, next_chunk, overlap_len)
+    next_chunk = reconstructed_spectrograms[i].copy() # (Batch, Freq, Time, Channels)
+    
+    # The overlap is ALWAYS exactly half of the incoming chunk
+    overlap_frames = next_chunk.shape[2] // 2
+    final_spectrogram = linear_crossfading(final_spectrogram, next_chunk, overlap_frames)
+
+print("Spectrogram reconstruction and crossfading complete. Final spectrogram shape:", final_spectrogram.shape)
 
 # Step 4: Spectrogram Inversion (The Mastering Engineer)
 # The blended spectrograms can now be inverted back to audio using Griffin-Lim or a neural vocoder. This step is not implemented here, but libraries like librosa (for Griffin-Lim) or pretrained neural vocoders can be used for this purpose.
