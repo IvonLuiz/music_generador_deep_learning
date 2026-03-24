@@ -13,7 +13,7 @@ LEVEL_TO_INT = {'top': 1, 'middle': 2, 'bottom': 3}
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
 
 
-def _parse_level(level: str) -> str:
+def parse_level(level: str) -> str:
     level = str(level).strip().lower()
     if level in ('mid', 'middle'):
         return 'middle'
@@ -27,7 +27,6 @@ def _get_prior_cfg(config: dict, name: str) -> dict:
     if priors and name in priors:
         return priors[name]
     return config[name]
-
 
 
 def _normalize_state_dict_keys_for_jukebox(state_dict: dict) -> dict:
@@ -85,7 +84,7 @@ def load_single_level_prior(model_dir_or_file: str, device: torch.device, weight
 
     config = load_config(config_path)
     model_cfg = config.get('model', {})
-    selected_level = _parse_level(model_cfg.get('selected_level', 'top'))
+    selected_level = parse_level(model_cfg.get('selected_level', 'top'))
     prior_cfg = _get_prior_cfg(config, LEVEL_TO_PRIOR_CFG[selected_level])
 
     checkpoint = torch.load(model_file, map_location=device, weights_only=False)
