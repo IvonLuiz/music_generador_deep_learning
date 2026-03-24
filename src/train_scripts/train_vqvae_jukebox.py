@@ -151,18 +151,27 @@ if __name__ == "__main__":
     activation_name = str(model_cfg.get('activation', '')).lower()
     activation_layer = nn.Sigmoid() if activation_name == 'sigmoid' else None
 
+    # Assert model config has all paramters needed for model initialization
+    required_params = ['input_channels', 'hidden_dim', 'num_embeddings', 'embedding_dim', 'beta', 'conv_type', 'dilation_growth_rate', 'channel_growth', 'ema_decay', 'epsilon', 'restart_threshold']
+    missing_params = [p for p in required_params if p not in model_cfg]
+    if missing_params:
+        raise ValueError(f"Missing required model config parameters: {', '.join(missing_params)}")
+
     jukebox_model = JukeboxVQVAE(
         input_channels=model_cfg['input_channels'],
         hidden_dim=model_cfg['hidden_dim'],
         levels=levels,
         num_residual_layers=num_residual_layers,
-        num_embeddings=model_cfg.get('num_embeddings', 2048),
-        embedding_dim=model_cfg.get('embedding_dim', 64),
-        beta=model_cfg.get('beta', 0.25),
-        conv_type=model_cfg.get('conv_type', 2),
+        num_embeddings=model_cfg.get('num_embeddings'),
+        embedding_dim=model_cfg.get('embedding_dim'),
+        beta=model_cfg.get('beta'),
+        conv_type=model_cfg.get('conv_type'),
         activation_layer=activation_layer,
-        dilation_growth_rate=model_cfg.get('dilation_growth_rate', 3),
-        channel_growth=model_cfg.get('channel_growth', 1),
+        dilation_growth_rate=model_cfg.get('dilation_growth_rate'),
+        channel_growth=model_cfg.get('channel_growth'),
+        ema_decay=model_cfg.get('ema_decay'),
+        epsilon=model_cfg.get('epsilon'),
+        restart_threshold=model_cfg.get('restart_threshold'),
     ).to(device)
 
     train_vqvae_jukebox(

@@ -27,12 +27,24 @@ class EMAVectorQuantizer(nn.Module):
         @param restart_threshold: threshold for triggering random restarts.
         """
         super().__init__()
-        self.num_embeddings = num_embeddings  # K
-        self.embedding_dim = embedding_dim    # D
-        self.beta = beta
-        self.decay = ema_decay
-        self.epsilon = epsilon
-        self.restart_threshold = restart_threshold
+        # Coerce values coming from YAML configs (which can be loaded as strings).
+        self.num_embeddings = int(num_embeddings)  # K
+        self.embedding_dim = int(embedding_dim)    # D
+        self.beta = float(beta)
+        self.decay = float(ema_decay)
+        self.epsilon = float(epsilon)
+        self.restart_threshold = float(restart_threshold)
+
+        if self.num_embeddings <= 0:
+            raise ValueError("num_embeddings must be > 0")
+        if self.embedding_dim <= 0:
+            raise ValueError("embedding_dim must be > 0")
+        if not (0.0 < self.decay < 1.0):
+            raise ValueError("ema_decay must be in (0, 1)")
+        if self.epsilon <= 0.0:
+            raise ValueError("epsilon must be > 0")
+        if self.restart_threshold < 0.0:
+            raise ValueError("restart_threshold must be >= 0")
 
         # Initialize codebook embeddings
         embedding = torch.empty(num_embeddings, embedding_dim)

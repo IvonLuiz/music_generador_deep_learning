@@ -15,7 +15,8 @@ model:
   embedding_dim: 64 # matching hidden_dim allows for better codebook utilization and richer representations, while still fitting in 12GB VRAM
   beta: 0.25
   ema_decay: 0.99           # Standard Jukebox/VQ-VAE EMA decay
-  restart_threshold: 0.5    # Threshold for the EMAVectorQuantizer we just built
+  restart_threshold: 0.5    # Threshold for the EMAVectorQuantizer restart mechanism
+  epsilon: 1e-5             # Small constant for numerical stability in EMA updates
   
   conv_type: 2
   dilation_growth_rate: 3
