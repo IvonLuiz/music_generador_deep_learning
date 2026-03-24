@@ -63,9 +63,12 @@ class JukeboxHierarchicalQuantizedDataset(Dataset):
                 self.middle_indices.append(idx_middle.cpu())
                 self.bottom_indices.append(idx_bottom.cpu())
 
-        self.top_indices = torch.cat(self.top_indices, dim=0).long()
-        self.middle_indices = torch.cat(self.middle_indices, dim=0).long()
-        self.bottom_indices = torch.cat(self.bottom_indices, dim=0).long()
+        # Transpose dim 1 (Freq) and dim 2 (Time), then make contiguous in memory.
+        # This ensures that when the training script flattens the grid, 
+        # it generates all frequencies for Time 0 before moving to Time 1.
+        self.top_indices = torch.cat(self.top_indices, dim=0).long().transpose(1, 2).contiguous()
+        self.middle_indices = torch.cat(self.middle_indices, dim=0).long().transpose(1, 2).contiguous()
+        self.bottom_indices = torch.cat(self.bottom_indices, dim=0).long().transpose(1, 2).contiguous()
 
         print(f"Top indices shape:    {tuple(self.top_indices.shape)}")
         print(f"Middle indices shape: {tuple(self.middle_indices.shape)}")
