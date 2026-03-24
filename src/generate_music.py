@@ -106,7 +106,6 @@ bottom_prior, bottom_config, _ = load_transformer_prior('bottom', bottom_transfo
 bottom_seq_len = int(bottom_config['model']['inferred_seq_lens']['bottom'])
 bottom_grid = bottom_config['model'].get('inferred_grids', {}).get('bottom')
 
-print(bottom_config)
 vqvae_bottom_decoder = load_jukebox_model(
     bottom_config['vqvae']['bottom_model_dir'],
     'bottom',
@@ -205,36 +204,33 @@ def linear_crossfading(spec_chunk_1, spec_chunk_2, overlap_len):
     """
     assert overlap_len > 0, "Overlap length must be greater than 0 for crossfading"
     
-    fade_in = torch.linspace(0, 1, steps=overlap_len).unsqueeze(0).unsqueeze(2)  # Shape: (1, overlap_len, 1)
-    fade_out = 1 - fade_in  # Shape: (1, overlap_len, 1)
+    # We reshape to (1, overlap_len, 1, 1) assuming shape is (Batch, time_frames, freq_bins, channels)
+    fade_in = np.linspace(0, 1, num=overlap_len).reshape(1, overlap_len, 1, 1)
+    fade_out = 1 - fade_in
     
     # Apply crossfade to the overlapping regions
     spec_chunk_1[:, -overlap_len:] *= fade_out
     spec_chunk_2[:, :overlap_len] *= fade_in
     # Combine the two chunks
-    combined_chunk = torch.cat([spec_chunk_1[:, :-overlap_len], spec_chunk_1[:, -overlap_len:] + spec_chunk_2[:, :overlap_len], spec_chunk_2[:, overlap_len:]], dim=1)
+    combined_chunk = np.concatenate([spec_chunk_1[:, :-overlap_len], spec_chunk_1[:, -overlap_len:] + spec_chunk_2[:, :overlap_len], spec_chunk_2[:, overlap_len:]], axis=1)
     return combined_chunk
 
 reconstructed_spectrograms = []
 for bottom_tokens in bottom_tokens_list:
     bottom_tokens_tensor = torch.from_numpy(bottom_tokens).to(device)
     with torch.no_grad():
-        decoded_specs = _decode_bottom_indices(vqvae_bottom_decoder, bottom_tokens, bottom_grid, device)
+        decoded_specs = _decode_bottom_indices(vqvae_bottom_decoder, bottom_tokens_tensor, bottom_grid, device)
     reconstructed_spectrograms.append(decoded_specs)
 
 
-spectrograms_crossfaded = []
-for i in range(len(reconstructed_spectrograms) - 1):
-    spec_chunk_1 = reconstructed_spectrograms[i]
-    spec_chunk_2 = reconstructed_spectrograms[i + 1]
-    overlap_len = min(spec_chunk_1.shape[1], spec_chunk_2.shape[1]) // 4  # Example: use 25% of the chunk length for crossfading
-    blended_spec = linear_crossfading(spec_chunk_1, spec_chunk_2, overlap_len)
-    spectrograms_crossfaded.append(blended_spec)
+final_spectrogram = reconstructed_spectrograms[0].copy()
+for i in range(1, len(reconstructed_spectrograms)):
+    next_chunk = reconstructed_spectrograms[i].copy()
+    overlap_len = min(final_spectrogram.shape[1], next_chunk.shape[1]) // 4
+    final_spectrogram = linear_crossfading(final_spectrogram, next_chunk, overlap_len)
 
 # Step 4: Spectrogram Inversion (The Mastering Engineer)
 # The blended spectrograms can now be inverted back to audio using Griffin-Lim or a neural vocoder. This step is not implemented here, but libraries like librosa (for Griffin-Lim) or pretrained neural vocoders can be used for this purpose.
-
-
 
 current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 save_dir = os.path.join('samples', 'transformer_hierarchical_generated', current_time)
@@ -246,11 +242,18 @@ if not os.path.exists(min_max_values_path):
 with open(min_max_values_path, 'rb') as f:
     min_max_values = pickle.load(f)
 
-_save_decoded_spectrograms(decoded_specs, save_dir)
-min_max_list = _prepare_min_max_values(min_max_values, decoded_specs.shape[0])
+_save_decoded_spectrograms(final_spectrogram, save_dir)
+min_max_list = _prepare_min_max_values(min_max_values, final_spectrogram.shape[0])
 
-audio_method = 'griffin_lim'  # or 'neural_vocoder'
+audio_method = 'griffinlim'  # or 'neural_vocoder'
+import soundfile as sf
 sound_generator = SoundGenerator(vqvae_bottom_decoder, hop_length=HOP_LENGTH)
 audio_signals = sound_generator.convert_spectrograms_to_audio(
-    decoded_specs, min_max_list, method=audio_method
+    final_spectrogram, min_max_list, method=audio_method
 )
+
+audio_dir = os.path.join(save_dir, 'audio')
+os.makedirs(audio_dir, exist_ok=True)
+for i, signal in enumerate(audio_signals):
+    sf.write(os.path.join(audio_dir, f'sample_{i}.wav'), signal, SAMPLE_RATE)
+print(f'Done! Saved generated samples to {save_dir}')
