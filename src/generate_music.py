@@ -20,7 +20,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from datasets.jukebox_hierarchical_quantized_dataset import JukeboxHierarchicalQuantizedDataset
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
 from utils import load_maestro, load_config
-from train_scripts.jukebox_utils import load_jukebox_model, _parse_level
+from train_scripts.jukebox_utils import load_jukebox_model
 from test_scripts.test_transformer_prior import load_transformer_prior
 from generation.soundgenerator import SoundGenerator
 from processing.preprocess_audio import MIN_MAX_VALUES_SAVE_DIR, SAMPLE_RATE, HOP_LENGTH

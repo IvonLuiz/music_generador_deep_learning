@@ -15,7 +15,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from generation.soundgenerator import SoundGenerator
 from processing.preprocess_audio import HOP_LENGTH, MIN_MAX_VALUES_SAVE_DIR, SAMPLE_RATE, TARGET_TIME_FRAMES
-from train_scripts.jukebox_utils import _parse_level, load_jukebox_model
+from train_scripts.jukebox_utils import parse_level, load_jukebox_model
 from utils import find_min_max_for_path, load_maestro
 
 
@@ -151,7 +151,7 @@ def test_jukebox_vqvae(
     audio_method: str,
 ) -> None:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    level_name = _parse_level(level)
+    level_name = parse_level(level)
     model_ref = _resolve_model_reference(model_dir_or_file)
 
     print(f'Loading Jukebox VQ-VAE ({level_name}) from {model_ref}')
