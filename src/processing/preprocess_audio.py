@@ -6,12 +6,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 
-TARGET_TIME_FRAMES = 256  # Adjust this for desired length
+TARGET_TIME_FRAMES = 256  # Adjust this for desired length TODO: change to 1024 later
 SAMPLE_RATE = 22050    # samples per second
 FRAME_SIZE = 512       # samples for each STFT window
 HOP_LENGTH = 256       # move amount of samples between windows
 
-MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_spectrograms_test/min_max_values/"
+MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_spectrograms_all_years/min_max_values/"
 
 class Loader:
     """
@@ -406,6 +406,7 @@ if __name__ == "__main__":
     # For 128 time frames: (128 * 256) / 22050 ≈ 1.49 seconds
     # For 256 time frames: (256 * 256) / 22050 ≈ 2.97 seconds  
     # For 512 time frames: (512 * 256) / 22050 ≈ 5.95 seconds
+    # For 1024 time frames: (1024 * 256) / 22050 ≈ 11.9 seconds
     
     DURATION = (TARGET_TIME_FRAMES * HOP_LENGTH) / SAMPLE_RATE # ~2.97 seconds for 256 frames
     
@@ -419,12 +420,12 @@ if __name__ == "__main__":
     # MIN_MAX_VALUES_SAVE_DIR = "./data/fsdd/"
     # FILES_DIR = "./data/fsdd/audio/"
     
-    FILES_DIR = "./data/raw/maestro-v3.0.0/2011"
-    SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro_spectrograms_test/"
-    VISUALIZATION_SAVE_DIR = "./data/processed/maestro_spectrograms_test/spectrograms/"
+    FILES_DIR = "./data/raw/maestro-v3.0.0/"
+    SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro_spectrograms_all_years/"
+    VISUALIZATION_SAVE_DIR = SPECTROGRAMS_SAVE_DIR + "/spectrograms/"
     
     # Enable visualization (set to False to disable)
-    ENABLE_VISUALIZATION = True
+    ENABLE_VISUALIZATION = False
     
     # instantiate all objects
     loader = Loader(SAMPLE_RATE, DURATION, MONO)
