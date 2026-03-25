@@ -162,7 +162,20 @@ def train_transformer_prior(
         dropout=float(prior_cfg.get('dropout', 0.1)),
     ).to(device)
 
+    epochs = int(train_cfg['epochs'])
+    early_stopping = EarlyStopping(patience=int(train_cfg.get('early_stopping_patience', 10)), verbose=True)
+
     optimizer = optim.AdamW(prior.parameters(), lr=float(train_cfg['learning_rate']), weight_decay=float(train_cfg.get('weight_decay', 0.01)))
+
+    # Warmup for the first ~5% of total training steps
+    total_steps = len(train_loader) * epochs
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=float(train_cfg['learning_rate']),
+        total_steps=total_steps,
+        pct_start=0.05, # Peaks at 5% of training, then gently decays
+        anneal_strategy='cos'
+    )
 
     # Use mixed precision training if on CUDA for potential speedup and reduced memory usage
     use_amp = device.type == 'cuda'
@@ -197,9 +210,6 @@ def train_transformer_prior(
     with open(os.path.join(run_dir, 'config.yaml'), 'w') as f:
         yaml.dump(config_to_save, f)
 
-    epochs = int(train_cfg['epochs'])
-    early_stopping = EarlyStopping(patience=int(train_cfg.get('early_stopping_patience', 10)), verbose=True)
-
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
@@ -230,7 +240,7 @@ def train_transformer_prior(
             optimizer.zero_grad()
 
             if use_amp:
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
                     loss = prior.loss(target_seq, upper_indices=cond_seq)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer) # unscale the gradients back to their original values before clipping
@@ -242,6 +252,8 @@ def train_transformer_prior(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
                 optimizer.step()
+
+            scheduler.step()
 
             running_loss += loss.item()
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
@@ -270,7 +282,7 @@ def train_transformer_prior(
                 target_seq = target_indices.view(target_indices.shape[0], -1)
                 cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
                 if use_amp:
-                    with torch.amp.autocast('cuda'):
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
                         loss = prior.loss(target_seq, upper_indices=cond_seq)
                 else:
                     loss = prior.loss(target_seq, upper_indices=cond_seq)

@@ -12,7 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
 from generation.generate import *
 from utils import load_maestro, load_config, initialize_vqvae_hierarchical_model
-from train_scripts.train_vqvae2_utils import train_vqvae_hierarchical
+from train_scripts.train_vqvae_utils import train_vqvae_hierarchical
 from processing.preprocess_audio import TARGET_TIME_FRAMES, MIN_MAX_VALUES_SAVE_DIR
 from datasets.spectrogram_dataset import MmapSpectrogramDataset
 

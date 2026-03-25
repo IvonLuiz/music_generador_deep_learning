@@ -33,20 +33,13 @@ priors:
 
 conditioning_priors:
   # Used only when training.conditioning_mode=generated.
-  # Example: to train middle with generated top, set top_model_dir to a trained top prior run directory.
-  # You can also set top_model_dir/middle_model_dir to: latest, newest, auto, most_recent
-  # to automatically resolve the newest run in ./models/<model.name>_<level>_prior/<timestamp>/.
-  top_model_dir: "latest"
-  middle_model_dir: "latest"
+  # Grouped layout only: one run_dir containing top/middle/bottom subfolders.
+  run_dir: "./models/pixelcnn_jukebox_maestro2011_prior/2026-03-12_20-50-19"
   weights_file: "best_model.pth"
 
 pixelcnn_models:
-  # Optional paths for test script (one model per level).
-  # You can also set *_model_dir to: latest, newest, auto, most_recent
-  # to automatically resolve the newest run in ./models/<model.name>_<level>_prior/<timestamp>/.
-  top_model_dir: "latest"
-  middle_model_dir: "latest"
-  bottom_model_dir: "latest"
+  # Grouped layout only: one run_dir containing top/middle/bottom subfolders.
+  run_dir: "./models/pixelcnn_jukebox_maestro2011_prior/2026-03-12_20-50-19"
   weights_file: "best_model.pth"
 
 training:

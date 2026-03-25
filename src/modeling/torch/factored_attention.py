@@ -86,7 +86,28 @@ class FactoredAttention(nn.Module):
             out = out.permute(0, 3, 1, 2, 4).reshape(batch_size, num_blocks, self.block_len, model_dim)  # (batch_size, num_blocks, block_len, model_dim)
 
         elif self.attention_type == 'previous_row':
-            raise NotImplementedError("previous_row attention is not yet implemented!")
+            # PREVIOUS-ROW ATTENTION: Attend entirely to the row immediately above.
+            # Q comes from the current row. K and V come from the previous row.
+            
+            # We want to shift K and V down by one row along the `num_blocks` dimension (dim=1), so that each row attends to the previous row
+            # The first row will attend to an all-zero row (since there is no previous row), and the last row will be dropped (since there is no next row to attend to it)
+            previous_row_zeros = torch.zeros_like(k[:, :1, ...]) # getting right shape from slicing the first row
+
+            # Shift K and V down by 1 row along the `num_blocks` dimension (dim=1)
+            # We concatenate the zeros at the top, and slice off the last row
+            k_shifted = torch.cat([previous_row_zeros, k[:, :-1, ...]], dim=1)
+            v_shifted = torch.cat([previous_row_zeros, v[:, :-1, ...]], dim=1)
+            
+            # Apply the exact same reshaping as Row Attention
+            # Merge B and num_blocks so SDPA processes each row pairing independently
+            q = q.transpose(2,3).reshape(batch_size * num_blocks, self.num_heads, self.block_len, self.head_dim)
+            k_shifted = k_shifted.transpose(2,3).reshape(batch_size * num_blocks, self.num_heads, self.block_len, self.head_dim)
+            v_shifted = v_shifted.transpose(2,3).reshape(batch_size * num_blocks, self.num_heads, self.block_len, self.head_dim)
+            
+            # 4. SDPA Execution
+            # is_causal=False because the entire previous row is in the past, so it is "fully visible"
+            out = F.scaled_dot_product_attention(q, k_shifted, v_shifted, is_causal=False)
+            out = out.transpose(1,2).reshape(batch_size, num_blocks, self.block_len, model_dim)
 
         # Flatten back to 1D sequence and project
         out = out.reshape(batch_size, seq_len, model_dim)   # (batch_size, seq_len, model_dim)
@@ -101,6 +122,7 @@ if __name__ == "__main__":
     BLOCK_LEN = 16
     NUM_BLOCKS = 4
     SEQ_LEN = BLOCK_LEN * NUM_BLOCKS  # 64
+    print(f"Batch Size: {BATCH_SIZE}, Num Heads: {NUM_HEADS}, Model Dim: {MODEL_DIM}, Block Len: {BLOCK_LEN}, Seq Len: {SEQ_LEN}")
     
     dummy_x = torch.randn(BATCH_SIZE, SEQ_LEN, MODEL_DIM)
     
@@ -116,4 +138,10 @@ if __name__ == "__main__":
     assert out_col.shape == (BATCH_SIZE, SEQ_LEN, MODEL_DIM), "Column attention shape mismatch!"
     print(f"Column Attention Output Shape: {out_col.shape} - PASSED")
     
+    print("\nTesting Previous-Row Attention...")
+    prev_row_attn = FactoredAttention(MODEL_DIM, NUM_HEADS, BLOCK_LEN, 'previous_row')
+    out_prev_row = prev_row_attn(dummy_x)
+    assert out_prev_row.shape == (BATCH_SIZE, SEQ_LEN, MODEL_DIM), "Previous-row attention shape mismatch!"
+    print(f"Previous-Row Attention Output Shape: {out_prev_row.shape} - PASSED")
+
     print("\nAll implemented attention patterns passed successfully!")

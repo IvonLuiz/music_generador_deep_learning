@@ -15,34 +15,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from generation.generate import *
 from utils import load_maestro, load_config
-from train_scripts.train_vqvae2_utils import train_vqvae_hierarchical
+from train_scripts.train_vqvae_utils import train_vqvae_jukebox
 from processing.preprocess_audio import TARGET_TIME_FRAMES, MIN_MAX_VALUES_SAVE_DIR
 from datasets.spectrogram_dataset import MmapSpectrogramDataset
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-
-class JukeboxHierarchicalAdapter(nn.Module):
-    """
-    Thin wrapper so train_vqvae_hierarchical can call model(x) and reconstruct(x)
-    on a JukeboxVQVAE, which already returns the expected
-    (x_recon, total_vq_loss, [(vq_loss, codebook_loss, commitment_loss)]) format.
-    """
-    def __init__(self, model: JukeboxVQVAE):
-        super().__init__()
-        self.model = model
-
-    def forward(self, x):
-        x_recon, total_vq_loss, vq_details = self.model(x)
-        vq_loss, codebook_loss, commitment_loss = vq_details[0]
-        zero = torch.zeros_like(vq_loss)
-        return x_recon, total_vq_loss, [
-            (vq_loss, codebook_loss, commitment_loss),
-            (zero, zero, zero),
-        ]
-
-    def reconstruct(self, x):
-        return self.model.reconstruct(x)
 
 if __name__ == "__main__":
     # Optional: faster matmul on Ampere+ GPUs
@@ -173,25 +151,31 @@ if __name__ == "__main__":
     activation_name = str(model_cfg.get('activation', '')).lower()
     activation_layer = nn.Sigmoid() if activation_name == 'sigmoid' else None
 
+    # Assert model config has all paramters needed for model initialization
+    required_params = ['input_channels', 'hidden_dim', 'num_embeddings', 'embedding_dim', 'beta', 'conv_type', 'dilation_growth_rate', 'channel_growth', 'ema_decay', 'epsilon', 'restart_threshold']
+    missing_params = [p for p in required_params if p not in model_cfg]
+    if missing_params:
+        raise ValueError(f"Missing required model config parameters: {', '.join(missing_params)}")
+
     jukebox_model = JukeboxVQVAE(
         input_channels=model_cfg['input_channels'],
         hidden_dim=model_cfg['hidden_dim'],
         levels=levels,
         num_residual_layers=num_residual_layers,
-        num_embeddings=model_cfg.get('num_embeddings', 2048),
-        embedding_dim=model_cfg.get('embedding_dim', 64),
-        beta=model_cfg.get('beta', 0.25),
-        conv_type=model_cfg.get('conv_type', 2),
+        num_embeddings=model_cfg.get('num_embeddings'),
+        embedding_dim=model_cfg.get('embedding_dim'),
+        beta=model_cfg.get('beta'),
+        conv_type=model_cfg.get('conv_type'),
         activation_layer=activation_layer,
-        dilation_growth_rate=model_cfg.get('dilation_growth_rate', 3),
-        channel_growth=model_cfg.get('channel_growth', 1),
+        dilation_growth_rate=model_cfg.get('dilation_growth_rate'),
+        channel_growth=model_cfg.get('channel_growth'),
+        ema_decay=model_cfg.get('ema_decay'),
+        epsilon=model_cfg.get('epsilon'),
+        restart_threshold=model_cfg.get('restart_threshold'),
     ).to(device)
 
-    train_model = JukeboxHierarchicalAdapter(jukebox_model)
-    
-    # Train the VQ-VAE Hierarchical model
-    train_vqvae_hierarchical(
-        model=train_model,
+    train_vqvae_jukebox(
+        model=jukebox_model,
         x_train=x_train,
         train_file_paths=train_file_paths,
         min_max_values=min_max_values,
