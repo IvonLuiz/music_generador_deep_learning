@@ -108,7 +108,7 @@ class TransformerPriorConditioned(nn.Module):
         """!
         @brief Initializes the factored transformer layers for the model. This is separated into its own method for clarity and potential future customization.
         """
-        attention_patterns = ['row', 'column'] # TODO: will add 'previous_row' here later
+        attention_patterns = ['row', 'column', 'previous_row']
 
         self.transformer = nn.Sequential(*[
             FactoredTransformerLayer(

@@ -6,14 +6,15 @@ import torch.nn.functional as F
 class VectorQuantizer(nn.Module):
     """
     Vector Quantization layer with straight-through estimator.
-
-    Args:
-        num_embeddings (int): K, codebook size.
-        embedding_dim (int): D, embedding vector width (channel dimension of latent).
-        beta (float): commitment loss weight (typically 0.25 .. 2.0).
     """
 
     def __init__(self, num_embeddings: int, embedding_dim: int, beta: float = 0.25):
+        """!
+        @brief Initializes the VectorQuantizer module.
+        @param num_embeddings: K, codebook size.
+        @param embedding_dim: D, embedding vector width (channel dimension of latent).
+        @param beta: commitment loss weight (typically 0.25 .. 2.0).
+        """
         super().__init__()
         self.num_embeddings = num_embeddings  # K
         self.embedding_dim = embedding_dim    # D
@@ -40,13 +41,13 @@ class VectorQuantizer(nn.Module):
 
         assert D == self.embedding_dim, f"Expected channels==embedding_dim ({self.embedding_dim}), got {D}"
 
-        # Move channel dim to last and flatten spatial dims: (B, D, *spatial) -> (N, D)
+        # Move channel dim to last and flatten spatial dims: (B, D, *spatial) -> (B, *spatial, D) -> (N, D)
         # permute: (B, *spatial, D)
         perm = [0] + list(range(2, z_e.dim())) + [1]
         z = z_e.permute(*perm).contiguous()             # (B, *spatial, D)
         z_flat = z.view(-1, D)                          # (N, D)  where N = B * prod(spatial)
 
-        # Compute distances ||z - e||^2 = ||z||^2 + ||e||^2 - 2 z.e
+        # Compute distances ||z - e||^2 = ||z||^2 + ||e||^2 - 2 z*e
         e = self.embedding                                          # (K, D)
         z_sq = (z_flat ** 2).sum(dim=1, keepdim=True)               # (N, 1)
         e_sq = (e ** 2).sum(dim=1)                                  # (K,)

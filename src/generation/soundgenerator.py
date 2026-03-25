@@ -65,6 +65,8 @@ class SoundGenerator:
         Returns:
             List of audio signals as numpy arrays
         """
+        assert method in ("griffinlim", "istft"), "Unsupported inversion method. Use 'griffinlim' or 'istft'."
+
         signals = []
 
         for spectrogram, min_max_value in zip(spectrograms, min_max_values):

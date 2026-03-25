@@ -21,7 +21,7 @@ model:
   selected_level: bottom
 priors:
   bottom_prior:
-    block_len: 16
+    block_len: 32
     dim_feedforward: 2048
     dropout: 0.1
     model_dim: 512
@@ -35,7 +35,7 @@ priors:
     num_heads: 8
     num_layers: 12
   top_prior:
-    block_len: 16
+    block_len: 8
     dim_feedforward: 2048
     dropout: 0.1
     model_dim: 512
@@ -43,7 +43,7 @@ priors:
     num_layers: 12
 training:
   batch_size: 16
-  early_stopping_patience: 10
+  early_stopping_patience: 7
   epochs: 150
   learning_rate: 0.0003
   quantization_batch_size: 32
@@ -51,7 +51,7 @@ training:
   validation_split: 0.2
   weight_decay: 0.01
 vqvae:
-  bottom_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_bottom/2026-03-09_01-09-07
-  middle_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_middle/2026-03-09_04-38-06
-  top_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_top/2026-03-09_08-30-58
+  bottom_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_bottom/2026-03-22_03-23-39
+  middle_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_middle/2026-03-22_06-54-25
+  top_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_top/2026-03-22_09-41-44
   weights_file: best_model.pth

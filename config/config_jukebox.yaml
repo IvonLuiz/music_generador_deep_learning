@@ -11,23 +11,36 @@ model:
   selected_level: "bottom"  # options: "bottom", "middle", "top"
   input_channels: 1
   hidden_dim: 64
-  num_embeddings: 2048
-  embedding_dim: 64
+  num_embeddings: 2048 # codebook size
+  embedding_dim: 64 # matching hidden_dim allows for better codebook utilization and richer representations, while still fitting in 12GB VRAM
   beta: 0.25
+  ema_decay: 0.99           # Standard Jukebox/VQ-VAE EMA decay
+  restart_threshold: 0.5    # Threshold for the EMAVectorQuantizer restart mechanism
+  epsilon: 1e-5             # Small constant for numerical stability in EMA updates
+  
   conv_type: 2
   dilation_growth_rate: 3
   channel_growth: 1
   activation: "sigmoid"
+
   level_profiles:
     bottom:
-      levels: 3
+      levels: 3 # downsampling blocks -> 32x32 grid
       num_residual_layers: 8
     middle:
-      levels: 5
+      levels: 4 # downsampling blocks -> 16x16 grid
       num_residual_layers: 4
     top:
-      levels: 7
+      levels: 5 # downsampling blocks -> 8x8 grid
       num_residual_layers: 4
+
+# Jukebox paper user levels 3, 5, 7. Here we keep levels: 3, 4, 5 because
+# Jukebox compresses a massive 1D line of audio (e.g., 65,536 samples), while
+# we are compressing a 2D image ($256 * 256$). If we were to apply 7 downsampling
+# steps to a 256 grid (256 / 2^7), our Top level latent space would be a 2 * 2 grid.
+# That is only 4 tokens, the Transformer prior wouldn't have enough sequential
+# length to learn anything meaningful. So, 3, 4, 5 correctly yields sequence lengths
+# of 1024, 256, 64, which perfectly mimics the Jukebox scale for our 2D data.
 
 training:
   batch_size: 32 # 12GB GPU can handle 32, to handle 64 will probably need 16GB
@@ -42,3 +55,16 @@ training:
 testing:
   specific_run_dir: null
   weights_file_choice: "best_model.pth"
+
+# Jukebox paper uses:
+# bottom: 3 downsampling blocks
+# middle: 5 downsampling blocks
+# top: 7 downsampling blocks
+# residual blocks per block: 8, 4, 4
+# dilation growth rate: 3
+# codebook size: 2048
+# commit weight: 0.02
+# EMA gamma: 0.99
+# conv channels: 32
+# residual block width: 64, 32, 32
+# raw audio 1D, not spectrogram 2D

@@ -128,6 +128,23 @@ def _save_indices(indices: np.ndarray, save_dir: str, name: str, grid: Optional[
             plt.close()
 
 
+def _save_decoded_spectrograms(specs: np.ndarray, save_dir: str) -> None:
+    spec_dir = os.path.join(save_dir, 'spectrograms')
+    os.makedirs(spec_dir, exist_ok=True)
+
+    np.save(os.path.join(spec_dir, 'bottom_decoded_specs.npy'), specs)
+
+    for i in range(specs.shape[0]):
+        img = specs[i, :, :, 0]
+        plt.figure(figsize=(6, 4))
+        plt.imshow(img, origin='lower', aspect='auto')
+        plt.colorbar()
+        plt.title(f'Decoded Bottom Spectrogram {i}')
+        plt.tight_layout()
+        plt.savefig(os.path.join(spec_dir, f'bottom_spec_{i:03d}.png'), dpi=150)
+        plt.close()
+
+
 def _prepare_min_max_values(min_max_values: object, count: int) -> list:
     if isinstance(min_max_values, dict):
         values = list(min_max_values.values())
@@ -187,7 +204,7 @@ def test_transformer_prior(
     weights_file: str,
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    top_k_value = top_k if top_k > 0 else None
+    top_k_value = top_k if (top_k is not None and top_k > 0) else None
 
     print(f'Loading top Transformer prior from {top_prior_path}')
     top_prior, top_config, _ = load_transformer_prior('top', top_prior_path, device, weights_file)
@@ -262,6 +279,7 @@ def test_transformer_prior(
             min_max_values = pickle.load(f)
 
         decoded_specs = _decode_bottom_indices(vqvae, bottom_tokens, bottom_grid, device)
+        _save_decoded_spectrograms(decoded_specs, save_dir)
         min_max_list = _prepare_min_max_values(min_max_values, decoded_specs.shape[0])
 
         sound_generator = SoundGenerator(vqvae, hop_length=HOP_LENGTH)
@@ -285,14 +303,14 @@ if __name__ == '__main__':
     parser.add_argument('--min_max_values', type=str, default=None, help='Path to min_max_values.pkl (optional)')
     parser.add_argument('--audio_method', type=str, default='griffinlim', help='Audio inversion: griffinlim or istft')
     parser.add_argument('--weights_file', type=str, default='best_model.pth')
-    parser.add_argument('--n_samples', type=int, default=6)
-    parser.add_argument('--temperature', type=float, default=0.9)
-    parser.add_argument('--top_k', type=int, default=64)
+    parser.add_argument('--n_samples', type=int, default=6, help='Number of samples to generate (default: 6)')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (default: 1.0)')
+    parser.add_argument('--top_k', type=int, default=None, help='Top-k filtering for sampling (0 or negative for no filtering)')
     args = parser.parse_args()
 
     if args.temperature <= 0:
         raise ValueError(f'--temperature must be > 0, got {args.temperature}')
-    if args.top_k < 0:
+    if args.top_k is not None and args.top_k < 0:
         raise ValueError(f'--top_k must be >= 0, got {args.top_k}')
 
     if args.audio_method not in ('griffinlim', 'istft'):
