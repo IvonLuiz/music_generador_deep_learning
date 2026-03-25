@@ -5,7 +5,7 @@ class ModelCheckpoint:
     """
     Saves the model and optimizer state.
     """
-    def __init__(self, save_path, model, optimizer, mode="min"):
+    def __init__(self, save_path, model, optimizer, mode="min", initial_best_score=None):
         """
         Args:
             save_path (str): Path to save the model.
@@ -17,11 +17,12 @@ class ModelCheckpoint:
         self.model = model
         self.optimizer = optimizer
         self.mode = mode
-        self.best_score = float('inf') if mode == "min" else float('-inf')
+        default_best = float('inf') if mode == "min" else float('-inf')
+        self.best_score = initial_best_score if initial_best_score is not None else default_best
         
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-    def step(self, epoch, current_loss, metric_value=None):
+    def step(self, epoch, current_loss, metric_value=None, extra_state=None):
         """
         Args:
             epoch (int): Current epoch.
@@ -38,6 +39,8 @@ class ModelCheckpoint:
             'optimizer_state': self.optimizer.state_dict(),
             'loss': current_loss
         }
+        if extra_state:
+            save_dict.update(extra_state)
         torch.save(save_dict, self.save_path)
         
         # Check if best
