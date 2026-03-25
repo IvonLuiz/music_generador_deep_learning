@@ -19,7 +19,7 @@ from datasets.jukebox_hierarchical_quantized_dataset import JukeboxHierarchicalQ
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
 from utils import load_maestro, load_config
 from callbacks import EarlyStopping
-from train_scripts.jukebox_utils import load_jukebox_model, _parse_level
+from train_scripts.jukebox_utils import load_jukebox_model, parse_level
 
 
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
@@ -78,7 +78,7 @@ def train_transformer_prior(
     transformer_cfg = config.setdefault('model', {})
     train_cfg = config['training']
 
-    selected_level = _parse_level(level_override or transformer_cfg.get('selected_level', 'top'))
+    selected_level = parse_level(level_override or transformer_cfg.get('selected_level', 'top'))
     transformer_cfg['selected_level'] = selected_level
 
     effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
