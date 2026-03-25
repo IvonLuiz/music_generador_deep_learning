@@ -1,0 +1,47 @@
+conditioning_priors:
+  middle_model_dir: latest
+  top_model_dir: latest
+  weights_file: best_model.pth
+dataset:
+  processed_path: ./data/processed/maestro_spectrograms_test/
+  target_time_frames: 256
+model:
+  name: pixelcnn_jukebox_maestro2011
+  num_prior_levels: 3
+  selected_level: middle
+  two_level_conditioning_mode: deconv
+pixelcnn_models:
+  bottom_model_dir: latest
+  middle_model_dir: latest
+  top_model_dir: latest
+  weights_file: best_model.pth
+priors:
+  bottom_prior:
+    conv_filter_size: 5
+    dropout_rate: 0.1
+    hidden_channels: 512
+    num_layers: 18
+  middle_prior:
+    conv_filter_size: 5
+    dropout_rate: 0.1
+    hidden_channels: 512
+    num_layers: 16
+  top_prior:
+    conv_filter_size: 5
+    dropout_rate: 0.1
+    hidden_channels: 512
+    num_layers: 15
+training:
+  batch_size: 16
+  conditioning_mode: real
+  early_stopping_patience: 4
+  epochs: 50
+  learning_rate: 0.0003
+  quantization_batch_size: 32
+  save_dir: ./models/
+  validation_split: 0.2
+vqvae:
+  bottom_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_bottom/2026-03-11_01-22-52
+  middle_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_middle/2026-03-11_03-53-44
+  top_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_top/2026-03-11_07-47-14
+  weights_file: best_model.pth
