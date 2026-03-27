@@ -18,8 +18,7 @@ from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from generation.generate import *
 from utils import load_config
 from train_scripts.train_vqvae_utils import train_vqvae_jukebox
-from processing.preprocess_audio import TARGET_TIME_FRAMES, MIN_MAX_VALUES_SAVE_DIR
-from datasets.spectrogram_dataset import LazySpectrogramDataset # <--- IMPORTED HERE
+from datasets.spectrogram_dataset import LazySpectrogramDataset
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -99,6 +98,8 @@ if __name__ == "__main__":
     persist_workers = bool(config['training'].get('persist_workers', None))
     prefetch_factor = int(config['training'].get('prefetch_factor', None))
     spectrograms_path = config['dataset']['processed_path']
+    target_time_frames = int(config['dataset'].get('target_time_frames', 256))
+    min_max_values_path = config['dataset']['min_max_values_path']
     model_save_dir = config['training']['save_dir']
     model_name = config['model']['name']
     model_cfg = config['model']
@@ -108,6 +109,7 @@ if __name__ == "__main__":
     print(f"Configuration loaded. Model: {model_name}, Save Dir: {model_save_dir}")
     print(f"Training parameters: batch_size={batch_size}, learning_rate={learning_rate}, epochs={epochs}, early_stopping_patience={early_stopping_patience}")
     print(f"Data loading parameters: num_workers={num_workers}, pin_memory={pin_memory}, persist_workers={persist_workers}, prefetch_factor={prefetch_factor}")
+    print(f"Dataset target_time_frames={target_time_frames}")
 
     selected_level = args.level or model_cfg.get('selected_level', 'bottom')
     selected_level = str(selected_level).lower()
@@ -200,21 +202,20 @@ if __name__ == "__main__":
         val_paths = all_file_paths[num_train:]
         
         # Instantiate Lazy Datasets
-        x_train = LazySpectrogramDataset(train_paths)
-        x_val = LazySpectrogramDataset(val_paths)
+        x_train = LazySpectrogramDataset(train_paths, target_time_frames=target_time_frames)
+        x_val = LazySpectrogramDataset(val_paths, target_time_frames=target_time_frames)
         
         train_file_paths = train_paths
         val_file_paths = val_paths
         
         print(f"Data split: {len(x_train)} training, {len(x_val)} validation samples.")
     else:
-        x_train = LazySpectrogramDataset(all_file_paths)
+        x_train = LazySpectrogramDataset(all_file_paths, target_time_frames=target_time_frames)
         train_file_paths = all_file_paths
         x_val = None
         val_file_paths = None
 
     # Load min_max_values
-    min_max_values_path = os.path.join(MIN_MAX_VALUES_SAVE_DIR, "min_max_values.pkl")
     with open(min_max_values_path, "rb") as f:
         min_max_values = pickle.load(f)
 
