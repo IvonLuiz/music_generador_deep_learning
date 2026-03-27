@@ -49,6 +49,7 @@ class TransformerPriorConditioned(nn.Module):
         is_upsampler: bool = False,
         cond_num_embeddings: Optional[int] = None,
         upsample_stride: Optional[int] = None,
+        max_time_steps: int = 500,
         dropout: float = 0.1,
     ):
         """!
@@ -58,11 +59,15 @@ class TransformerPriorConditioned(nn.Module):
         @param model_dim The dimensionality of the token and position embeddings. If this is an upsampler prior,
         it must match the output dimension of the WaveNetConditioner.This is because the conditioning information
         from the previous level will be added to the token embeddings before being fed into the transformer layers.
-        For non-upsampler priors, this can be set independently. (model_dim == cond_embedding_dim is not strictly required, but it's common to keep them the same for simplicity).
+        For non-upsampler priors, this can be set independently. (model_dim == cond_embedding_dim is not strictly
+        required, but it's common to keep them the same for simplicity).
         @param num_heads The number of attention heads in the transformer encoder layers.
         @param num_layers The number of transformer encoder layers.
         @param dim_feedforward The dimensionality of the feedforward network model.
         @param max_seq_len The maximum sequence length the model can process.
+        @param max_time_steps The maximum number of time steps the model can process. This is used for the time
+        embedding and should be set based on the expected maximum length of the input sequences in terms of time steps
+        (chunks). Defaults to 500.
         @param is_upsampler Whether this prior is an upsampler (i.e., conditions on another prior's output).
         This is used to determine whether conditioning embeddings are expected. Defaults to False.
         @param cond_num_embeddings The vocabulary size for the conditioning input (if any).
@@ -81,15 +86,6 @@ class TransformerPriorConditioned(nn.Module):
         self.block_len = block_len
         self.dropout = dropout
 
-        # Embedding layers for tokens and positions        
-        self.token_embedding = nn.Embedding(num_embeddings, model_dim)
-        self.pos_embedding = nn.Embedding(max_seq_len, model_dim)
-
-        # Initialize the transformer layers
-        self._init_factored_transformer_layers()
-        self.norm = nn.LayerNorm(model_dim)
-        self.to_logits = nn.Linear(model_dim, num_embeddings, bias=False)
-
         # Initialize the conditioner if this is an upsampling prior
         self.is_upsampler = is_upsampler
         if self.is_upsampler:
@@ -103,6 +99,16 @@ class TransformerPriorConditioned(nn.Module):
                 upsample_stride=upsample_stride,
                 dropout=dropout,
             )
+
+        # Embedding layers for tokens and positions        
+        self.token_embedding = nn.Embedding(num_embeddings, model_dim)
+        self.pos_embedding = nn.Embedding(max_seq_len, model_dim)
+        self.time_embedding = nn.Embedding(max_time_steps, model_dim)
+
+        # Initialize the transformer layers
+        self._init_factored_transformer_layers()
+        self.norm = nn.LayerNorm(model_dim)
+        self.to_logits = nn.Linear(model_dim, num_embeddings, bias=False)
 
     def _init_factored_transformer_layers(self):
         """!
@@ -121,13 +127,23 @@ class TransformerPriorConditioned(nn.Module):
             ) for num_layer in range(self.num_layers)
         ])
 
-    def forward(self, indices: torch.Tensor, upper_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        indices: torch.Tensor,
+        upper_indices: Optional[torch.Tensor] = None,
+        time_ids: torch.Tensor = None
+    ) -> torch.Tensor:
         """
         Forward pass for the TransformerPriorConditioned model.
+
+        Architecture adapted from jukebox. We pass the input token indices through token and position embeddings, add
+        conditioning information if this is an upsampler prior, and then pass through a series of factored transformer
+        layers before projecting to logits over the vocabulary.
 
         @param indices The input token indices for the current level (shape: [batch_size, seq_len]).
         @param upper_indices The input token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
         This is used as conditioning information for upsampler priors. Defaults to None (no conditioning).
+        @param time_ids The time step IDs for each token position (shape: [batch_size, seq_len]). This is used for time embeddings.
         @return Logits over the vocabulary for the next token prediction (shape: [batch_size, seq_len, num_embeddings]).
         """
         if indices.ndim != 2:
@@ -142,6 +158,11 @@ class TransformerPriorConditioned(nn.Module):
 
         # base embeddings (tokens + position)
         x = self.token_embedding(indices) + self.pos_embedding(pos)
+
+        # Add time embeddings if time_ids are provided (for upsampler priors, this should help the model learn temporal structure)
+        if time_ids is not None:
+            t_emb = self.time_embedding(time_ids)
+            x = x + t_emb.expand(-1, seq_len, -1)
 
         if self.is_upsampler:
             if upper_indices is None:
@@ -195,6 +216,7 @@ class TransformerPriorConditioned(nn.Module):
         batch_size: int,
         start_tokens: Optional[torch.Tensor] = None,
         upper_indices: Optional[torch.Tensor] = None,
+        time_id: torch.Tensor = None,
         seq_len: int = 64,
         temperature: float = 1.0,  
         top_k: Optional[int] = None,
@@ -205,6 +227,7 @@ class TransformerPriorConditioned(nn.Module):
         @param batch_size The number of sequences to generate in parallel.
         @param start_tokens The initial input token indices (shape: [batch_size, initial_seq_len]). Defaults to None (start with a single token).
         @param upper_indices The input token indices from the upper level prior for conditioning (shape: [batch_size, upper_seq_len]). Defaults to None (no conditioning).
+        @param time_id The time ID for the current generation step. Defaults to None. This is used for time embeddings and should be provided when generating from an upsampler prior to help the model learn temporal structure.
         @param seq_len The length of the generated sequence (including the initial input). Defaults to 64.
         @param top_k The number of top logits to keep for sampling. If None or <= 0, no filtering is applied. Defaults to None.
         @paramm temperature The sampling temperature. Must be > 0. Defaults to 1.0.
@@ -235,7 +258,7 @@ class TransformerPriorConditioned(nn.Module):
         
         while tokens.shape[1] < seq_len:
             # Pass upper_indices during generation
-            logits = self.forward(tokens, upper_indices=upper_indices)
+            logits = self.forward(tokens, upper_indices=upper_indices, time_ids=time_id)
             
             next_logits = logits[:, -1, :] / temperature
             next_logits_filtered = self._top_k_filter(next_logits, top_k)
