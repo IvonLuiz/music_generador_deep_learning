@@ -46,10 +46,16 @@ class TransformerPriorConditioned(nn.Module):
         dim_feedforward: int,
         max_seq_len: int,
         block_len: int = 16,
+        max_time_steps: int = 500,
         is_upsampler: bool = False,
         cond_num_embeddings: Optional[int] = None,
         upsample_stride: Optional[int] = None,
-        max_time_steps: int = 500,
+        conditioner_residual_block_width: int = 1024,
+        conditioner_residual_blocks: int = 16,
+        conditioner_kernel_size: int = 3,
+        conditioner_conv_channels: int = 1024,
+        conditioner_dilation_growth_rate: int = 3,
+        conditioner_dilation_cycle: int = 8,
         dropout: float = 0.1,
     ):
         """!
@@ -74,6 +80,14 @@ class TransformerPriorConditioned(nn.Module):
         Comes from the output of the previous level prior. Defaults to None (no conditioning).
         @param cond_embedding_dim The dimensionality of the conditioning embeddings (if any).
         Comes from the output of the previous level prior. Defaults to None (no conditioning).
+        @param upsample_stride The stride for upsampling in the WaveNet conditioner. This is the ratio between the
+        input and output sequences of the conditioner. Defaults to None (no upsampling).
+        @param conditioner_residual_block_width The number of channels in the residual blocks of the WaveNet conditioner. Defaults to 1024.
+        @param conditioner_residual_blocks The number of residual blocks in the WaveNet conditioner. Defaults to 16.
+        @param conditioner_kernel_size The kernel size for the WaveNet conditioner. Defaults to 3.
+        @param conditioner_conv_channels The number of channels in the convolutional layers of the WaveNet conditioner. Defaults to 1024.
+        @param conditioner_dilation_growth_rate The rate at which the dilation factor grows in the WaveNet conditioner. Defaults to 3.
+        @param conditioner_dilation_cycle The cycle length for the dilation factors in the WaveNet conditioner. Defaults to 8.
         @param dropout The dropout probability. Defaults to 0.1.
         """
         super().__init__()
@@ -96,6 +110,12 @@ class TransformerPriorConditioned(nn.Module):
             self.conditioner = WaveNetConditioner(
                 num_embeddings=cond_num_embeddings,
                 embedding_dim=model_dim,
+                num_layers=conditioner_residual_blocks,
+                num_channels=conditioner_residual_block_width,
+                kernel_size=conditioner_kernel_size,
+                conv_channels=conditioner_conv_channels,
+                dilation_growth=conditioner_dilation_growth_rate,
+                dilation_cycle=conditioner_dilation_cycle,
                 upsample_stride=upsample_stride,
                 dropout=dropout,
             )

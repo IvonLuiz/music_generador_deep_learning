@@ -90,12 +90,13 @@ def train_transformer_prior(
     middle_model = load_jukebox_model(effective_middle_model_dir, 'middle', device, effective_weights_file)
     bottom_model = load_jukebox_model(effective_bottom_model_dir, 'bottom', device, effective_weights_file)
 
-    x_all, _ = load_maestro(dataset_cfg['processed_path'], dataset_cfg.get('target_time_frames', 256))
+    x_all, file_paths = load_maestro(dataset_cfg['processed_path'], dataset_cfg.get('target_time_frames', 256))
     print(f'Loaded data shape: {x_all.shape}')
 
     quant_batch_size = train_cfg.get('quantization_batch_size', 32)
     dataset = JukeboxHierarchicalQuantizedDataset(
         x_train=x_all,
+        file_paths=file_paths,
         top_model=top_model,
         middle_model=middle_model,
         bottom_model=bottom_model,
@@ -143,9 +144,10 @@ def train_transformer_prior(
     cond_level = COND_LEVEL[selected_level]
 
     is_upsampler = cond_level is not None
-    cond_num_embeddings = num_embeddings_map[cond_level] if is_upsampler else None
     upsample_stride = None
+    cond_num_embeddings = None
     if is_upsampler:
+        cond_num_embeddings = num_embeddings_map[cond_level]
         upsample_stride = _compute_stride(seq_lens[selected_level], seq_lens[cond_level], selected_level)
 
     prior = TransformerPriorConditioned(
@@ -159,6 +161,12 @@ def train_transformer_prior(
         is_upsampler=is_upsampler,
         cond_num_embeddings=cond_num_embeddings,
         upsample_stride=upsample_stride,
+        conditioner_residual_block_width=int(prior_cfg.get('conditioner_residual_block_width', 1024)),
+        conditioner_residual_blocks=int(prior_cfg.get('conditioner_residual_blocks', 16)),
+        conditioner_kernel_size=int(prior_cfg.get('conditioner_kernel_size', 3)),
+        conditioner_conv_channels=int(prior_cfg.get('conditioner_conv_channels', 1024)),
+        conditioner_dilation_growth_rate=int(prior_cfg.get('conditioner_dilation_growth_rate', 3)),
+        conditioner_dilation_cycle=int(prior_cfg.get('conditioner_dilation_cycle', 8)),
         dropout=float(prior_cfg.get('dropout', 0.1)),
     ).to(device)
 

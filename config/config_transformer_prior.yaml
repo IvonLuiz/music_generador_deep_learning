@@ -40,6 +40,14 @@ priors:
     dim_feedforward: 2048
     dropout: 0.1
     block_len: 32  # Because Bottom grid is 32x32
+    # condiditioner parameters
+    conditioner_residual_block_width: 1024
+    conditioner_residual_blocks: 16
+    conditioner_kernel_size: 3
+    conditioner_conv_channels: 1024
+    conditioner_dilation_growth_rate: 3
+    conditioner_dilation_cycle: 8
+    conditioner_upsample_stride: 4 # Because Bottom grid is 32x32 and Middle grid is 16x16, we need to upsample by a factor of 2 in
 
 training:
   batch_size: 16
