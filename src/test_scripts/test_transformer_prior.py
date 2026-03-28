@@ -19,7 +19,7 @@ from utils import load_config
 
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
 from generation.soundgenerator import SoundGenerator
-from processing.preprocess_audio import MIN_MAX_VALUES_SAVE_DIR, SAMPLE_RATE, HOP_LENGTH
+from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH
 from train_scripts.jukebox_utils import load_jukebox_model
 
 
@@ -115,11 +115,15 @@ def _save_indices(indices: np.ndarray, save_dir: str, name: str, grid: Optional[
     print(f'Saved generated {name} indices to {path}')
 
     if isinstance(grid, list) and len(grid) == 2 and int(grid[0]) * int(grid[1]) == indices.shape[1]:
-        h, w = int(grid[0]), int(grid[1])
+        # grid[0] is Time, grid[1] Frequency
+        time_steps, freq_bins = int(grid[0]), int(grid[1])
+
         vis_dir = os.path.join(save_dir, 'visualizations', name)
         os.makedirs(vis_dir, exist_ok=True)
         for i in range(indices.shape[0]):
-            img = indices[i].reshape(h, w)
+            # Reshape exactly as it was generated (Time, Freq), then transpose (.T) for the image (Freq, Time)
+            img = indices[i].reshape(time_steps, freq_bins).T
+            
             plt.figure(figsize=(5, 4))
             plt.imshow(img, origin='lower', aspect='auto')
             plt.colorbar()
@@ -175,21 +179,24 @@ def _decode_bottom_indices(
     if not (isinstance(grid, list) and len(grid) == 2):
         raise ValueError('Bottom grid is required to reshape indices into (H, W)')
 
-    h, w = int(grid[0]), int(grid[1])
-    if h * w != indices.shape[1]:
+    # grid[0] is now Time, grid[1] is now Frequency
+    time_steps, freq_bins = int(grid[0]), int(grid[1])
+    
+    if time_steps * freq_bins != indices.shape[1]:
         raise ValueError(f'Grid {grid} does not match seq_len={indices.shape[1]}')
 
-    idx_2d = indices.view(indices.shape[0], h, w).long().to(device)
+    # View as (Batch, Time, Freq), then transpose to (Batch, Freq, Time)
+    idx_2d = indices.view(indices.shape[0], time_steps, freq_bins).transpose(1, 2).contiguous().long().to(device)
+    
     vqvae.eval()
     with torch.no_grad():
-        emb = vqvae.vq.embedding[idx_2d]  # (B, H, W, D)
-        z_q = emb.permute(0, 3, 1, 2).contiguous()  # (B, D, H, W)
+        emb = vqvae.vq.embedding[idx_2d]  # (B, Freq, Time, D)
+        z_q = emb.permute(0, 3, 1, 2).contiguous()  # (B, D, Freq, Time)
         x_hat = vqvae.decoder(z_q)
         if vqvae.activation_layer is not None:
             x_hat = vqvae.activation_layer(x_hat)
 
     return x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()
-
 
 def test_transformer_prior(
     top_prior_path: str,
@@ -202,6 +209,7 @@ def test_transformer_prior(
     temperature: float,
     top_k: int,
     weights_file: str,
+    time_ids: Optional[torch.Tensor] = None,
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     top_k_value = top_k if (top_k is not None and top_k > 0) else None
@@ -210,6 +218,9 @@ def test_transformer_prior(
     top_prior, top_config, _ = load_transformer_prior('top', top_prior_path, device, weights_file)
     top_seq_len = int(top_config['model']['inferred_seq_lens']['top'])
     top_grid = top_config['model'].get('inferred_grids', {}).get('top')
+    
+    if time_ids is None:
+        time_ids=torch.zeros((num_samples, 1), dtype=torch.long, device=device)
 
     with torch.no_grad():
         top_tokens = top_prior.generate(
@@ -219,6 +230,7 @@ def test_transformer_prior(
             temperature=temperature,
             top_k=top_k_value,
             device=device,
+            time_id=time_ids,
         )
 
     print(f'Loading middle Transformer prior from {middle_prior_path}')
@@ -264,13 +276,11 @@ def test_transformer_prior(
     vqvae_cfg = bottom_config.get('vqvae', {}) if isinstance(bottom_config, dict) else {}
     effective_bottom_vqvae = bottom_vqvae_path or vqvae_cfg.get('bottom_model_dir')
     effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
+    min_max_values_path = bottom_config['dataset']['min_max_values_path']
 
     if effective_bottom_vqvae is not None:
         print(f'Loading bottom VQ-VAE from {effective_bottom_vqvae}')
         vqvae = load_jukebox_model(effective_bottom_vqvae, 'bottom', device, effective_weights_file)
-
-        if min_max_values_path is None:
-            min_max_values_path = os.path.join(MIN_MAX_VALUES_SAVE_DIR, 'min_max_values.pkl')
 
         if not os.path.exists(min_max_values_path):
             raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
