@@ -1,6 +1,7 @@
 import os
 import pickle
 import sys
+import soundfile as sf
 import yaml
 import argparse
 from datetime import datetime
@@ -8,10 +9,6 @@ from typing import Optional
 import numpy as np
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 # Add 'src' to sys.path to allow imports from sibling directories
@@ -23,7 +20,7 @@ from utils import load_maestro, load_config
 from train_scripts.jukebox_utils import load_jukebox_model
 from test_scripts.test_transformer_prior import load_transformer_prior
 from generation.soundgenerator import SoundGenerator
-from processing.preprocess_audio import MIN_MAX_VALUES_SAVE_DIR, SAMPLE_RATE, HOP_LENGTH
+from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH
 
 
 def _prepare_min_max_values(min_max_values: object, count: int) -> list:
@@ -59,6 +56,7 @@ def _save_decoded_spectrograms(specs: np.ndarray, save_dir: str) -> None:
         plt.tight_layout()
         plt.savefig(os.path.join(spec_dir, f'bottom_spec_{i:03d}.png'), dpi=150)
         plt.close()
+
 def _decode_bottom_indices(
     vqvae,
     indices: torch.Tensor,
@@ -70,36 +68,29 @@ def _decode_bottom_indices(
     if not (isinstance(grid, list) and len(grid) == 2):
         raise ValueError('Bottom grid is required to reshape indices into (H, W)')
 
-    h, w = int(grid[0]), int(grid[1]) # (frequency, time) dimensions of the spectrogram
-    if h * w != indices.shape[1]:
+    # grid[0] is now Time, grid[1] is now Frequency
+    time_steps, freq_bins = int(grid[0]), int(grid[1])
+    
+    if time_steps * freq_bins != indices.shape[1]:
         raise ValueError(f'Grid {grid} does not match seq_len={indices.shape[1]}')
 
-    idx_2d = indices.view(indices.shape[0], w, h).transpose(1, 2).contiguous().long().to(device)
+    # View as (Batch, Time, Freq), then transpose to (Batch, Freq, Time)
+    idx_2d = indices.view(indices.shape[0], time_steps, freq_bins).transpose(1, 2).contiguous().long().to(device)
+    
     vqvae.eval()
     with torch.no_grad():
-        emb = vqvae.vq.embedding[idx_2d]  # (B, H, W, D)
-        z_q = emb.permute(0, 3, 1, 2).contiguous()  # (B, D, H, W)
+        emb = vqvae.vq.embedding[idx_2d]  # (B, Freq, Time, D)
+        z_q = emb.permute(0, 3, 1, 2).contiguous()  # (B, D, Freq, Time)
         x_hat = vqvae.decoder(z_q)
         if vqvae.activation_layer is not None:
             x_hat = vqvae.activation_layer(x_hat)
 
     return x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()
 
-def extract_right_half(tokens_1d, grid):
-    """Reshapes 1D tokens to 2D, slices the right half of time, and flattens back."""
-    if tokens_1d is None: return None
-    h, w = int(grid[0]), int(grid[1])
-    # Reshape to (Batch, Height, Width)
-    tokens_2d = tokens_1d.reshape(tokens_1d.shape[0], h, w)
-    # Slice the right half of the width (Time)
-    right_half = tokens_2d[:, :, w//2:]
-    # Flatten back to 1D
-    return right_half.reshape(tokens_1d.shape[0], -1)
 
-
-bottom_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_bottom_transformer_prior/2026-03-24_04-45-45/config.yaml"
-middle_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_middle_transformer_prior/2026-03-24_04-01-47/config.yaml"
-top_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_top_transformer_prior/2026-03-24_03-48-41/config.yaml"
+bottom_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_bottom_transformer_prior/2026-03-27_06-29-03/config.yaml"
+middle_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_middle_transformer_prior/2026-03-27_05-13-16/config.yaml"
+top_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_top_transformer_prior/2026-03-27_04-26-48/config.yaml"
 
 config_top = load_config(top_transformer_prior_config_path)
 config_middle = load_config(middle_transformer_prior_config_path)
@@ -118,6 +109,9 @@ middle_grid = middle_config['model'].get('inferred_grids', {}).get('middle')
 bottom_prior, bottom_config, _ = load_transformer_prior('bottom', bottom_transformer_prior_config_path, device)
 bottom_seq_len = int(bottom_config['model']['inferred_seq_lens']['bottom'])
 bottom_grid = bottom_config['model'].get('inferred_grids', {}).get('bottom')
+min_max_values_path = bottom_config['dataset'].get('min_max_values_path')
+if not os.path.exists(min_max_values_path):
+    raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
 
 vqvae_bottom_decoder = load_jukebox_model(
     bottom_config['vqvae']['bottom_model_dir'],
@@ -134,9 +128,10 @@ temperature = 1.0
 top_k = None
 
 ## loop until generated amount of audio is reached, generating in blocks of top_seq_len and using the last part of the previous block as context for the next block
-chunks_to_generate = 10  # Example value
+chunks_to_generate = 3  # Example value
 
 curr_start_token = None
+current_time_id = torch.tensor([0], dtype=torch.long).to(device)  # Start with time_id=0 for the first block
 top_tokens_list = []
 for chunk in range(chunks_to_generate):
     with torch.no_grad():
@@ -144,6 +139,7 @@ for chunk in range(chunks_to_generate):
             batch_size=1,
             start_tokens=curr_start_token,
             upper_indices=None,
+            time_id=current_time_id,
             seq_len=top_seq_len,
             temperature=temperature,  
             top_k=top_k,
@@ -268,10 +264,6 @@ print("Spectrogram reconstruction and crossfading complete. Final spectrogram sh
 
 current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 save_dir = os.path.join('samples', 'transformer_hierarchical_generated', current_time)
-min_max_values_path = os.path.join(MIN_MAX_VALUES_SAVE_DIR, 'min_max_values.pkl')
-
-if not os.path.exists(min_max_values_path):
-    raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
 
 with open(min_max_values_path, 'rb') as f:
     min_max_values = pickle.load(f)
@@ -280,7 +272,6 @@ _save_decoded_spectrograms(final_spectrogram, save_dir)
 min_max_list = _prepare_min_max_values(min_max_values, final_spectrogram.shape[0])
 
 audio_method = 'griffinlim'  # or 'neural_vocoder'
-import soundfile as sf
 sound_generator = SoundGenerator(vqvae_bottom_decoder, hop_length=HOP_LENGTH)
 audio_signals = sound_generator.convert_spectrograms_to_audio(
     final_spectrogram, min_max_list, method=audio_method
