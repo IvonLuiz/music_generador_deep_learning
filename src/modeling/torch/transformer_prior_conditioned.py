@@ -181,8 +181,10 @@ class TransformerPriorConditioned(nn.Module):
 
         # Add time embeddings if time_ids are provided (for upsampler priors, this should help the model learn temporal structure)
         if time_ids is not None:
-            t_emb = self.time_embedding(time_ids)
-            x = x + t_emb.expand(-1, seq_len, -1)
+            time_ids = time_ids.view(batch_size)    # (batch,)
+            t_emb = self.time_embedding(time_ids)   # (batch, model_dim)
+            t_emb = t_emb.unsqueeze(1)              # (batch, 1, model_dim) to add to each token position
+            x = x + t_emb.expand(-1, seq_len, -1)   # (batch, seq_len, model_dim) broadcast addition of time embedding to each token position
 
         if self.is_upsampler:
             if upper_indices is None:
