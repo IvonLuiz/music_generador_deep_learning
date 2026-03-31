@@ -148,7 +148,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                 samples = np.stack(samples)
             else:
                 samples = x_val[:4]
-            sample_paths = val_file_paths[:4]
+            sample_paths = val_file_paths[:4] if val_file_paths else None
         else:
             if isinstance(dataset, Dataset):
                 samples = []
@@ -159,7 +159,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                 samples = np.stack(samples)
             else:
                 samples = x_train[:4]
-            sample_paths = train_file_paths[:4]
+            sample_paths = train_file_paths[:4] if train_file_paths else None
         
         spectrograms_dir = os.path.dirname(sample_paths[0])
         sample_min_max = []
@@ -388,6 +388,17 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
     val_dataloader = None
     val_dataset = None
 
+    def _loader_kwargs():
+        kwargs = {
+            'num_workers': num_workers,
+            'pin_memory': pin_memory,
+        }
+        if num_workers > 0:
+            kwargs['persistent_workers'] = persist_workers
+            if prefetch_factor is not None:
+                kwargs['prefetch_factor'] = prefetch_factor
+        return kwargs
+
     if x_val is not None:
         if isinstance(x_val, (np.ndarray, list)):
             if len(x_val) > 0:
@@ -395,8 +406,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                 val_dataset = SpectrogramDataset(x_val)
                 val_dataloader = DataLoader(
                     val_dataset, batch_size=batch_size, shuffle=False,
-                    num_workers=num_workers, pin_memory=pin_memory,
-                    persistent_workers=persist_workers, prefetch_factor=prefetch_factor,
+                    **_loader_kwargs(),
                 )
                 early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
         else:
@@ -405,8 +415,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
             val_dataset = x_val
             val_dataloader = DataLoader(
                 val_dataset, batch_size=batch_size, shuffle=False,
-                num_workers=num_workers, pin_memory=pin_memory,
-                persistent_workers=persist_workers, prefetch_factor=prefetch_factor,
+                **_loader_kwargs(),
             )
             early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
     
@@ -420,9 +429,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
         
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=pin_memory,
-        persistent_workers=persist_workers, # Each worker fetches 4 batches in advance (8 * 4 = 32 batches ready in RAM)
-        prefetch_factor=prefetch_factor,
+        **_loader_kwargs(),
     )
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -474,7 +481,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                 samples = np.stack(samples)
             else:
                 samples = x_val[:4]
-            sample_paths = val_file_paths[:4]
+            sample_paths = val_file_paths[:4] if val_file_paths else None
         else:
             if isinstance(dataset, Dataset):
                 samples = []
@@ -485,9 +492,8 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                 samples = np.stack(samples)
             else:
                 samples = x_train[:4]
-            sample_paths = train_file_paths[:4]
-        
-        spectrograms_dir = os.path.dirname(sample_paths[0])
+            sample_paths = train_file_paths[:4] if train_file_paths else None
+
         sample_min_max = []
         for fp in sample_paths:
             mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
