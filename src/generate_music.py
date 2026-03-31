@@ -2,10 +2,8 @@ import os
 import pickle
 import sys
 import soundfile as sf
-import yaml
-import argparse
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 import numpy as np
 
 import torch
@@ -40,6 +38,62 @@ def _prepare_min_max_values(min_max_values: object, count: int) -> list:
     repeats = (count + len(values) - 1) // len(values)
     tiled = (values * repeats)[:count]
     return tiled
+
+
+def _generate_level_tokens(
+    prior,
+    seq_len: int,
+    chunks_to_generate: int,
+    device: torch.device,
+    temperature: float,
+    top_k: Optional[int],
+    upper_tokens_list: Optional[List[np.ndarray]] = None,
+    use_time_id: bool = False,
+) -> List[np.ndarray]:
+    token_blocks = []
+    curr_start_token = None
+    current_time_id = torch.tensor([0], dtype=torch.long).to(device) if use_time_id else None
+
+    for chunk in range(chunks_to_generate):
+        upper_indices = None
+        if upper_tokens_list is not None:
+            upper_indices = torch.from_numpy(upper_tokens_list[chunk]).to(device)
+
+        generate_kwargs = {
+            'batch_size': 1,
+            'start_tokens': curr_start_token,
+            'upper_indices': upper_indices,
+            'seq_len': seq_len,
+            'temperature': temperature,
+            'top_k': top_k,
+            'device': device,
+        }
+        if use_time_id:
+            generate_kwargs['time_id'] = current_time_id
+
+        with torch.no_grad():
+            tokens = prior.generate(**generate_kwargs).cpu().numpy()
+
+        overlap_len = seq_len // 2
+        curr_start_token = torch.from_numpy(tokens[:, -overlap_len:]).to(device)
+        token_blocks.append(tokens)
+
+    return token_blocks
+
+
+def _decode_bottom_blocks(
+    vqvae,
+    bottom_tokens_list: List[np.ndarray],
+    bottom_grid: Optional[list],
+    device: torch.device,
+) -> List[np.ndarray]:
+    reconstructed_spectrograms = []
+    for bottom_tokens in bottom_tokens_list:
+        bottom_tokens_tensor = torch.from_numpy(bottom_tokens).to(device)
+        with torch.no_grad():
+            decoded_specs = _decode_bottom_indices(vqvae, bottom_tokens_tensor, bottom_grid, device)
+        reconstructed_spectrograms.append(decoded_specs)
+    return reconstructed_spectrograms
 
 def _save_decoded_spectrograms(specs: np.ndarray, save_dir: str) -> None:
     spec_dir = os.path.join(save_dir, 'spectrograms')
@@ -123,83 +177,51 @@ vqvae_bottom_decoder.eval()
 
 
 # Step 1: Top-Level Unrolling (The Composer)
-## TODO: remove hardcoded generation parameters and make them configurable
+# TODO: remove hardcoded generation parameters and make them configurable
 temperature = 1.0
 top_k = None
 
-## loop until generated amount of audio is reached, generating in blocks of top_seq_len and using the last part of the previous block as context for the next block
+# Loop until generated amount of audio is reached, generating in blocks and
+# using the tail of each block as context for the next block.
 chunks_to_generate = 3  # Example value
 
-curr_start_token = None
-current_time_id = torch.tensor([0], dtype=torch.long).to(device)  # Start with time_id=0 for the first block
-top_tokens_list = []
-for chunk in range(chunks_to_generate):
-    with torch.no_grad():
-        top_tokens = top_prior.generate(
-            batch_size=1,
-            start_tokens=curr_start_token,
-            upper_indices=None,
-            time_id=current_time_id,
-            seq_len=top_seq_len,
-            temperature=temperature,  
-            top_k=top_k,
-            device=device,  
-        ).cpu().numpy()
-
-    ## overlap extract 
-    ### take second half of the current tokens 
-    ### and use it as the start tokens for the next level's generation
-    overlap_len = top_seq_len // 2
-    curr_start_token = top_tokens[:, -overlap_len:]
-    curr_start_token = torch.from_numpy(curr_start_token).to(device)
-    top_tokens_list.append(top_tokens)
+top_tokens_list = _generate_level_tokens(
+    prior=top_prior,
+    seq_len=top_seq_len,
+    chunks_to_generate=chunks_to_generate,
+    device=device,
+    temperature=temperature,
+    top_k=top_k,
+    upper_tokens_list=None,
+    use_time_id=True,
+)
 
 print("Top-level generation complete. Generated tokens for each block have shape:", top_tokens_list[0].shape if top_tokens_list else None)
 
 # Step 2: Hierarchical Upsampling (The Performers)
-curr_start_token = None
-middle_tokens_list = []
-for chunk in range(chunks_to_generate):
-    curr_top_tokens = torch.from_numpy(top_tokens_list[chunk]).to(device)
-    
-    middle_tokens = middle_prior.generate(
-        batch_size=1,
-        start_tokens=curr_start_token,  # Use the last part of the previous block as context
-        upper_indices=curr_top_tokens,
-        seq_len=middle_seq_len,
-        temperature=temperature,
-        top_k=top_k,
-        device=device,
-    ).cpu().numpy()
-    
-    ## overlap extract for middle tokens to use as context for the next block
-    overlap_len = middle_seq_len // 2
-    curr_start_token = middle_tokens[:, -overlap_len:]
-    curr_start_token = torch.from_numpy(curr_start_token).to(device)
-    middle_tokens_list.append(middle_tokens)
+middle_tokens_list = _generate_level_tokens(
+    prior=middle_prior,
+    seq_len=middle_seq_len,
+    chunks_to_generate=chunks_to_generate,
+    device=device,
+    temperature=temperature,
+    top_k=top_k,
+    upper_tokens_list=top_tokens_list,
+    use_time_id=False,
+)
     
 print("Middle-level generation complete. Generated tokens for each block have shape:", middle_tokens_list[0].shape if middle_tokens_list else None)
 
-curr_start_token = None
-bottom_tokens_list = []
-for chunk in range(chunks_to_generate):
-    curr_middle_tokens = torch.from_numpy(middle_tokens_list[chunk]).to(device)
-    
-    bottom_tokens = bottom_prior.generate(
-        batch_size=1,
-        start_tokens=curr_start_token,  # Use the last part of the previous block as context
-        upper_indices=curr_middle_tokens,
-        seq_len=bottom_seq_len,
-        temperature=temperature,
-        top_k=top_k,
-        device=device,
-    ).cpu().numpy()
-    
-    ## overlap extract for bottom tokens to use as context for the next block
-    overlap_len = bottom_seq_len // 2
-    curr_start_token = bottom_tokens[:, -overlap_len:]
-    curr_start_token = torch.from_numpy(curr_start_token).to(device)
-    bottom_tokens_list.append(bottom_tokens)
+bottom_tokens_list = _generate_level_tokens(
+    prior=bottom_prior,
+    seq_len=bottom_seq_len,
+    chunks_to_generate=chunks_to_generate,
+    device=device,
+    temperature=temperature,
+    top_k=top_k,
+    upper_tokens_list=middle_tokens_list,
+    use_time_id=False,
+)
 
 print("Generation complete. Bottom tokens length:", len(bottom_tokens_list),
       "with each block having shape:", bottom_tokens_list[0].shape if bottom_tokens_list else None)
@@ -240,12 +262,12 @@ def linear_crossfading(spec_chunk_1, spec_chunk_2, overlap_len):
     ], axis=2)
     return combined
 
-reconstructed_spectrograms = []
-for bottom_tokens in bottom_tokens_list:
-    bottom_tokens_tensor = torch.from_numpy(bottom_tokens).to(device)
-    with torch.no_grad():
-        decoded_specs = _decode_bottom_indices(vqvae_bottom_decoder, bottom_tokens_tensor, bottom_grid, device)
-    reconstructed_spectrograms.append(decoded_specs)
+reconstructed_spectrograms = _decode_bottom_blocks(
+    vqvae=vqvae_bottom_decoder,
+    bottom_tokens_list=bottom_tokens_list,
+    bottom_grid=bottom_grid,
+    device=device,
+)
 print("Decoded spectrograms for all blocks. Each block has shape:", reconstructed_spectrograms[0].shape if reconstructed_spectrograms else None)
 
 final_spectrogram = reconstructed_spectrograms[0].copy()
