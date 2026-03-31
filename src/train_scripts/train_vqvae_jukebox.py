@@ -170,6 +170,7 @@ if __name__ == "__main__":
     config_to_save['training']['pretrained_weights_path'] = pretrained_weights_path
     config_to_save['model'] = dict(config['model'])
     config_to_save['model']['selected_level'] = selected_level
+    config_to_save['dataset'] = dict(config['dataset'])
 
     with open(config_file_path, 'w') as f:
         yaml.dump(config_to_save, f)

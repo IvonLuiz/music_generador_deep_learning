@@ -76,9 +76,10 @@ def train_transformer_prior(
     dataset_cfg = config['dataset']
     vqvae_cfg = config['vqvae']
     transformer_cfg = config.setdefault('model', {})
-    train_cfg = config['training']
-
     selected_level = parse_level(level_override or transformer_cfg.get('selected_level', 'top'))
+    train_general_cfg = config['training']
+    train_prior_cfg = config['training'][LEVEL_TO_PRIOR_CFG[selected_level]]
+    train_cfg = {**train_general_cfg, **train_prior_cfg}  # Prior-specific settings override general settings
     transformer_cfg['selected_level'] = selected_level
 
     effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
@@ -158,6 +159,7 @@ def train_transformer_prior(
         dim_feedforward=int(prior_cfg['dim_feedforward']),
         max_seq_len=seq_lens[selected_level],
         block_len=int(prior_cfg.get('block_len', 16)),
+        max_time_steps=int(prior_cfg.get('max_time_steps', 500)),
         is_upsampler=is_upsampler,
         cond_num_embeddings=cond_num_embeddings,
         upsample_stride=upsample_stride,
