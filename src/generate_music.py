@@ -2,6 +2,8 @@ import os
 import pickle
 import sys
 import soundfile as sf
+import argparse
+import random
 from datetime import datetime
 from typing import Optional, List
 import numpy as np
@@ -21,6 +23,11 @@ from generation.soundgenerator import SoundGenerator
 from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH
 
 
+DEFAULT_TOP_RUN_ROOT = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_top_transformer_prior"
+DEFAULT_MIDDLE_RUN_ROOT = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_middle_transformer_prior"
+DEFAULT_BOTTOM_RUN_ROOT = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_bottom_transformer_prior"
+
+
 def _prepare_min_max_values(min_max_values: object, count: int) -> list:
     if isinstance(min_max_values, dict):
         values = list(min_max_values.values())
@@ -38,6 +45,49 @@ def _prepare_min_max_values(min_max_values: object, count: int) -> list:
     repeats = (count + len(values) - 1) // len(values)
     tiled = (values * repeats)[:count]
     return tiled
+
+
+def _resolve_latest_config_path(run_root: str, level_name: str) -> str:
+    if os.path.isfile(run_root):
+        return run_root
+
+    if not os.path.isdir(run_root):
+        raise FileNotFoundError(f"{level_name} run root does not exist: {run_root}")
+
+    direct_cfg = os.path.join(run_root, 'config.yaml')
+    if os.path.isfile(direct_cfg):
+        return direct_cfg
+
+    candidates = []
+    for entry in os.listdir(run_root):
+        entry_path = os.path.join(run_root, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        cfg_path = os.path.join(entry_path, 'config.yaml')
+        if os.path.isfile(cfg_path):
+            candidates.append(cfg_path)
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No config.yaml found in {run_root} for level {level_name}."
+        )
+
+    return max(candidates, key=os.path.getmtime)
+
+
+def _resolve_prior_config_path(
+    explicit_path: Optional[str],
+    default_run_root: str,
+    level_name: str,
+) -> str:
+    if explicit_path:
+        if not os.path.exists(explicit_path):
+            raise FileNotFoundError(f"{level_name} config path not found: {explicit_path}")
+        if os.path.isdir(explicit_path):
+            return _resolve_latest_config_path(explicit_path, level_name)
+        return explicit_path
+
+    return _resolve_latest_config_path(default_run_root, level_name)
 
 
 def _generate_level_tokens(
@@ -142,96 +192,44 @@ def _decode_bottom_indices(
     return x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()
 
 
-bottom_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_bottom_transformer_prior/2026-03-27_06-29-03/config.yaml"
-middle_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_middle_transformer_prior/2026-03-27_05-13-16/config.yaml"
-top_transformer_prior_config_path = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_top_transformer_prior/2026-03-27_04-26-48/config.yaml"
+def main():
+    parser = argparse.ArgumentParser(description='Generate music from hierarchical transformer priors.')
+    parser.add_argument('--top_config', type=str, default=None, help='Path to top prior config.yaml or run directory')
+    parser.add_argument('--middle_config', type=str, default=None, help='Path to middle prior config.yaml or run directory')
+    parser.add_argument('--bottom_config', type=str, default=None, help='Path to bottom prior config.yaml or run directory')
+    parser.add_argument('--top_run_root', type=str, default=DEFAULT_TOP_RUN_ROOT, help='Default top run root used when --top_config is not provided')
+    parser.add_argument('--middle_run_root', type=str, default=DEFAULT_MIDDLE_RUN_ROOT, help='Default middle run root used when --middle_config is not provided')
+    parser.add_argument('--bottom_run_root', type=str, default=DEFAULT_BOTTOM_RUN_ROOT, help='Default bottom run root used when --bottom_config is not provided')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature for all priors')
+    parser.add_argument('--top_k', type=int, default=None, help='Top-k sampling (None disables top-k)')
+    parser.add_argument('--chunks_to_generate', type=int, default=3, help='Number of chunks to generate')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible generation (set to negative to disable)')
+    parser.add_argument('--audio_method', type=str, default='griffinlim', choices=['griffinlim', 'istft'], help='Spectrogram inversion method')
+    parser.add_argument('--save_root', type=str, default='samples/transformer_hierarchical_generated', help='Root directory for generated outputs')
+    args = parser.parse_args()
 
-config_top = load_config(top_transformer_prior_config_path)
-config_middle = load_config(middle_transformer_prior_config_path)
-config_bottom = load_config(bottom_transformer_prior_config_path)
+    if args.seed is not None and args.seed < 0:
+        args.seed = None
+    _set_seed(args.seed)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-top_prior, top_config, _ = load_transformer_prior('top', top_transformer_prior_config_path, device)
-top_seq_len = int(top_config['model']['inferred_seq_lens']['top'])
-top_grid = top_config['model'].get('inferred_grids', {}).get('top')
-
-middle_prior, middle_config, _ = load_transformer_prior('middle', middle_transformer_prior_config_path, device)
-middle_seq_len = int(middle_config['model']['inferred_seq_lens']['middle'])
-middle_grid = middle_config['model'].get('inferred_grids', {}).get('middle')
-
-bottom_prior, bottom_config, _ = load_transformer_prior('bottom', bottom_transformer_prior_config_path, device)
-bottom_seq_len = int(bottom_config['model']['inferred_seq_lens']['bottom'])
-bottom_grid = bottom_config['model'].get('inferred_grids', {}).get('bottom')
-min_max_values_path = bottom_config['dataset'].get('min_max_values_path')
-if not os.path.exists(min_max_values_path):
-    raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
-
-vqvae_bottom_decoder = load_jukebox_model(
-    bottom_config['vqvae']['bottom_model_dir'],
-    'bottom',
-    device,
-    bottom_config['vqvae']['weights_file'],
-    )
-vqvae_bottom_decoder.eval()
+    save_dir = generate_hierarchical_music(args)
+    print(f'Done! Saved generated samples to {save_dir}')
 
 
-# Step 1: Top-Level Unrolling (The Composer)
-# TODO: remove hardcoded generation parameters and make them configurable
-temperature = 1.0
-top_k = None
+def _set_seed(seed: Optional[int]) -> None:
+    if seed is None:
+        return
 
-# Loop until generated amount of audio is reached, generating in blocks and
-# using the tail of each block as context for the next block.
-chunks_to_generate = 3  # Example value
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f'Using deterministic seed: {seed}')
 
-top_tokens_list = _generate_level_tokens(
-    prior=top_prior,
-    seq_len=top_seq_len,
-    chunks_to_generate=chunks_to_generate,
-    device=device,
-    temperature=temperature,
-    top_k=top_k,
-    upper_tokens_list=None,
-    use_time_id=True,
-)
 
-print("Top-level generation complete. Generated tokens for each block have shape:", top_tokens_list[0].shape if top_tokens_list else None)
-
-# Step 2: Hierarchical Upsampling (The Performers)
-middle_tokens_list = _generate_level_tokens(
-    prior=middle_prior,
-    seq_len=middle_seq_len,
-    chunks_to_generate=chunks_to_generate,
-    device=device,
-    temperature=temperature,
-    top_k=top_k,
-    upper_tokens_list=top_tokens_list,
-    use_time_id=False,
-)
-    
-print("Middle-level generation complete. Generated tokens for each block have shape:", middle_tokens_list[0].shape if middle_tokens_list else None)
-
-bottom_tokens_list = _generate_level_tokens(
-    prior=bottom_prior,
-    seq_len=bottom_seq_len,
-    chunks_to_generate=chunks_to_generate,
-    device=device,
-    temperature=temperature,
-    top_k=top_k,
-    upper_tokens_list=middle_tokens_list,
-    use_time_id=False,
-)
-
-print("Generation complete. Bottom tokens length:", len(bottom_tokens_list),
-      "with each block having shape:", bottom_tokens_list[0].shape if bottom_tokens_list else None)
-print("Decoding bottom tokens into spectrograms...")
-
-# At this point, bottom_tokens_list contains the generated token indices for each block, which can be decoded back
-# into spectrograms using the VQ-VAE decoder. The overlapping regions between blocks can be blended together using
-# a linear crossfade to create a seamless spectrogram, which can then be inverted back to audio using Griffin-Lim or a neural vocoder.
-
-# Step 3: Spectrogram Crossfading (The Audio Engineer)
 def linear_crossfading(spec_chunk_1, spec_chunk_2, overlap_len):
     """
     Linearly crossfade between two spectrogram chunks over the specified overlap length
@@ -262,45 +260,122 @@ def linear_crossfading(spec_chunk_1, spec_chunk_2, overlap_len):
     ], axis=2)
     return combined
 
-reconstructed_spectrograms = _decode_bottom_blocks(
-    vqvae=vqvae_bottom_decoder,
-    bottom_tokens_list=bottom_tokens_list,
-    bottom_grid=bottom_grid,
-    device=device,
-)
-print("Decoded spectrograms for all blocks. Each block has shape:", reconstructed_spectrograms[0].shape if reconstructed_spectrograms else None)
 
-final_spectrogram = reconstructed_spectrograms[0].copy()
-overlap_option = "none"  # or "linear_crossfade"
-for i in range(1, len(reconstructed_spectrograms)):
-    next_chunk = reconstructed_spectrograms[i].copy() # (Batch, Freq, Time, Channels)
-    
-    # The overlap is ALWAYS exactly half of the incoming chunk
-    overlap_frames = next_chunk.shape[2] // 2
-    final_spectrogram = linear_crossfading(final_spectrogram, next_chunk, overlap_frames)
+def generate_hierarchical_music(args) -> str:
+    top_transformer_prior_config_path = _resolve_prior_config_path(args.top_config, args.top_run_root, 'top')
+    middle_transformer_prior_config_path = _resolve_prior_config_path(args.middle_config, args.middle_run_root, 'middle')
+    bottom_transformer_prior_config_path = _resolve_prior_config_path(args.bottom_config, args.bottom_run_root, 'bottom')
 
-print("Spectrogram reconstruction and crossfading complete. Final spectrogram shape:", final_spectrogram.shape)
+    print(f'Top config: {top_transformer_prior_config_path}')
+    print(f'Middle config: {middle_transformer_prior_config_path}')
+    print(f'Bottom config: {bottom_transformer_prior_config_path}')
 
-# Step 4: Spectrogram Inversion (The Mastering Engineer)
-# The blended spectrograms can now be inverted back to audio using Griffin-Lim or a neural vocoder. This step is not implemented here, but libraries like librosa (for Griffin-Lim) or pretrained neural vocoders can be used for this purpose.
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-save_dir = os.path.join('samples', 'transformer_hierarchical_generated', current_time)
+    # Load the three trained priors.
+    top_prior, top_config, _ = load_transformer_prior('top', top_transformer_prior_config_path, device)
+    middle_prior, middle_config, _ = load_transformer_prior('middle', middle_transformer_prior_config_path, device)
+    bottom_prior, bottom_config, _ = load_transformer_prior('bottom', bottom_transformer_prior_config_path, device)
 
-with open(min_max_values_path, 'rb') as f:
-    min_max_values = pickle.load(f)
+    top_seq_len = int(top_config['model']['inferred_seq_lens']['top'])
+    middle_seq_len = int(middle_config['model']['inferred_seq_lens']['middle'])
+    bottom_seq_len = int(bottom_config['model']['inferred_seq_lens']['bottom'])
+    bottom_grid = bottom_config['model'].get('inferred_grids', {}).get('bottom')
 
-_save_decoded_spectrograms(final_spectrogram, save_dir)
-min_max_list = _prepare_min_max_values(min_max_values, final_spectrogram.shape[0])
+    min_max_values_path = bottom_config['dataset'].get('min_max_values_path')
+    if not os.path.exists(min_max_values_path):
+        raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
 
-audio_method = 'griffinlim'  # or 'neural_vocoder'
-sound_generator = SoundGenerator(vqvae_bottom_decoder, hop_length=HOP_LENGTH)
-audio_signals = sound_generator.convert_spectrograms_to_audio(
-    final_spectrogram, min_max_list, method=audio_method
-)
+    vqvae_bottom_decoder = load_jukebox_model(
+        bottom_config['vqvae']['bottom_model_dir'],
+        'bottom',
+        device,
+        bottom_config['vqvae']['weights_file'],
+    )
+    vqvae_bottom_decoder.eval()
 
-audio_dir = os.path.join(save_dir, 'audio')
-os.makedirs(audio_dir, exist_ok=True)
-for i, signal in enumerate(audio_signals):
-    sf.write(os.path.join(audio_dir, f'sample_{i}.wav'), signal, SAMPLE_RATE)
-print(f'Done! Saved generated samples to {save_dir}')
+    # Step 1: Top-Level Unrolling (The Composer)
+    # Generate global structure block-by-block, carrying overlap context.
+    top_tokens_list = _generate_level_tokens(
+        prior=top_prior,
+        seq_len=top_seq_len,
+        chunks_to_generate=args.chunks_to_generate,
+        device=device,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        upper_tokens_list=None,
+        use_time_id=True,
+    )
+    print('Top-level generation complete. Generated tokens for each block have shape:', top_tokens_list[0].shape if top_tokens_list else None)
+
+    # Step 2: Hierarchical Upsampling (The Performers)
+    # Middle prior conditions on top tokens, then bottom prior on middle tokens.
+    middle_tokens_list = _generate_level_tokens(
+        prior=middle_prior,
+        seq_len=middle_seq_len,
+        chunks_to_generate=args.chunks_to_generate,
+        device=device,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        upper_tokens_list=top_tokens_list,
+        use_time_id=False,
+    )
+    print('Middle-level generation complete. Generated tokens for each block have shape:', middle_tokens_list[0].shape if middle_tokens_list else None)
+
+    bottom_tokens_list = _generate_level_tokens(
+        prior=bottom_prior,
+        seq_len=bottom_seq_len,
+        chunks_to_generate=args.chunks_to_generate,
+        device=device,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        upper_tokens_list=middle_tokens_list,
+        use_time_id=False,
+    )
+    print('Generation complete. Bottom tokens length:', len(bottom_tokens_list),
+          'with each block having shape:', bottom_tokens_list[0].shape if bottom_tokens_list else None)
+    print('Decoding bottom tokens into spectrograms...')
+
+    # Step 3: Spectrogram Crossfading (The Audio Engineer)
+    # Decode each chunk then crossfade overlaps to remove block boundaries.
+    reconstructed_spectrograms = _decode_bottom_blocks(
+        vqvae=vqvae_bottom_decoder,
+        bottom_tokens_list=bottom_tokens_list,
+        bottom_grid=bottom_grid,
+        device=device,
+    )
+    print('Decoded spectrograms for all blocks. Each block has shape:', reconstructed_spectrograms[0].shape if reconstructed_spectrograms else None)
+
+    final_spectrogram = reconstructed_spectrograms[0].copy()
+    for i in range(1, len(reconstructed_spectrograms)):
+        next_chunk = reconstructed_spectrograms[i].copy()  # (Batch, Freq, Time, Channels)
+        overlap_frames = next_chunk.shape[2] // 2
+        final_spectrogram = linear_crossfading(final_spectrogram, next_chunk, overlap_frames)
+    print('Spectrogram reconstruction and crossfading complete. Final spectrogram shape:', final_spectrogram.shape)
+
+    # Step 4: Spectrogram Inversion (The Mastering Engineer)
+    # Convert final spectrograms back to audio and save all artifacts.
+    current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    save_dir = os.path.join(args.save_root, current_time)
+
+    with open(min_max_values_path, 'rb') as f:
+        min_max_values = pickle.load(f)
+
+    _save_decoded_spectrograms(final_spectrogram, save_dir)
+    min_max_list = _prepare_min_max_values(min_max_values, final_spectrogram.shape[0])
+
+    sound_generator = SoundGenerator(vqvae_bottom_decoder, hop_length=HOP_LENGTH)
+    audio_signals = sound_generator.convert_spectrograms_to_audio(
+        final_spectrogram, min_max_list, method=args.audio_method
+    )
+
+    audio_dir = os.path.join(save_dir, 'audio')
+    os.makedirs(audio_dir, exist_ok=True)
+    for i, signal in enumerate(audio_signals):
+        sf.write(os.path.join(audio_dir, f'sample_{i}.wav'), signal, SAMPLE_RATE)
+
+    return save_dir
+
+
+if __name__ == '__main__':
+    main()
