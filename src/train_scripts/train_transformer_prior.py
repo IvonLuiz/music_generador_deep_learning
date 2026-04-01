@@ -4,6 +4,7 @@ import yaml
 import argparse
 from datetime import datetime
 from typing import Optional
+import math
 
 import torch
 import torch.nn as nn
@@ -177,8 +178,18 @@ def train_transformer_prior(
 
     optimizer = optim.AdamW(prior.parameters(), lr=float(train_cfg['learning_rate']), weight_decay=float(train_cfg.get('weight_decay', 0.01)))
 
+    grad_accum_steps = int(train_cfg.get('gradient_accumulation_steps', 1))
+    if grad_accum_steps < 1:
+        raise ValueError(f"gradient_accumulation_steps must be >= 1, got {grad_accum_steps}")
+    effective_batch_size = int(train_cfg['batch_size']) * grad_accum_steps
+    print(
+        f"Gradient accumulation: {grad_accum_steps} step(s) "
+        f"(micro_batch={int(train_cfg['batch_size'])}, effective_batch={effective_batch_size})"
+    )
+
     # Warmup for the first ~5% of total training steps
-    total_steps = len(train_loader) * epochs
+    optimizer_steps_per_epoch = max(1, math.ceil(len(train_loader) / grad_accum_steps))
+    total_steps = optimizer_steps_per_epoch * epochs
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=float(train_cfg['learning_rate']),
@@ -228,9 +239,10 @@ def train_transformer_prior(
     for epoch in range(epochs):
         prior.train()
         running_loss = 0.0
+        optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs} [Train:{selected_level}]')
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             top_indices = batch[0].to(device)
             mid_indices = batch[1].to(device)
             bot_indices = batch[2].to(device)
@@ -247,23 +259,30 @@ def train_transformer_prior(
 
             target_seq = target_indices.view(target_indices.shape[0], -1)
             cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
-            optimizer.zero_grad()
 
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
                     loss = prior.loss(target_seq, upper_indices=cond_seq)
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer) # unscale the gradients back to their original values before clipping
-                torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                loss_to_backward = loss / grad_accum_steps
+                scaler.scale(loss_to_backward).backward()
             else:
                 loss = prior.loss(target_seq, upper_indices=cond_seq)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
-                optimizer.step()
+                loss_to_backward = loss / grad_accum_steps
+                loss_to_backward.backward()
 
-            scheduler.step()
+            should_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == len(train_loader))
+            if should_step:
+                if use_amp:
+                    scaler.unscale_(optimizer) # unscale gradients before clipping
+                    torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
+                    optimizer.step()
+
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
             running_loss += loss.item()
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
