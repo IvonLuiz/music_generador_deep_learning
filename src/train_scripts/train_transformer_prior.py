@@ -2,6 +2,8 @@ import os
 import sys
 import yaml
 import argparse
+import json
+import numpy as np
 from datetime import datetime
 from typing import Optional
 import math
@@ -21,7 +23,7 @@ from modeling.torch.transformer_prior_conditioned import TransformerPriorConditi
 from utils import load_maestro, load_config
 from callbacks import EarlyStopping
 from train_scripts.jukebox_utils import load_jukebox_model, parse_level
-
+from train_scripts.resume_utils import load_resume_artifacts
 
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
 COND_LEVEL = {'top': None, 'middle': 'top', 'bottom': 'middle'}
@@ -60,7 +62,6 @@ def _compute_stride(lower_len: int, upper_len: int, level_name: str) -> int:
             f'Cannot infer upsample_stride for {level_name}: lower_len={lower_len}, upper_len={upper_len}'
         )
     return lower_len // upper_len
-
 
 def train_transformer_prior(
     config_path: str,
@@ -173,6 +174,23 @@ def train_transformer_prior(
         dropout=float(prior_cfg.get('dropout', 0.1)),
     ).to(device)
 
+    retrain = bool(train_cfg.get('retrain', False))
+    pretrained_weights_path = train_cfg.get('pretrained_weights_path')
+
+    resume_history = {}
+    initial_best_metric = None
+    if retrain:
+        if not pretrained_weights_path:
+            raise ValueError("training.retrain is true but training.pretrained_weights_path is empty.")
+        resume_history, initial_best_metric, checkpoint = load_resume_artifacts(pretrained_weights_path, val_key='val_loss', train_key='train_loss')
+        print(f"Retraining enabled from checkpoint: {pretrained_weights_path}")
+        if initial_best_metric is not None:
+            print(f"Baseline best metric from previous training: {initial_best_metric:.6f}")
+        else:
+            print("Baseline best metric unavailable from previous training history.")
+
+        prior.load_state_dict(checkpoint['model_state'])
+
     epochs = int(train_cfg['epochs'])
     early_stopping = EarlyStopping(patience=int(train_cfg.get('early_stopping_patience', 10)), verbose=True)
 
@@ -228,12 +246,15 @@ def train_transformer_prior(
     if upsample_stride is not None:
         config_to_save['model']['inferred_upsample_stride'] = int(upsample_stride)
 
+    config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['retrain'] = retrain
+    config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['pretrained_weights_path'] = pretrained_weights_path
+
     with open(os.path.join(run_dir, 'config.yaml'), 'w') as f:
         yaml.dump(config_to_save, f)
 
-    train_losses = []
-    val_losses = []
-    best_val_loss = float('inf')
+    train_losses = resume_history.get('train_loss', [])
+    val_losses = resume_history.get('val_loss', [])
+    best_val_loss = initial_best_metric if initial_best_metric is not None else float('inf')
     best_epoch = 0
 
     for epoch in range(epochs):
@@ -320,11 +341,14 @@ def train_transformer_prior(
         epoch_val_loss = val_running_loss / max(len(val_loader), 1)
         val_losses.append(epoch_val_loss)
 
+        with open(os.path.join(run_dir, 'loss_history.json'), 'w', encoding='utf-8') as f:
+            json.dump({'train_loss': train_losses, 'val_loss': val_losses}, f)
+
         print(f'Epoch {epoch + 1}: Train Loss={epoch_train_loss:.4f}, Val Loss={epoch_val_loss:.4f}')
 
         if epoch_val_loss < best_val_loss:
             best_val_loss = epoch_val_loss
-            best_epoch = epoch + 1
+            best_epoch = len(val_losses)
             torch.save(
                 {
                     'model_state': prior.state_dict(),
@@ -332,6 +356,7 @@ def train_transformer_prior(
                     'epoch': epoch + 1,
                     'train_loss': epoch_train_loss,
                     'val_loss': epoch_val_loss,
+                    'history': {'train_loss': train_losses, 'val_loss': val_losses},
                 },
                 os.path.join(run_dir, 'best_model.pth')
             )
@@ -344,6 +369,7 @@ def train_transformer_prior(
                     'epoch': epoch + 1,
                     'train_loss': epoch_train_loss,
                     'val_loss': epoch_val_loss,
+                    'history': {'train_loss': train_losses, 'val_loss': val_losses},
                 },
                 os.path.join(run_dir, f'model_epoch_{epoch + 1}.pth')
             )

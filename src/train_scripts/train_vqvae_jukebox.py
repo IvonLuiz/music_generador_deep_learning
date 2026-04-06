@@ -20,46 +20,9 @@ from utils import load_config
 from train_scripts.train_vqvae_utils import train_vqvae_jukebox
 from datasets.spectrogram_dataset import LazySpectrogramDataset
 
+from .resume_utils import load_resume_artifacts
+
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-
-
-def _extract_best_metric(history: dict):
-    if not history:
-        return None
-    if 'val_total' in history and history['val_total']:
-        finite_vals = [float(v) for v in history['val_total'] if np.isfinite(v)]
-        if finite_vals:
-            return min(finite_vals)
-    if 'total' in history and history['total']:
-        finite_vals = [float(v) for v in history['total'] if np.isfinite(v)]
-        if finite_vals:
-            return min(finite_vals)
-    return None
-
-
-def _load_resume_artifacts(pretrained_weights_path: str):
-    if not os.path.isfile(pretrained_weights_path):
-        raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_weights_path}")
-
-    checkpoint = torch.load(pretrained_weights_path, map_location='cpu', weights_only=False)
-    resume_history = checkpoint.get('history', {}) if isinstance(checkpoint, dict) else {}
-    if not isinstance(resume_history, dict):
-        resume_history = {}
-
-    history_path = os.path.join(os.path.dirname(pretrained_weights_path), 'loss_history.json')
-    if os.path.isfile(history_path):
-        with open(history_path, 'r', encoding='utf-8') as f:
-            file_history = json.load(f)
-        if isinstance(file_history, dict):
-            resume_history = file_history
-
-    best_metric = _extract_best_metric(resume_history)
-    if best_metric is None and isinstance(checkpoint, dict) and 'metric_value' in checkpoint:
-        best_metric = float(checkpoint['metric_value'])
-    if best_metric is None and isinstance(checkpoint, dict) and 'loss' in checkpoint:
-        best_metric = float(checkpoint['loss'])
-
-    return resume_history, best_metric
 
 if __name__ == "__main__":
     # Optional: faster matmul on Ampere+ GPUs
@@ -156,7 +119,7 @@ if __name__ == "__main__":
     if retrain:
         if not pretrained_weights_path:
             raise ValueError("training.retrain is true but training.pretrained_weights_path is empty.")
-        resume_history, initial_best_metric = _load_resume_artifacts(pretrained_weights_path)
+        resume_history, initial_best_metric, _ = load_resume_artifacts(pretrained_weights_path, val_key='val_total', train_key='total')
         print(f"Retraining enabled from checkpoint: {pretrained_weights_path}")
         if initial_best_metric is not None:
             print(f"Baseline best metric from previous training: {initial_best_metric:.6f}")
