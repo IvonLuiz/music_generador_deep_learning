@@ -90,6 +90,62 @@ def _resolve_prior_config_path(
     return _resolve_latest_config_path(default_run_root, level_name)
 
 
+def _debug(msg: str) -> None:
+    print(f'[DEBUG] {msg}')
+
+
+def _normalize_candidate_path(path: Optional[str]) -> Optional[str]:
+    if not path or not isinstance(path, str):
+        return None
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _resolve_min_max_values_path(bottom_config: dict) -> str:
+    candidates: List[str] = []
+
+    direct_path = _normalize_candidate_path(bottom_config.get('dataset', {}).get('min_max_values_path'))
+    if direct_path:
+        candidates.append(direct_path)
+
+    processed_path = _normalize_candidate_path(bottom_config.get('dataset', {}).get('processed_path'))
+    if processed_path:
+        candidates.append(os.path.join(processed_path, 'min_max_values.pkl'))
+
+    bottom_model_dir = _normalize_candidate_path(bottom_config.get('vqvae', {}).get('bottom_model_dir'))
+    if bottom_model_dir:
+        bottom_vqvae_cfg = os.path.join(bottom_model_dir, 'config.yaml')
+        if os.path.exists(bottom_vqvae_cfg):
+            _debug(f'Loading bottom VQ-VAE config for min/max fallback: {bottom_vqvae_cfg}')
+            vq_cfg = load_config(bottom_vqvae_cfg)
+            vq_direct = _normalize_candidate_path(vq_cfg.get('dataset', {}).get('min_max_values_path'))
+            if vq_direct:
+                candidates.append(vq_direct)
+            vq_processed = _normalize_candidate_path(vq_cfg.get('dataset', {}).get('processed_path'))
+            if vq_processed:
+                candidates.append(os.path.join(vq_processed, 'min_max_values.pkl'))
+
+    seen = set()
+    unique_candidates = []
+    for path in candidates:
+        if path not in seen:
+            seen.add(path)
+            unique_candidates.append(path)
+
+    _debug('Min/max candidate paths checked:')
+    for path in unique_candidates:
+        _debug(f'  - {path}')
+
+    for path in unique_candidates:
+        if os.path.exists(path):
+            _debug(f'Using min/max path: {path}')
+            return path
+
+    raise FileNotFoundError(
+        'Could not resolve min_max_values.pkl. Checked dataset.min_max_values_path, '
+        'dataset.processed_path/min_max_values.pkl, and bottom VQ-VAE config fallbacks.'
+    )
+
+
 def _generate_level_tokens(
     prior,
     seq_len: int,
@@ -212,8 +268,12 @@ def main():
         args.seed = None
     _set_seed(args.seed)
 
-    save_dir = generate_hierarchical_music(args)
-    print(f'Done! Saved generated samples to {save_dir}')
+    try:
+        save_dir = generate_hierarchical_music(args)
+        print(f'Done! Saved generated samples to {save_dir}')
+    except Exception as e:
+        _debug(f'Generation failed in main with error: {type(e).__name__}: {e}')
+        raise
 
 
 def _set_seed(seed: Optional[int]) -> None:
@@ -262,6 +322,7 @@ def linear_crossfading(spec_chunk_1, spec_chunk_2, overlap_len):
 
 
 def generate_hierarchical_music(args) -> str:
+    _debug('Resolving config paths...')
     top_transformer_prior_config_path = _resolve_prior_config_path(args.top_config, args.top_run_root, 'top')
     middle_transformer_prior_config_path = _resolve_prior_config_path(args.middle_config, args.middle_run_root, 'middle')
     bottom_transformer_prior_config_path = _resolve_prior_config_path(args.bottom_config, args.bottom_run_root, 'bottom')
@@ -271,8 +332,10 @@ def generate_hierarchical_music(args) -> str:
     print(f'Bottom config: {bottom_transformer_prior_config_path}')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    _debug(f'Using device: {device}')
 
     # Load the three trained priors.
+    _debug('Loading transformer priors...')
     top_prior, top_config, _ = load_transformer_prior('top', top_transformer_prior_config_path, device)
     middle_prior, middle_config, _ = load_transformer_prior('middle', middle_transformer_prior_config_path, device)
     bottom_prior, bottom_config, _ = load_transformer_prior('bottom', bottom_transformer_prior_config_path, device)
@@ -282,10 +345,10 @@ def generate_hierarchical_music(args) -> str:
     bottom_seq_len = int(bottom_config['model']['inferred_seq_lens']['bottom'])
     bottom_grid = bottom_config['model'].get('inferred_grids', {}).get('bottom')
 
-    min_max_values_path = bottom_config['dataset'].get('min_max_values_path')
-    if not os.path.exists(min_max_values_path):
-        raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
+    _debug('Resolving min_max_values.pkl path...')
+    min_max_values_path = _resolve_min_max_values_path(bottom_config)
 
+    _debug('Loading bottom VQ-VAE decoder...')
     vqvae_bottom_decoder = load_jukebox_model(
         bottom_config['vqvae']['bottom_model_dir'],
         'bottom',
@@ -358,6 +421,7 @@ def generate_hierarchical_music(args) -> str:
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     save_dir = os.path.join(args.save_root, current_time)
 
+    _debug(f'Loading min/max values from: {min_max_values_path}')
     with open(min_max_values_path, 'rb') as f:
         min_max_values = pickle.load(f)
 
