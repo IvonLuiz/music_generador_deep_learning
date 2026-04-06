@@ -1,6 +1,5 @@
 dataset:
   processed_path: ./data/processed/maestro_spectrograms_2011_time_frames_1024/
-  min_max_values_path: "./data/processed/maestro_spectrograms_2011_time_frames_1024/min_max_values/min_max_values.pkl"
   target_time_frames: 1024
 model:
   inferred_grids:
@@ -19,7 +18,7 @@ model:
     top: 256
   inferred_upsample_stride: 4
   name: jukebox_maestro2011_target_time_frames_1024
-  selected_level: middle
+  selected_level: bottom
 priors:
   bottom_prior:
     block_len: 32
@@ -30,9 +29,9 @@ priors:
     conditioner_residual_block_width: 1024
     conditioner_residual_blocks: 16
     conditioner_upsample_stride: 4
-    dim_feedforward: 480
+    dim_feedforward: 960
     dropout: 0.1
-    model_dim: 480
+    model_dim: 960
     num_heads: 1
     num_layers: 36
   middle_prior:
@@ -44,9 +43,9 @@ priors:
     conditioner_residual_block_width: 1024
     conditioner_residual_blocks: 16
     conditioner_upsample_stride: 4
-    dim_feedforward: 480
+    dim_feedforward: 960
     dropout: 0.1
-    model_dim: 480
+    model_dim: 960
     num_heads: 1
     num_layers: 36
   top_prior:
@@ -58,20 +57,23 @@ priors:
     num_layers: 36
 training:
   bottom_prior:
-    batch_size: 2
+    batch_size: 1
     epochs: 150
+    gradient_accumulation_steps: 32
     learning_rate: 0.0003
     weight_decay: 0.01
   early_stopping_patience: 7
   middle_prior:
-    batch_size: 4
+    batch_size: 2
     epochs: 150
+    gradient_accumulation_steps: 16
     learning_rate: 0.0003
     weight_decay: 0.01
   save_dir: ./models/transformer_prior/
   top_prior:
     batch_size: 8
     epochs: 150
+    gradient_accumulation_steps: 4
     learning_rate: 0.00015
     weight_decay: 0.002
   validation_split: 0.2
