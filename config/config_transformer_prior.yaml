@@ -27,10 +27,10 @@ priors:
     dropout: 0.1
     block_len: 8  # Because Top grid is 8x8
   middle_prior:
-    model_dim: 480        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
+    model_dim: 960        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
     num_heads: 1          # Atention heads (Jukebox uses 1 for Middle)
     num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
-    dim_feedforward: 480 # Transformer feedforward layers
+    dim_feedforward: 960  # Transformer feedforward layers
     dropout: 0.1
     block_len: 16  # Because Middle grid is 16x16
     # condiditioner parameters
@@ -42,10 +42,10 @@ priors:
     conditioner_dilation_cycle: 8
     conditioner_upsample_stride: 4 # Because Middle grid is 16x16 and Top grid is 8x8, we need to upsample by a factor of 2 in each dimension (16/8 = 2)
   bottom_prior:
-    model_dim: 480        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
+    model_dim: 960        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
     num_heads: 1          # Atention heads (Jukebox uses 1 for Bottom)
     num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
-    dim_feedforward: 480 # Transformer feedforward layers
+    dim_feedforward: 960  # Transformer feedforward layers
     dropout: 0.1
     block_len: 32  # Because Bottom grid is 32x32
     # condiditioner parameters
@@ -55,21 +55,24 @@ priors:
     conditioner_conv_channels: 1024
     conditioner_dilation_growth_rate: 3
     conditioner_dilation_cycle: 8
-    conditioner_upsample_stride: 4 # Because Bottom grid is 32x32 and Middle grid is 16x16, we need to upsample by a factor of 2 in
+    conditioner_upsample_stride: 4 # Because Bottom grid is 32x32 and Middle grid is 16x16, we need to upsample by a factor of 2 in each dimension (32/16 = 2)
 
 training:
   top_prior:
     batch_size: 8
+    gradient_accumulation_steps: 4
     learning_rate: 0.00015  # Warmup to lr then cosine decay
     weight_decay: 0.002
     epochs: 150
   middle_prior:
-    batch_size: 4
+    batch_size: 2
+    gradient_accumulation_steps: 16
     learning_rate: 0.0003  # Warmup to lr then cosine decay
     weight_decay: 0.01
     epochs: 150
   bottom_prior:
-    batch_size: 2
+    batch_size: 1
+    gradient_accumulation_steps: 32
     learning_rate: 0.0003  # Warmup to lr then cosine decay
     weight_decay: 0.01
     epochs: 150
