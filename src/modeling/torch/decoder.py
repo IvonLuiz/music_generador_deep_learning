@@ -48,13 +48,10 @@ class DecoderBlock(nn.Module):
         """Create a 2D or 1D decoder block with the given parameters."""
         if conv_type == 2:
             conv_block = nn.ConvTranspose2d
-            batch_norm = nn.BatchNorm2d
         elif conv_type == 1:
             conv_block = nn.ConvTranspose1d
-            batch_norm = nn.BatchNorm1d
         else:
             raise ValueError(f"Unsupported conv_type: {conv_type}")
-
 
         current_in = in_channels
         for block_idx in range(num_downsample_blocks):
@@ -64,5 +61,4 @@ class DecoderBlock(nn.Module):
                                          kernel_size=kernel_size,
                                          stride=stride,
                                          padding=padding))
-            self.layers.append(batch_norm(current_out))
             current_in = current_out
