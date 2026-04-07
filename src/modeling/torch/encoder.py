@@ -49,10 +49,8 @@ class EncoderBlock(nn.Module):
         """Create a 2D or 1D encoder block with the given parameters."""
         if conv_size == 1:
             conv_type = nn.Conv1d
-            batch_norm = nn.BatchNorm1d
         elif conv_size == 2:
             conv_type = nn.Conv2d
-            batch_norm = nn.BatchNorm2d
         else:
             raise ValueError(f"Unsupported conv_size: {conv_size}")
 
@@ -61,4 +59,3 @@ class EncoderBlock(nn.Module):
                                         kernel_size=kernel_size,
                                     stride=stride,
                                     padding=padding))
-        self.layers.append(batch_norm(out_channels))
