@@ -1,13 +1,15 @@
 dataset:
   raw_path: "./data/raw/maestro-v3.0.0/2011"
-  processed_path: "./data/processed/maestro_spectrograms_test/"
+  processed_path: "./data/processed/maestro_spectrograms_2011_time_frames_1024/"
+  min_max_values_path: "./data/processed/maestro_spectrograms_2011_time_frames_1024/min_max_values/min_max_values.pkl"
+  hdf5_path: "./data/processed/maestro_dataset.h5"
   sample_rate: 22050
   hop_length: 256
   frame_size: 512
-  target_time_frames: 256
+  target_time_frames: 1024
 
 model:
-  name: "jukebox_vqvae_maestro2011"
+  name: "jukebox_vqvae_maestro2011_time-frames-1024"
   selected_level: "bottom"  # options: "bottom", "middle", "top"
   input_channels: 1
   hidden_dim: 64
@@ -43,14 +45,18 @@ model:
 # of 1024, 256, 64, which perfectly mimics the Jukebox scale for our 2D data.
 
 training:
-  batch_size: 32 # 12GB GPU can handle 32, to handle 64 will probably need 16GB
+  batch_size: 8 # 12GB GPU can handle 32, to handle 64 will probably need 16GB
   learning_rate: 0.0002
   epochs: 150
   validation_split: 0.2
   save_dir: "./models/jukebox_vq_vae/"
   early_stopping_patience: 7
-  num_workers: 0
-  pin_memory: false
+  num_workers: 12
+  pin_memory: true
+  persist_workers: true
+  prefetch_factor: 4
+  retrain: false 
+  pretrained_weights_path: "./models/jukebox_vq_vae/jukebox_vqvae_all_years/model.pth"
 
 testing:
   specific_run_dir: null

@@ -50,7 +50,9 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                              x_val: np.ndarray = None,
                              val_file_paths: list = None,
                              num_workers: int = 4,
-                             pin_memory: bool = True):
+                             pin_memory: bool = True,
+                             persist_workers: bool = True,
+                             prefetch_factor: int = 4,):
     """
     Train a VQ-VAE Hierarchical model.
 
@@ -69,6 +71,10 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
         amp (bool, optional): Whether to use automatic mixed precision (AMP) during training. Defaults to True.
         x_val (np.ndarray, optional): Validation spectrogram data.
         val_file_paths (list, optional): List of file paths corresponding to x_val.
+        num_workers (int, optional): Number of worker threads for data loading. Defaults to 4.
+        pin_memory (bool, optional): Whether to pin memory for faster data transfer. Defaults to True.
+        persist_workers (bool, optional): Whether to persist worker processes. Defaults to True.
+        prefetch_factor (int, optional): Number of batches to prefetch. Defaults to 4.
     """
     model.to(device)
     
@@ -77,18 +83,35 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
     val_dataloader = None
     val_dataset = None
 
+    def _loader_kwargs():
+        kwargs = {
+            'num_workers': num_workers,
+            'pin_memory': pin_memory,
+        }
+        if num_workers > 0:
+            kwargs['persistent_workers'] = persist_workers
+            if prefetch_factor is not None:
+                kwargs['prefetch_factor'] = prefetch_factor
+        return kwargs
+
     if x_val is not None:
         if isinstance(x_val, (np.ndarray, list)):
             if len(x_val) > 0:
                 print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
                 val_dataset = SpectrogramDataset(x_val)
-                val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+                val_dataloader = DataLoader(
+                    val_dataset, batch_size=batch_size, shuffle=False,
+                    **_loader_kwargs(),
+                )
                 early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
         else:
             # Assume x_val is a Dataset
             print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
             val_dataset = x_val
-            val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+            val_dataloader = DataLoader(
+                val_dataset, batch_size=batch_size, shuffle=False,
+                **_loader_kwargs(),
+            )
             early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
     
     if val_dataloader is None:
@@ -99,7 +122,10 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
     else:
         dataset = x_train
         
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True,
+        **_loader_kwargs(),
+    )
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner for potential speedup
@@ -129,7 +155,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                 samples = np.stack(samples)
             else:
                 samples = x_val[:4]
-            sample_paths = val_file_paths[:4]
+            sample_paths = val_file_paths[:4] if val_file_paths else None
         else:
             if isinstance(dataset, Dataset):
                 samples = []
@@ -140,7 +166,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                 samples = np.stack(samples)
             else:
                 samples = x_train[:4]
-            sample_paths = train_file_paths[:4]
+            sample_paths = train_file_paths[:4] if train_file_paths else None
         
         spectrograms_dir = os.path.dirname(sample_paths[0])
         sample_min_max = []
@@ -333,7 +359,12 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                         x_val: np.ndarray = None,
                         val_file_paths: list = None,
                         num_workers: int = 4,
-                        pin_memory: bool = True):
+                        pin_memory: bool = True,
+                        persist_workers: bool = True,
+                        prefetch_factor: int = 4,
+                        resume_checkpoint_path: str = None,
+                        resume_history: dict = None,
+                        initial_best_metric: float = None,):
     """
     Train a Jukebox VQ-VAE model.
 
@@ -352,6 +383,10 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
         amp (bool, optional): Whether to use automatic mixed precision (AMP) during training. Defaults to True.
         x_val (np.ndarray, optional): Validation spectrogram data.
         val_file_paths (list, optional): List of file paths corresponding to x_val.
+        num_workers (int, optional): Number of worker threads for data loading. Defaults to 4.
+        pin_memory (bool, optional): Whether to pin memory for faster data transfer. Defaults to True.
+        persist_workers (bool, optional): Whether to persist worker processes. Defaults to True.
+        prefetch_factor (int, optional): Number of batches to prefetch. Defaults to 4.
     """
     model.to(device)
     
@@ -360,18 +395,35 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
     val_dataloader = None
     val_dataset = None
 
+    def _loader_kwargs():
+        kwargs = {
+            'num_workers': num_workers,
+            'pin_memory': pin_memory,
+        }
+        if num_workers > 0:
+            kwargs['persistent_workers'] = persist_workers
+            if prefetch_factor is not None:
+                kwargs['prefetch_factor'] = prefetch_factor
+        return kwargs
+
     if x_val is not None:
         if isinstance(x_val, (np.ndarray, list)):
             if len(x_val) > 0:
                 print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
                 val_dataset = SpectrogramDataset(x_val)
-                val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+                val_dataloader = DataLoader(
+                    val_dataset, batch_size=batch_size, shuffle=False,
+                    **_loader_kwargs(),
+                )
                 early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
         else:
             # Assume x_val is a Dataset
             print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
             val_dataset = x_val
-            val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+            val_dataloader = DataLoader(
+                val_dataset, batch_size=batch_size, shuffle=False,
+                **_loader_kwargs(),
+            )
             early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
     
     if val_dataloader is None:
@@ -382,11 +434,27 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
     else:
         dataset = x_train
         
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True,
+        **_loader_kwargs(),
+    )
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner for potential speedup
     scaler = GradScaler(enabled=amp and device.type == 'cuda')  # For mixed precision training
+
+    start_epoch = 0
+    if resume_checkpoint_path:
+        checkpoint = torch.load(resume_checkpoint_path, map_location=device, weights_only=False)
+        if 'model_state' not in checkpoint:
+            raise KeyError(f"Checkpoint at {resume_checkpoint_path} does not contain 'model_state'.")
+
+        model.load_state_dict(checkpoint['model_state'])
+        if 'optimizer_state' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state'])
+        start_epoch = int(checkpoint.get('epoch', -1)) + 1
+        print(f"Resumed training from checkpoint: {resume_checkpoint_path}")
+        print(f"Starting from epoch index {start_epoch} (human epoch {start_epoch + 1}).")
 
     print("Model will be saved to :", save_path)
     
@@ -396,8 +464,16 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
     sample_generator = None
 
     if save_path:
-        model_checkpoint = ModelCheckpoint(save_path, model, optimizer, mode="min")
+        model_checkpoint = ModelCheckpoint(
+            save_path,
+            model,
+            optimizer,
+            mode="min",
+            initial_best_score=initial_best_metric,
+        )
         loss_plotter = LossPlotter(save_path)
+        if resume_history:
+            loss_plotter.set_history(resume_history)
         
         # Prepare samples for visualization
         if val_dataloader:
@@ -412,7 +488,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                 samples = np.stack(samples)
             else:
                 samples = x_val[:4]
-            sample_paths = val_file_paths[:4]
+            sample_paths = val_file_paths[:4] if val_file_paths else None
         else:
             if isinstance(dataset, Dataset):
                 samples = []
@@ -423,9 +499,8 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                 samples = np.stack(samples)
             else:
                 samples = x_train[:4]
-            sample_paths = train_file_paths[:4]
-        
-        spectrograms_dir = os.path.dirname(sample_paths[0])
+            sample_paths = train_file_paths[:4] if train_file_paths else None
+
         sample_min_max = []
         for fp in sample_paths:
             mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
@@ -438,7 +513,17 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
 
     best_val_loss = float('inf')
 
-    for epoch in range(epochs):
+    if start_epoch >= epochs:
+        print(
+            f"Checkpoint epoch ({start_epoch}) is already >= configured epochs ({epochs}). "
+            "Nothing to train."
+        )
+        if loss_plotter:
+            loss_plotter.plot()
+            loss_plotter.save_history()
+        return model
+
+    for epoch in range(start_epoch, epochs):
         model.train()
 
         optimizer.zero_grad(set_to_none=True)
@@ -573,11 +658,20 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
         if loss_plotter:
             loss_plotter.update(epoch_metrics)
             loss_plotter.plot()
+            loss_plotter.save_history()
             
         if model_checkpoint:
             # Use validation loss if available, else training loss
             metric_to_monitor = avg_val_loss if avg_val_loss is not None else avg_epoch_loss
-            model_checkpoint.step(epoch, avg_epoch_loss, metric_value=metric_to_monitor)
+            model_checkpoint.step(
+                epoch,
+                avg_epoch_loss,
+                metric_value=metric_to_monitor,
+                extra_state={
+                    'metric_value': metric_to_monitor,
+                    'history': loss_plotter.history if loss_plotter else {},
+                },
+            )
             
         if sample_generator:
             sample_generator.step(epoch)

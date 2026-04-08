@@ -3,10 +3,12 @@ import argparse
 import torch
 import numpy as np
 import os
+import json
 import yaml
 import sys
 import pickle
 import gc
+import glob
 import torch.nn as nn
 
 # Add 'src' to sys.path to allow imports from sibling directories
@@ -14,13 +16,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from generation.generate import *
-from utils import load_maestro, load_config
+from utils import load_config
 from train_scripts.train_vqvae_utils import train_vqvae_jukebox
-from processing.preprocess_audio import TARGET_TIME_FRAMES, MIN_MAX_VALUES_SAVE_DIR
-from datasets.spectrogram_dataset import MmapSpectrogramDataset
+from datasets.spectrogram_dataset import LazySpectrogramDataset
+
+from .resume_utils import load_resume_artifacts
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-
 
 if __name__ == "__main__":
     # Optional: faster matmul on Ampere+ GPUs
@@ -54,12 +56,25 @@ if __name__ == "__main__":
     learning_rate = config['training']['learning_rate']
     epochs = config['training']['epochs']
     early_stopping_patience = config['training'].get('early_stopping_patience', 20)
-    num_workers = config['training'].get('num_workers', 0)
-    pin_memory = config['training'].get('pin_memory', False)
+    num_workers = config['training'].get('num_workers', 4) # Default to 4 for lazy loading
+    pin_memory = config['training'].get('pin_memory', True) # Default to True for speed
+    persist_workers_cfg = config['training'].get('persist_workers', True)
+    persist_workers = bool(persist_workers_cfg) if persist_workers_cfg is not None else True
+    prefetch_factor_cfg = config['training'].get('prefetch_factor', 4)
+    prefetch_factor = int(prefetch_factor_cfg) if prefetch_factor_cfg is not None else None
     spectrograms_path = config['dataset']['processed_path']
+    target_time_frames = int(config['dataset'].get('target_time_frames', 256))
+    min_max_values_path = config['dataset']['min_max_values_path']
     model_save_dir = config['training']['save_dir']
     model_name = config['model']['name']
     model_cfg = config['model']
+    retrain = bool(config['training'].get('retrain', False))
+    pretrained_weights_path = config['training'].get('pretrained_weights_path')
+
+    print(f"Configuration loaded. Model: {model_name}, Save Dir: {model_save_dir}")
+    print(f"Training parameters: batch_size={batch_size}, learning_rate={learning_rate}, epochs={epochs}, early_stopping_patience={early_stopping_patience}")
+    print(f"Data loading parameters: num_workers={num_workers}, pin_memory={pin_memory}, persist_workers={persist_workers}, prefetch_factor={prefetch_factor}")
+    print(f"Dataset target_time_frames={target_time_frames}")
 
     selected_level = args.level or model_cfg.get('selected_level', 'bottom')
     selected_level = str(selected_level).lower()
@@ -101,49 +116,72 @@ if __name__ == "__main__":
     print(f"Selected Jukebox level: {selected_level} (levels={levels}, residual_layers={num_residual_layers})")
     print(f"Model will be saved to: {model_file_path}")
 
-    # Save the config used for this training run immediately
-    with open(config_file_path, 'w') as f:
-        yaml.dump(config, f)
-    
-    # Load training data to compute variance
-    x_all, file_paths_all = load_maestro(spectrograms_path, TARGET_TIME_FRAMES, debug_print=False)
-    data_variance = np.var(x_all)
+    resume_history = {}
+    initial_best_metric = None
+    if retrain:
+        if not pretrained_weights_path:
+            raise ValueError("training.retrain is true but training.pretrained_weights_path is empty.")
+        resume_history, initial_best_metric, _ = load_resume_artifacts(pretrained_weights_path, val_key='val_total', train_key='total')
+        print(f"Retraining enabled from checkpoint: {pretrained_weights_path}")
+        if initial_best_metric is not None:
+            print(f"Baseline best metric from previous training: {initial_best_metric:.6f}")
+        else:
+            print("Baseline best metric unavailable from previous training history.")
 
-    # Split into train/val manually to save memory
-    validation_split = config['training'].get('validation_split', 0.0)
+    # Save the config used for this training run immediately
+    config_to_save = dict(config)
+    config_to_save['training'] = dict(config['training'])
+    config_to_save['training']['retrain'] = retrain
+    config_to_save['training']['pretrained_weights_path'] = pretrained_weights_path
+    config_to_save['model'] = dict(config['model'])
+    config_to_save['model']['selected_level'] = selected_level
+    config_to_save['dataset'] = dict(config['dataset'])
+
+    with open(config_file_path, 'w') as f:
+        yaml.dump(config_to_save, f)
+    
+    # --- LAZY LOADING IMPLEMENTATION ---
+    print(f"Scanning for spectrogram files in {spectrograms_path}...")
+    all_file_paths = glob.glob(os.path.join(spectrograms_path, "**/*.npy"), recursive=True)
+    
+    if not all_file_paths:
+        raise FileNotFoundError(f"No .npy files found in {spectrograms_path}")
+    
+    print(f"Found {len(all_file_paths)} files. Creating lazy datasets...")
+
+    # Data variance calculation on a small subset (100 files) to save time/RAM
+    subset_paths = all_file_paths[:min(100, len(all_file_paths))]
+    subset_data = np.stack([np.load(p) for p in subset_paths])
+    data_variance = np.var(subset_data)
+    del subset_data
+    gc.collect()
+
+    # Split into train/val
+    np.random.shuffle(all_file_paths)
+    validation_split = config['training'].get('validation_split', 0.2)
+    
     if validation_split > 0:
-        num_samples = len(x_all)
-        num_val = int(num_samples * validation_split)
-        num_train = num_samples - num_val
+        num_val = int(len(all_file_paths) * validation_split)
+        num_train = len(all_file_paths) - num_val
         
-        # Shuffle indices
-        indices = np.random.permutation(num_samples)
-        train_indices = indices[:num_train]
-        val_indices = indices[num_train:]
+        train_paths = all_file_paths[:num_train]
+        val_paths = all_file_paths[num_train:]
         
-        # Use MmapSpectrogramDataset to avoid loading data into RAM
-        x_train = MmapSpectrogramDataset(x_all, train_indices)
-        x_val = MmapSpectrogramDataset(x_all, val_indices)
+        # Instantiate Lazy Datasets
+        x_train = LazySpectrogramDataset(train_paths, target_time_frames=target_time_frames)
+        x_val = LazySpectrogramDataset(val_paths, target_time_frames=target_time_frames)
         
-        # Handle paths
-        file_paths_all = np.array(file_paths_all)
-        train_file_paths = file_paths_all[train_indices].tolist()
-        val_file_paths = file_paths_all[val_indices].tolist()
+        train_file_paths = train_paths
+        val_file_paths = val_paths
         
         print(f"Data split: {len(x_train)} training, {len(x_val)} validation samples.")
-        
-        # We keep x_all referenced by datasets, so we don't delete it explicitly, 
-        # but we can delete file_paths_all
-        del file_paths_all
-        gc.collect()
     else:
-        x_train = MmapSpectrogramDataset(x_all)
-        train_file_paths = file_paths_all
+        x_train = LazySpectrogramDataset(all_file_paths, target_time_frames=target_time_frames)
+        train_file_paths = all_file_paths
         x_val = None
         val_file_paths = None
 
     # Load min_max_values
-    min_max_values_path = os.path.join(MIN_MAX_VALUES_SAVE_DIR, "min_max_values.pkl")
     with open(min_max_values_path, "rb") as f:
         min_max_values = pickle.load(f)
 
@@ -190,5 +228,17 @@ if __name__ == "__main__":
         val_file_paths=val_file_paths,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persist_workers=persist_workers,
+        prefetch_factor=prefetch_factor,
+        resume_checkpoint_path=pretrained_weights_path if retrain else None,
+        resume_history=resume_history,
+        initial_best_metric=initial_best_metric,
     )
+
+    best_model_path = os.path.join(run_dir, 'best_model.pth')
+    if retrain:
+        if os.path.isfile(best_model_path):
+            print("Retraining improved over baseline: new best model saved.")
+        else:
+            print("Retraining did not beat baseline best metric in this run.")
     print("Training completed.")

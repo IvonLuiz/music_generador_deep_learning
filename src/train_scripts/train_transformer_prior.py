@@ -2,8 +2,11 @@ import os
 import sys
 import yaml
 import argparse
+import json
+import numpy as np
 from datetime import datetime
 from typing import Optional
+import math
 
 import torch
 import torch.nn as nn
@@ -19,8 +22,8 @@ from datasets.jukebox_hierarchical_quantized_dataset import JukeboxHierarchicalQ
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
 from utils import load_maestro, load_config
 from callbacks import EarlyStopping
-from train_scripts.jukebox_utils import load_jukebox_model, _parse_level
-
+from train_scripts.jukebox_utils import load_jukebox_model, parse_level
+from train_scripts.resume_utils import load_resume_artifacts
 
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
 COND_LEVEL = {'top': None, 'middle': 'top', 'bottom': 'middle'}
@@ -60,7 +63,6 @@ def _compute_stride(lower_len: int, upper_len: int, level_name: str) -> int:
         )
     return lower_len // upper_len
 
-
 def train_transformer_prior(
     config_path: str,
     level_override: Optional[str] = None,
@@ -76,9 +78,10 @@ def train_transformer_prior(
     dataset_cfg = config['dataset']
     vqvae_cfg = config['vqvae']
     transformer_cfg = config.setdefault('model', {})
-    train_cfg = config['training']
-
-    selected_level = _parse_level(level_override or transformer_cfg.get('selected_level', 'top'))
+    selected_level = parse_level(level_override or transformer_cfg.get('selected_level', 'top'))
+    train_general_cfg = config['training']
+    train_prior_cfg = config['training'][LEVEL_TO_PRIOR_CFG[selected_level]]
+    train_cfg = {**train_general_cfg, **train_prior_cfg}  # Prior-specific settings override general settings
     transformer_cfg['selected_level'] = selected_level
 
     effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
@@ -90,12 +93,13 @@ def train_transformer_prior(
     middle_model = load_jukebox_model(effective_middle_model_dir, 'middle', device, effective_weights_file)
     bottom_model = load_jukebox_model(effective_bottom_model_dir, 'bottom', device, effective_weights_file)
 
-    x_all, _ = load_maestro(dataset_cfg['processed_path'], dataset_cfg.get('target_time_frames', 256))
+    x_all, file_paths = load_maestro(dataset_cfg['processed_path'], dataset_cfg.get('target_time_frames', 256))
     print(f'Loaded data shape: {x_all.shape}')
 
     quant_batch_size = train_cfg.get('quantization_batch_size', 32)
     dataset = JukeboxHierarchicalQuantizedDataset(
         x_train=x_all,
+        file_paths=file_paths,
         top_model=top_model,
         middle_model=middle_model,
         bottom_model=bottom_model,
@@ -143,9 +147,10 @@ def train_transformer_prior(
     cond_level = COND_LEVEL[selected_level]
 
     is_upsampler = cond_level is not None
-    cond_num_embeddings = num_embeddings_map[cond_level] if is_upsampler else None
     upsample_stride = None
+    cond_num_embeddings = None
     if is_upsampler:
+        cond_num_embeddings = num_embeddings_map[cond_level]
         upsample_stride = _compute_stride(seq_lens[selected_level], seq_lens[cond_level], selected_level)
 
     prior = TransformerPriorConditioned(
@@ -156,19 +161,53 @@ def train_transformer_prior(
         dim_feedforward=int(prior_cfg['dim_feedforward']),
         max_seq_len=seq_lens[selected_level],
         block_len=int(prior_cfg.get('block_len', 16)),
+        max_time_steps=int(prior_cfg.get('max_time_steps', 500)),
         is_upsampler=is_upsampler,
         cond_num_embeddings=cond_num_embeddings,
         upsample_stride=upsample_stride,
+        conditioner_residual_block_width=int(prior_cfg.get('conditioner_residual_block_width', 1024)),
+        conditioner_residual_blocks=int(prior_cfg.get('conditioner_residual_blocks', 16)),
+        conditioner_kernel_size=int(prior_cfg.get('conditioner_kernel_size', 3)),
+        conditioner_conv_channels=int(prior_cfg.get('conditioner_conv_channels', 1024)),
+        conditioner_dilation_growth_rate=int(prior_cfg.get('conditioner_dilation_growth_rate', 3)),
+        conditioner_dilation_cycle=int(prior_cfg.get('conditioner_dilation_cycle', 8)),
         dropout=float(prior_cfg.get('dropout', 0.1)),
     ).to(device)
+
+    retrain = bool(train_cfg.get('retrain', False))
+    pretrained_weights_path = train_cfg.get('pretrained_weights_path')
+
+    resume_history = {}
+    initial_best_metric = None
+    if retrain:
+        if not pretrained_weights_path:
+            raise ValueError("training.retrain is true but training.pretrained_weights_path is empty.")
+        resume_history, initial_best_metric, checkpoint = load_resume_artifacts(pretrained_weights_path, val_key='val_loss', train_key='train_loss')
+        print(f"Retraining enabled from checkpoint: {pretrained_weights_path}")
+        if initial_best_metric is not None:
+            print(f"Baseline best metric from previous training: {initial_best_metric:.6f}")
+        else:
+            print("Baseline best metric unavailable from previous training history.")
+
+        prior.load_state_dict(checkpoint['model_state'])
 
     epochs = int(train_cfg['epochs'])
     early_stopping = EarlyStopping(patience=int(train_cfg.get('early_stopping_patience', 10)), verbose=True)
 
     optimizer = optim.AdamW(prior.parameters(), lr=float(train_cfg['learning_rate']), weight_decay=float(train_cfg.get('weight_decay', 0.01)))
 
+    grad_accum_steps = int(train_cfg.get('gradient_accumulation_steps', 1))
+    if grad_accum_steps < 1:
+        raise ValueError(f"gradient_accumulation_steps must be >= 1, got {grad_accum_steps}")
+    effective_batch_size = int(train_cfg['batch_size']) * grad_accum_steps
+    print(
+        f"Gradient accumulation: {grad_accum_steps} step(s) "
+        f"(micro_batch={int(train_cfg['batch_size'])}, effective_batch={effective_batch_size})"
+    )
+
     # Warmup for the first ~5% of total training steps
-    total_steps = len(train_loader) * epochs
+    optimizer_steps_per_epoch = max(1, math.ceil(len(train_loader) / grad_accum_steps))
+    total_steps = optimizer_steps_per_epoch * epochs
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=float(train_cfg['learning_rate']),
@@ -207,20 +246,24 @@ def train_transformer_prior(
     if upsample_stride is not None:
         config_to_save['model']['inferred_upsample_stride'] = int(upsample_stride)
 
+    config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['retrain'] = retrain
+    config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['pretrained_weights_path'] = pretrained_weights_path
+
     with open(os.path.join(run_dir, 'config.yaml'), 'w') as f:
         yaml.dump(config_to_save, f)
 
-    train_losses = []
-    val_losses = []
-    best_val_loss = float('inf')
+    train_losses = resume_history.get('train_loss', [])
+    val_losses = resume_history.get('val_loss', [])
+    best_val_loss = initial_best_metric if initial_best_metric is not None else float('inf')
     best_epoch = 0
 
     for epoch in range(epochs):
         prior.train()
         running_loss = 0.0
+        optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs} [Train:{selected_level}]')
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             top_indices = batch[0].to(device)
             mid_indices = batch[1].to(device)
             bot_indices = batch[2].to(device)
@@ -237,23 +280,30 @@ def train_transformer_prior(
 
             target_seq = target_indices.view(target_indices.shape[0], -1)
             cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
-            optimizer.zero_grad()
 
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
                     loss = prior.loss(target_seq, upper_indices=cond_seq)
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer) # unscale the gradients back to their original values before clipping
-                torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                loss_to_backward = loss / grad_accum_steps
+                scaler.scale(loss_to_backward).backward()
             else:
                 loss = prior.loss(target_seq, upper_indices=cond_seq)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
-                optimizer.step()
+                loss_to_backward = loss / grad_accum_steps
+                loss_to_backward.backward()
 
-            scheduler.step()
+            should_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == len(train_loader))
+            if should_step:
+                if use_amp:
+                    scaler.unscale_(optimizer) # unscale gradients before clipping
+                    torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
+                    optimizer.step()
+
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
             running_loss += loss.item()
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
@@ -291,11 +341,14 @@ def train_transformer_prior(
         epoch_val_loss = val_running_loss / max(len(val_loader), 1)
         val_losses.append(epoch_val_loss)
 
+        with open(os.path.join(run_dir, 'loss_history.json'), 'w', encoding='utf-8') as f:
+            json.dump({'train_loss': train_losses, 'val_loss': val_losses}, f)
+
         print(f'Epoch {epoch + 1}: Train Loss={epoch_train_loss:.4f}, Val Loss={epoch_val_loss:.4f}')
 
         if epoch_val_loss < best_val_loss:
             best_val_loss = epoch_val_loss
-            best_epoch = epoch + 1
+            best_epoch = len(val_losses)
             torch.save(
                 {
                     'model_state': prior.state_dict(),
@@ -303,6 +356,7 @@ def train_transformer_prior(
                     'epoch': epoch + 1,
                     'train_loss': epoch_train_loss,
                     'val_loss': epoch_val_loss,
+                    'history': {'train_loss': train_losses, 'val_loss': val_losses},
                 },
                 os.path.join(run_dir, 'best_model.pth')
             )
@@ -315,6 +369,7 @@ def train_transformer_prior(
                     'epoch': epoch + 1,
                     'train_loss': epoch_train_loss,
                     'val_loss': epoch_val_loss,
+                    'history': {'train_loss': train_losses, 'val_loss': val_losses},
                 },
                 os.path.join(run_dir, f'model_epoch_{epoch + 1}.pth')
             )

@@ -64,18 +64,35 @@ def _normalize_state_dict_keys_for_pixelcnn(state_dict: dict) -> dict:
     return state_dict
 
 
-def _resolve_model_file(model_dir_or_file: str, weights_file: str) -> Tuple[str, str]:
+def _resolve_model_file(model_dir_or_file: str, weights_file: str, level_name: Optional[str] = None) -> Tuple[str, str]:
     if os.path.isfile(model_dir_or_file):
         model_file = model_dir_or_file
         config_path = os.path.join(os.path.dirname(model_file), 'config.yaml')
     else:
-        model_file = os.path.join(model_dir_or_file, weights_file)
-        config_path = os.path.join(model_dir_or_file, 'config.yaml')
+        candidate_dirs = [model_dir_or_file]
+        if level_name:
+            level_dir = os.path.join(model_dir_or_file, parse_level(level_name))
+            if os.path.isdir(level_dir):
+                candidate_dirs.insert(0, level_dir)
+
+        selected_dir = candidate_dirs[0]
+        for candidate in candidate_dirs:
+            if os.path.isfile(os.path.join(candidate, 'config.yaml')):
+                selected_dir = candidate
+                break
+
+        model_file = os.path.join(selected_dir, weights_file)
+        config_path = os.path.join(selected_dir, 'config.yaml')
     return model_file, config_path
 
 
-def load_single_level_prior(model_dir_or_file: str, device: torch.device, weights_file: str = 'best_model.pth') -> JukeboxLevelPixelCNN:
-    model_file, config_path = _resolve_model_file(model_dir_or_file, weights_file)
+def load_single_level_prior(
+    model_dir_or_file: str,
+    device: torch.device,
+    weights_file: str = 'best_model.pth',
+    level_name: Optional[str] = None,
+) -> JukeboxLevelPixelCNN:
+    model_file, config_path = _resolve_model_file(model_dir_or_file, weights_file, level_name=level_name)
 
     if not os.path.exists(config_path):
         raise FileNotFoundError(f'Config file not found at {config_path}')
@@ -84,7 +101,7 @@ def load_single_level_prior(model_dir_or_file: str, device: torch.device, weight
 
     config = load_config(config_path)
     model_cfg = config.get('model', {})
-    selected_level = parse_level(model_cfg.get('selected_level', 'top'))
+    selected_level = parse_level(level_name or model_cfg.get('selected_level', 'top'))
     prior_cfg = _get_prior_cfg(config, LEVEL_TO_PRIOR_CFG[selected_level])
 
     checkpoint = torch.load(model_file, map_location=device, weights_only=False)
@@ -110,7 +127,7 @@ def load_single_level_prior(model_dir_or_file: str, device: torch.device, weight
 
 
 def load_jukebox_model(model_dir_or_file: str, level_name: str, device: torch.device, weights_file: str = 'best_model.pth') -> JukeboxVQVAE:
-    model_file, config_path = _resolve_model_file(model_dir_or_file, weights_file)
+    model_file, config_path = _resolve_model_file(model_dir_or_file, weights_file, level_name=level_name)
 
     if not os.path.exists(config_path):
         raise FileNotFoundError(f'Config file not found at {config_path}')

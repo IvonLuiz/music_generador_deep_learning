@@ -1,4 +1,5 @@
 import os
+import json
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -12,6 +13,35 @@ class LossPlotter:
         self.save_path = save_path
         self.history = {}
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    @property
+    def history_path(self):
+        return os.path.join(os.path.dirname(self.save_path), 'loss_history.json')
+
+    def set_history(self, history: dict):
+        if history is None:
+            self.history = {}
+            return
+        self.history = {k: list(v) for k, v in history.items()}
+
+    def load_history(self, history_path: str = None):
+        path = history_path or self.history_path
+        if not os.path.exists(path):
+            return {}
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        normalized = {}
+        for key, values in data.items():
+            normalized[key] = list(values) if isinstance(values, list) else []
+        self.history = normalized
+        return self.history
+
+    def save_history(self, history_path: str = None):
+        path = history_path or self.history_path
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(self.history, f, indent=2)
 
     def update(self, metrics: dict):
         """
