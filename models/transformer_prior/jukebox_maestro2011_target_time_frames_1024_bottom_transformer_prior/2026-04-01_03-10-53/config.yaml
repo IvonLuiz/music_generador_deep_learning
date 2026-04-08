@@ -1,0 +1,84 @@
+dataset:
+  processed_path: ./data/processed/maestro_spectrograms_2011_time_frames_1024/
+  target_time_frames: 1024
+model:
+  inferred_grids:
+    bottom:
+    - 128
+    - 32
+    middle:
+    - 64
+    - 16
+    top:
+    - 32
+    - 8
+  inferred_seq_lens:
+    bottom: 4096
+    middle: 1024
+    top: 256
+  inferred_upsample_stride: 4
+  name: jukebox_maestro2011_target_time_frames_1024
+  selected_level: bottom
+priors:
+  bottom_prior:
+    block_len: 32
+    conditioner_conv_channels: 1024
+    conditioner_dilation_cycle: 8
+    conditioner_dilation_growth_rate: 3
+    conditioner_kernel_size: 3
+    conditioner_residual_block_width: 1024
+    conditioner_residual_blocks: 16
+    conditioner_upsample_stride: 4
+    dim_feedforward: 960
+    dropout: 0.1
+    model_dim: 960
+    num_heads: 1
+    num_layers: 36
+  middle_prior:
+    block_len: 16
+    conditioner_conv_channels: 1024
+    conditioner_dilation_cycle: 8
+    conditioner_dilation_growth_rate: 3
+    conditioner_kernel_size: 3
+    conditioner_residual_block_width: 1024
+    conditioner_residual_blocks: 16
+    conditioner_upsample_stride: 4
+    dim_feedforward: 960
+    dropout: 0.1
+    model_dim: 960
+    num_heads: 1
+    num_layers: 36
+  top_prior:
+    block_len: 8
+    dim_feedforward: 1200
+    dropout: 0.1
+    model_dim: 1200
+    num_heads: 8
+    num_layers: 36
+training:
+  bottom_prior:
+    batch_size: 1
+    epochs: 150
+    gradient_accumulation_steps: 32
+    learning_rate: 0.0003
+    weight_decay: 0.01
+  early_stopping_patience: 7
+  middle_prior:
+    batch_size: 2
+    epochs: 150
+    gradient_accumulation_steps: 16
+    learning_rate: 0.0003
+    weight_decay: 0.01
+  save_dir: ./models/transformer_prior/
+  top_prior:
+    batch_size: 8
+    epochs: 150
+    gradient_accumulation_steps: 4
+    learning_rate: 0.00015
+    weight_decay: 0.002
+  validation_split: 0.2
+vqvae:
+  bottom_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_time-frames-1024_bottom/2026-03-26_04-13-02
+  middle_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_time-frames-1024_middle/2026-03-26_07-18-14
+  top_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_time-frames-1024_top/2026-03-26_10-56-18
+  weights_file: best_model.pth
