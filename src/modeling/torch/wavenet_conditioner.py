@@ -4,22 +4,49 @@ import torch.nn.functional as F
 
 
 class WaveNetResidualBlock(nn.Module):
-    def __init__(self, in_channels, kernel_size, dilation, dropout):
-        super().__init__()
-        out_channels = in_channels  # For residual connection, output channels must match input channels
-    
-        # Simetric padding for non causal convolution: padding = (kernel_size - 1) * dilation
-        padding = (kernel_size - 1) // 2 * dilation
+    """!
+    @brief A single residual block used in the WaveNetConditioner, consisting of a dilated convolution followed by a
+    projection back to the residual width for the skip connection.
+    """
+    def __init__(self, residual_width: int, conv_channels: int, kernel_size: int, dilation: int, dropout: float):
+        """!
+        @brief Initializes the WaveNetResidualBlock.
         
+        @param residual_width The width of the residual connection.
+        @param conv_channels The number of channels in the convolutional layers.
+        @param kernel_size The kernel size for the convolutions.
+        @param dilation The dilation factor for the dilated convolution.
+        @param dropout The dropout probability.
+        """
+        super().__init__()
+
+        # Symmetric padding for non causal convolution: padding = (kernel_size - 1) * dilation
+        padding = (kernel_size - 1) // 2 * dilation
+
+        # dilated convolution
         self.conv = nn.Conv1d(
-            in_channels, out_channels, kernel_size,
-            dilation=dilation, padding=padding
+            in_channels=residual_width,
+            out_channels=conv_channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=padding
         )
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
-        self.proj = nn.Conv1d(out_channels, in_channels, kernel_size=1)
+        # project back from 'conv_channels' to 'residual_width' for the residual connection
+        self.proj = nn.Conv1d(
+            in_channels=conv_channels,
+            out_channels=residual_width,
+            kernel_size=1
+        )
 
     def forward(self, x):
+        """!
+        @brief Forward pass of the WaveNetResidualBlock.
+        
+        @param x A tensor of shape (Batch, Channels, Seq_len) containing the input to the block.
+        @return A tensor of the same shape as x containing the output of the block after adding the residual connection.
+        """
         residual = x
         x = self.conv(x)
         x = self.relu(x)
@@ -47,6 +74,7 @@ class WaveNetConditioner(nn.Module):
         num_layers: int = 16,
         num_channels: int = 1024,
         kernel_size: int = 3,
+        conv_channels: int = 1024,
         dilation_growth: int = 3,
         dilation_cycle: int = 8,
         upsample_stride: int = 4,
@@ -60,6 +88,7 @@ class WaveNetConditioner(nn.Module):
         @param num_layers The number of dilated convolutional layers.
         @param num_channels The number of channels in the convolutional layers.
         @param kernel_size The kernel size for the convolutions. Defaults to 3.
+        @param conv_channels The number of channels in the convolutional layers. Defaults to 1024.
         @param dilation_growth The growth factor for the dilation. Defaults to 3.
         @param dilation_cycle The cycle length for the dilation. Defaults to 8.
         @param upsample_stride The stride for the upsampling convolution.
@@ -78,7 +107,12 @@ class WaveNetConditioner(nn.Module):
             # calculate dilation for layer: 1, 3, 9, 27, ... (if growth by factor of 3)
             dilation = dilation_growth ** (i % dilation_cycle)
             self.layers.append(
-                WaveNetResidualBlock(num_channels, kernel_size, dilation, dropout)
+                WaveNetResidualBlock(
+                    residual_width=num_channels,
+                    conv_channels=conv_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    dropout=dropout)
             )
         
         # Upsampling layer to match the temporal resolution of the target sequence (e.g., for audio, this would upsample from the token rate to the audio sample rate)

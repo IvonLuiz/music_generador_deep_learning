@@ -1,16 +1,16 @@
 dataset:
-  processed_path: "./data/processed/maestro_spectrograms_test/"
-  target_time_frames: 256
+  processed_path: "./data/processed/maestro_spectrograms_2011_time_frames_1024/"
+  target_time_frames: 1024
 
 vqvae:
   # Update to your latest trained Jukebox VQ-VAE runs per level.
-  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_top/2026-03-22_09-41-44"
-  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_middle/2026-03-22_06-54-25"
-  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_bottom/2026-03-22_03-23-39"
+  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_time-frames-1024_top/2026-03-26_10-56-18"
+  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_time-frames-1024_middle/2026-03-26_07-18-14"
+  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_time-frames-1024_bottom/2026-03-26_04-13-02"
   weights_file: "best_model.pth"
 
 model:
-  name: "jukebox_maestro2011"
+  name: "jukebox_maestro2011_target_time_frames_1024"
 
 # Configurations related to the upsampler are calculated in the script, example:
 # the python training script will read the VQ-VAE configs to determine the number of tokens at each level,
@@ -20,33 +20,62 @@ model:
 # needing to hardcode those details here.
 priors:
   top_prior:
-    model_dim: 512
-    num_heads: 8
-    num_layers: 12
-    dim_feedforward: 2048
+    model_dim: 1200       # Transformer width (size of the embedding vector for each token) (Jukebox uses 4800)
+    num_heads: 8          # Atention heads (Jukebox uses 8 for Top)
+    num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
+    dim_feedforward: 1200 # Transformer feedforward layers
     dropout: 0.1
     block_len: 8  # Because Top grid is 8x8
   middle_prior:
-    model_dim: 512
-    num_heads: 8
-    num_layers: 12
-    dim_feedforward: 2048
+    model_dim: 960        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
+    num_heads: 1          # Atention heads (Jukebox uses 1 for Middle)
+    num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
+    dim_feedforward: 960  # Transformer feedforward layers
     dropout: 0.1
     block_len: 16  # Because Middle grid is 16x16
+    # condiditioner parameters
+    conditioner_residual_block_width: 1024
+    conditioner_residual_blocks: 16
+    conditioner_kernel_size: 3
+    conditioner_conv_channels: 1024
+    conditioner_dilation_growth_rate: 3
+    conditioner_dilation_cycle: 8
+    conditioner_upsample_stride: 4 # Because Middle grid is 16x16 and Top grid is 8x8, we need to upsample by a factor of 2 in each dimension (16/8 = 2)
   bottom_prior:
-    model_dim: 512
-    num_heads: 8
-    num_layers: 12
-    dim_feedforward: 2048
+    model_dim: 960        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
+    num_heads: 1          # Atention heads (Jukebox uses 1 for Bottom)
+    num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
+    dim_feedforward: 960  # Transformer feedforward layers
     dropout: 0.1
     block_len: 32  # Because Bottom grid is 32x32
+    # condiditioner parameters
+    conditioner_residual_block_width: 1024
+    conditioner_residual_blocks: 16
+    conditioner_kernel_size: 3
+    conditioner_conv_channels: 1024
+    conditioner_dilation_growth_rate: 3
+    conditioner_dilation_cycle: 8
+    conditioner_upsample_stride: 4 # Because Bottom grid is 32x32 and Middle grid is 16x16, we need to upsample by a factor of 2 in each dimension (32/16 = 2)
 
 training:
-  batch_size: 16
-  quantization_batch_size: 32
-  learning_rate: 0.0003  # Warmup to lr then cosine decay
-  weight_decay: 0.01
-  epochs: 150
+  top_prior:
+    batch_size: 8
+    gradient_accumulation_steps: 4
+    learning_rate: 0.00015  # Warmup to lr then cosine decay
+    weight_decay: 0.002
+    epochs: 150
+  middle_prior:
+    batch_size: 2
+    gradient_accumulation_steps: 16
+    learning_rate: 0.0003  # Warmup to lr then cosine decay
+    weight_decay: 0.01
+    epochs: 150
+  bottom_prior:
+    batch_size: 1
+    gradient_accumulation_steps: 32
+    learning_rate: 0.0003  # Warmup to lr then cosine decay
+    weight_decay: 0.01
+    epochs: 150
   validation_split: 0.2
   early_stopping_patience: 7
   save_dir: "./models/transformer_prior/"
