@@ -49,7 +49,7 @@ class MmapSpectrogramDataset(Dataset):
 class LazySpectrogramDataset(Dataset):
     """
     Loads .npy files from disk on-demand to save RAM, 
-    and automatically enforces strict 256x256 dimensions.
+    and enforces a fixed time-axis length (target_time_frames).
     """
     def __init__(self, file_paths, target_time_frames=256):
         self.file_paths = file_paths
@@ -66,14 +66,14 @@ class LazySpectrogramDataset(Dataset):
         if spec.ndim == 3 and spec.shape[-1] == 1:
             spec = spec[:, :, 0]
             
-        # Crop or Pad the Time dimension to be exactly 256
+        # Crop or pad only the time dimension to target_time_frames.
         if spec.shape[1] > self.target_time_frames:
             spec = spec[:, :self.target_time_frames] # Crop
         elif spec.shape[1] < self.target_time_frames:
             pad_width = self.target_time_frames - spec.shape[1]
             spec = np.pad(spec, ((0, 0), (0, pad_width)), mode='constant') # Pad
             
-        # Add the Channel dimension back to the front: (1, 256, 256)
+        # Add the channel dimension for PyTorch: (1, freq_bins, target_time_frames)
         spec = spec[np.newaxis, ...]
         
         return torch.from_numpy(spec).float()
