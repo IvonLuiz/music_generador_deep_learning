@@ -58,8 +58,10 @@ if __name__ == "__main__":
     early_stopping_patience = config['training'].get('early_stopping_patience', 20)
     num_workers = config['training'].get('num_workers', 4) # Default to 4 for lazy loading
     pin_memory = config['training'].get('pin_memory', True) # Default to True for speed
-    persist_workers = bool(config['training'].get('persist_workers', None))
-    prefetch_factor = int(config['training'].get('prefetch_factor', None))
+    persist_workers_cfg = config['training'].get('persist_workers', True)
+    persist_workers = bool(persist_workers_cfg) if persist_workers_cfg is not None else True
+    prefetch_factor_cfg = config['training'].get('prefetch_factor', 4)
+    prefetch_factor = int(prefetch_factor_cfg) if prefetch_factor_cfg is not None else None
     spectrograms_path = config['dataset']['processed_path']
     target_time_frames = int(config['dataset'].get('target_time_frames', 256))
     min_max_values_path = config['dataset']['min_max_values_path']
