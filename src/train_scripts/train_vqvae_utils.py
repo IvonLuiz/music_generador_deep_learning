@@ -83,6 +83,17 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
     val_dataloader = None
     val_dataset = None
 
+    def _loader_kwargs():
+        kwargs = {
+            'num_workers': num_workers,
+            'pin_memory': pin_memory,
+        }
+        if num_workers > 0:
+            kwargs['persistent_workers'] = persist_workers
+            if prefetch_factor is not None:
+                kwargs['prefetch_factor'] = prefetch_factor
+        return kwargs
+
     if x_val is not None:
         if isinstance(x_val, (np.ndarray, list)):
             if len(x_val) > 0:
@@ -90,8 +101,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                 val_dataset = SpectrogramDataset(x_val)
                 val_dataloader = DataLoader(
                     val_dataset, batch_size=batch_size, shuffle=False,
-                    num_workers=num_workers, pin_memory=pin_memory,
-                    persistent_workers=persist_workers, prefetch_factor=prefetch_factor
+                    **_loader_kwargs(),
                 )
                 early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
         else:
@@ -100,8 +110,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
             val_dataset = x_val
             val_dataloader = DataLoader(
                 val_dataset, batch_size=batch_size, shuffle=False,
-                num_workers=num_workers, pin_memory=pin_memory,
-                persistent_workers=persist_workers, prefetch_factor=prefetch_factor
+                **_loader_kwargs(),
             )
             early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
     
@@ -115,9 +124,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
         
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=pin_memory,
-        persistent_workers=persist_workers, # Each worker fetches 4 batches in advance (8 * 4 = 32 batches ready in RAM)
-        prefetch_factor=prefetch_factor, 
+        **_loader_kwargs(),
     )
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)

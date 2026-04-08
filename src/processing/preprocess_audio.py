@@ -10,6 +10,7 @@ TARGET_TIME_FRAMES = 1024  # Adjust this for desired length TODO: change to 1024
 SAMPLE_RATE = 22050    # samples per second
 FRAME_SIZE = 512       # samples for each STFT window
 HOP_LENGTH = 256       # move amount of samples between windows
+MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_spectrograms_2011_time_frames_1024/min_max_values/"
 
 
 class Loader:
