@@ -158,7 +158,7 @@ def _generate_level_tokens(
 ) -> List[np.ndarray]:
     token_blocks = []
     curr_start_token = None
-    current_time_id = torch.tensor([0], dtype=torch.long).to(device) if use_time_id else None
+    max_time_steps = getattr(prior, 'max_time_steps', None) if use_time_id else None
 
     for chunk in range(chunks_to_generate):
         upper_indices = None
@@ -175,6 +175,10 @@ def _generate_level_tokens(
             'device': device,
         }
         if use_time_id:
+            time_id_value = chunk
+            if isinstance(max_time_steps, int) and max_time_steps > 0:
+                time_id_value = chunk % max_time_steps
+            current_time_id = torch.tensor([time_id_value], dtype=torch.long, device=device)
             generate_kwargs['time_id'] = current_time_id
 
         with torch.no_grad():
