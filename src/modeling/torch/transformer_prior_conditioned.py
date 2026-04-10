@@ -46,10 +46,11 @@ class TransformerPriorConditioned(nn.Module):
         dim_feedforward: int,
         max_seq_len: int,
         block_len: int = 16,
-        max_time_steps: int = 500,
+        max_time_steps: int = 100,
         is_upsampler: bool = False,
         cond_num_embeddings: Optional[int] = None,
         upsample_stride: Optional[int] = None,
+        use_bos_token: bool = False,
         conditioner_residual_block_width: int = 1024,
         conditioner_residual_blocks: int = 16,
         conditioner_kernel_size: int = 3,
@@ -73,7 +74,7 @@ class TransformerPriorConditioned(nn.Module):
         @param max_seq_len The maximum sequence length the model can process.
         @param max_time_steps The maximum number of time steps the model can process. This is used for the time
         embedding and should be set based on the expected maximum length of the input sequences in terms of time steps
-        (chunks). Defaults to 500.
+        (chunks). Defaults to 100.
         @param is_upsampler Whether this prior is an upsampler (i.e., conditions on another prior's output).
         This is used to determine whether conditioning embeddings are expected. Defaults to False.
         @param cond_num_embeddings The vocabulary size for the conditioning input (if any).
@@ -82,6 +83,8 @@ class TransformerPriorConditioned(nn.Module):
         Comes from the output of the previous level prior. Defaults to None (no conditioning).
         @param upsample_stride The stride for upsampling in the WaveNet conditioner. This is the ratio between the
         input and output sequences of the conditioner. Defaults to None (no upsampling).
+        @param use_bos_token Whether to reserve an extra input token ID for beginning-of-sequence conditioning.
+        When enabled, token embeddings accept IDs in [0, num_embeddings] and generation starts from bos_token_id.
         @param conditioner_residual_block_width The number of channels in the residual blocks of the WaveNet conditioner. Defaults to 1024.
         @param conditioner_residual_blocks The number of residual blocks in the WaveNet conditioner. Defaults to 16.
         @param conditioner_kernel_size The kernel size for the WaveNet conditioner. Defaults to 3.
@@ -99,6 +102,10 @@ class TransformerPriorConditioned(nn.Module):
         self.max_seq_len = max_seq_len
         self.block_len = block_len
         self.dropout = dropout
+        self.max_time_steps = max_time_steps
+        self.use_bos_token = use_bos_token
+        self.bos_token_id = num_embeddings if use_bos_token else None
+        self.input_vocab_size = num_embeddings + (1 if use_bos_token else 0)
 
         # Initialize the conditioner if this is an upsampling prior
         self.is_upsampler = is_upsampler
@@ -121,7 +128,7 @@ class TransformerPriorConditioned(nn.Module):
             )
 
         # Embedding layers for tokens and positions        
-        self.token_embedding = nn.Embedding(num_embeddings, model_dim)
+        self.token_embedding = nn.Embedding(self.input_vocab_size, model_dim)
         self.pos_embedding = nn.Embedding(max_seq_len, model_dim)
         self.time_embedding = nn.Embedding(max_time_steps, model_dim)
 
@@ -163,7 +170,8 @@ class TransformerPriorConditioned(nn.Module):
         @param indices The input token indices for the current level (shape: [batch_size, seq_len]).
         @param upper_indices The input token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
         This is used as conditioning information for upsampler priors. Defaults to None (no conditioning).
-        @param time_ids The time step IDs for each token position (shape: [batch_size, seq_len]). This is used for time embeddings.
+        @param time_ids Optional time step IDs used for temporal conditioning.
+        Accepts shape [batch_size], [batch_size, 1], or [batch_size, seq_len].
         @return Logits over the vocabulary for the next token prediction (shape: [batch_size, seq_len, num_embeddings]).
         """
         if indices.ndim != 2:
@@ -172,6 +180,10 @@ class TransformerPriorConditioned(nn.Module):
         batch_size, seq_len = indices.shape
         if seq_len > self.max_seq_len:
             raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}")
+        if torch.any(indices < 0) or torch.any(indices >= self.input_vocab_size):
+            raise ValueError(
+                f"indices must be in [0, {self.input_vocab_size - 1}], got min={int(indices.min())}, max={int(indices.max())}"
+            )
 
         device = indices.device
         pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
