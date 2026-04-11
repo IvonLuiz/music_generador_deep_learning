@@ -186,8 +186,9 @@ class JukeboxVQVAE(nn.Module):
         """
         self.eval()
         with torch.no_grad():
-            x_recon, _, _ = self.forward(x)
-        return x_recon
+            with torch.autocast(device_type=x.device.type, enabled=x.device.type == 'cuda'):
+                x_recon, _, _ = self.forward(x)
+        return x_recon.float()
 
 
 if __name__ == "__main__":
