@@ -228,17 +228,37 @@ class TransformerPriorConditioned(nn.Module):
         
         return logits
 
-    def loss(self, indices: torch.Tensor, upper_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Next-token cross-entropy on a full sequence tensor (B, T)."""
+    def loss(
+        self,
+        indices: torch.Tensor,
+        upper_indices: Optional[torch.Tensor] = None,
+        time_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """!
+        Next-token cross-entropy on a full sequence tensor (B, T).
+        
+        @param indices The input token indices for the current level (shape: [batch_size, seq_len]).
+        @param upper_indices The input token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
+        This is used as conditioning information for upsampler priors. Defaults to None (no conditioning).
+        @param time_ids Optional time step IDs used for temporal conditioning. Accepts shape [batch_size], [batch_size, 1], or [batch_size, seq_len]. Defaults to None.
+        @return The computed cross-entropy loss for next-token prediction.
+        """
         if indices.ndim != 2:
             raise ValueError(f"indices must have shape (B, T), got {tuple(indices.shape)}")
-        if indices.shape[1] < 2:
-            raise ValueError("Need sequence length >= 2 for next-token training")
+        min_seq_len = 1 if self.use_bos_token else 2
+        if indices.shape[1] < min_seq_len:
+            raise ValueError(f"Need sequence length >= {min_seq_len} for next-token training")
         
-        # For next-token prediction, the input to the model is the sequence excluding the last token,
-        # and the target is the sequence excluding the first token.
-        input_tokens = indices[:, :-1]  # Length: T - 1
-        target = indices[:, 1:]         # Length: T - 1
+        # For next-token prediction, prepend BOS when enabled so the model learns to start from an empty prefix.
+        if self.use_bos_token:
+            bos = torch.full((indices.shape[0], 1), self.bos_token_id, dtype=indices.dtype, device=indices.device)
+            input_tokens = torch.cat([bos, indices[:, :-1]], dim=1)
+            target = indices
+        else:
+            # For next-token prediction, the input to the model is the sequence excluding the last token,
+            # and the target is the sequence excluding the first token.
+            input_tokens = indices[:, :-1]  # Length: T - 1
+            target = indices[:, 1:]         # Length: T - 1
         
         # Pass upper_indices through to forward
         logits = self.forward(input_tokens, upper_indices=upper_indices)
