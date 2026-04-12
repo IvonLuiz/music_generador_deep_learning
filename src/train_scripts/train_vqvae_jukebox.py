@@ -3,6 +3,7 @@ import argparse
 import torch
 import numpy as np
 import os
+import random
 import json
 import yaml
 import sys
@@ -19,10 +20,18 @@ from generation.generate import *
 from utils import load_config
 from train_scripts.train_vqvae_utils import train_vqvae_jukebox
 from datasets.spectrogram_dataset import LazySpectrogramDataset
-
-from .resume_utils import load_resume_artifacts
+from resume_utils import load_resume_artifacts
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+
+def set_global_seed(seed: int) -> None:
+    """Set global RNG seeds without forcing deterministic kernels (keeps training fast)."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 if __name__ == "__main__":
     # Optional: faster matmul on Ampere+ GPUs
@@ -52,32 +61,59 @@ if __name__ == "__main__":
     config_path = "./config/config_jukebox.yaml"
     config = load_config(config_path)
 
-    batch_size = config['training']['batch_size']
-    learning_rate = config['training']['learning_rate']
-    epochs = config['training']['epochs']
-    early_stopping_patience = config['training'].get('early_stopping_patience', 20)
-    num_workers = config['training'].get('num_workers', 4) # Default to 4 for lazy loading
-    pin_memory = config['training'].get('pin_memory', True) # Default to True for speed
-    persist_workers_cfg = config['training'].get('persist_workers', True)
-    persist_workers = bool(persist_workers_cfg) if persist_workers_cfg is not None else True
-    prefetch_factor_cfg = config['training'].get('prefetch_factor', 4)
-    prefetch_factor = int(prefetch_factor_cfg) if prefetch_factor_cfg is not None else None
-    spectrograms_path = config['dataset']['processed_path']
-    target_time_frames = int(config['dataset'].get('target_time_frames', 256))
-    min_max_values_path = config['dataset']['min_max_values_path']
-    model_save_dir = config['training']['save_dir']
-    model_name = config['model']['name']
+    # Determine selected level first
     model_cfg = config['model']
-    retrain = bool(config['training'].get('retrain', False))
-    pretrained_weights_path = config['training'].get('pretrained_weights_path')
-
-    print(f"Configuration loaded. Model: {model_name}, Save Dir: {model_save_dir}")
-    print(f"Training parameters: batch_size={batch_size}, learning_rate={learning_rate}, epochs={epochs}, early_stopping_patience={early_stopping_patience}")
-    print(f"Data loading parameters: num_workers={num_workers}, pin_memory={pin_memory}, persist_workers={persist_workers}, prefetch_factor={prefetch_factor}")
-    print(f"Dataset target_time_frames={target_time_frames}")
-
     selected_level = args.level or model_cfg.get('selected_level', 'bottom')
     selected_level = str(selected_level).lower()
+
+    # Merge general training config with level-specific config
+    train_general_cfg = config['training']
+    train_level_cfg = train_general_cfg.get(selected_level, {})
+    # Filter out level-specific keys and merge
+    train_cfg = {k: v for k, v in train_general_cfg.items() if k not in ['bottom', 'middle', 'top']}
+    train_cfg.update(train_level_cfg)
+    seed = int(train_cfg.get('seed', 42))
+    set_global_seed(seed)
+
+    # Extract parameters
+    batch_size = train_cfg.get('batch_size')
+    grad_accum_steps = train_cfg.get('gradient_accumulation_steps', 1)  # Default to 1
+    learning_rate = train_cfg.get('learning_rate')
+    epochs = train_cfg.get('epochs')
+    validation_split = train_cfg.get('validation_split', 0.2)
+    early_stopping_patience = train_cfg.get('early_stopping_patience', 20)
+    num_workers = train_cfg.get('num_workers', 4)
+    pin_memory = train_cfg.get('pin_memory', True)
+    persist_workers_cfg = train_cfg.get('persist_workers', True)
+    persist_workers = bool(persist_workers_cfg) if persist_workers_cfg is not None else True
+    prefetch_factor_cfg = train_cfg.get('prefetch_factor', 4)
+    prefetch_factor = int(prefetch_factor_cfg) if prefetch_factor_cfg is not None else None
+
+    # Dataset and model paths
+    dataset_cfg = config['dataset']
+    spectrograms_path = dataset_cfg['processed_path']
+    target_time_frames = int(dataset_cfg.get('target_time_frames', 256))
+    min_max_values_path = dataset_cfg['min_max_values_path']
+    sample_rate = int(dataset_cfg.get('sample_rate', 22050))
+    hop_length = int(dataset_cfg.get('hop_length', 256))
+    frame_size = int(dataset_cfg.get('frame_size', 512))
+    spectrogram_type_cfg = dataset_cfg.get('spectrogram_type')
+    if spectrogram_type_cfg is None:
+        spectrogram_type = 'mel' if 'mel' in str(spectrograms_path).lower() else 'linear'
+    else:
+        spectrogram_type = str(spectrogram_type_cfg).strip().lower()
+    n_mels = int(dataset_cfg.get('n_mels', 256))
+    model_save_dir = train_cfg['save_dir']
+    model_name = model_cfg['name']
+    retrain = bool(train_cfg.get('retrain', False))
+    pretrained_weights_path = train_cfg.get('pretrained_weights_path')
+
+    print(f"Configuration loaded. Model: {model_name}, Level: {selected_level}, Save Dir: {model_save_dir}")
+    print(f"Training parameters: batch_size={batch_size}, grad_accum_steps={grad_accum_steps}, learning_rate={learning_rate}, epochs={epochs}, early_stopping_patience={early_stopping_patience}")
+    print(f"Reproducibility seed: {seed}")
+    print(f"Data loading parameters: num_workers={num_workers}, pin_memory={pin_memory}, persist_workers={persist_workers}, prefetch_factor={prefetch_factor}")
+    print(f"Dataset target_time_frames={target_time_frames}, validation_split={validation_split}")
+    print(f"Audio inversion settings: spectrogram_type={spectrogram_type}, sample_rate={sample_rate}, hop_length={hop_length}, frame_size={frame_size}, n_mels={n_mels}")
 
     level_profiles = model_cfg.get('level_profiles')
     if level_profiles is None:
@@ -143,23 +179,22 @@ if __name__ == "__main__":
     # --- LAZY LOADING IMPLEMENTATION ---
     print(f"Scanning for spectrogram files in {spectrograms_path}...")
     all_file_paths = glob.glob(os.path.join(spectrograms_path, "**/*.npy"), recursive=True)
+    all_file_paths = sorted(all_file_paths)
     
     if not all_file_paths:
         raise FileNotFoundError(f"No .npy files found in {spectrograms_path}")
     
     print(f"Found {len(all_file_paths)} files. Creating lazy datasets...")
 
-    # Data variance calculation on a small subset (100 files) to save time/RAM
-    subset_paths = all_file_paths[:min(100, len(all_file_paths))]
-    subset_data = np.stack([np.load(p) for p in subset_paths])
+    # Data variance calculation
+    subset_data = np.stack([np.load(p) for p in all_file_paths])
     data_variance = np.var(subset_data)
     del subset_data
     gc.collect()
 
     # Split into train/val
-    np.random.shuffle(all_file_paths)
-    validation_split = config['training'].get('validation_split', 0.2)
-    
+    split_rng = np.random.default_rng(seed)
+    split_rng.shuffle(all_file_paths)
     if validation_split > 0:
         num_val = int(len(all_file_paths) * validation_split)
         num_train = len(all_file_paths) - num_val
@@ -219,6 +254,7 @@ if __name__ == "__main__":
         min_max_values=min_max_values,
         device=device,
         batch_size=batch_size,
+        grad_accum_steps=grad_accum_steps,
         learning_rate=learning_rate,
         epochs=epochs,
         save_path=model_file_path,
@@ -233,6 +269,12 @@ if __name__ == "__main__":
         resume_checkpoint_path=pretrained_weights_path if retrain else None,
         resume_history=resume_history,
         initial_best_metric=initial_best_metric,
+        spectrogram_type=spectrogram_type,
+        sample_rate=sample_rate,
+        hop_length=hop_length,
+        frame_size=frame_size,
+        n_mels=n_mels,
+        seed=seed,
     )
 
     best_model_path = os.path.join(run_dir, 'best_model.pth')
