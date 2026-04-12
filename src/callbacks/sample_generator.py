@@ -4,13 +4,25 @@ import numpy as np
 import matplotlib.pyplot as plt
 import soundfile as sf
 from generation.soundgenerator import SoundGenerator
-from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE
+from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE, FRAME_SIZE
 
 class SampleGenerator:
     """
     Generates and saves spectrograms and audio samples during training.
     """
-    def __init__(self, model, samples, min_max_values, save_dir, device):
+    def __init__(
+        self,
+        model,
+        samples,
+        min_max_values,
+        save_dir,
+        device,
+        spectrogram_type="linear",
+        hop_length=HOP_LENGTH,
+        sample_rate=SAMPLE_RATE,
+        n_fft=FRAME_SIZE,
+        n_mels=256,
+    ):
         """
         Args:
             model: The VQ-VAE model.
@@ -24,7 +36,14 @@ class SampleGenerator:
         self.min_max_values = min_max_values
         self.save_dir = save_dir
         self.device = device
-        self.sound_generator = SoundGenerator(model, hop_length=HOP_LENGTH)
+        self.sound_generator = SoundGenerator(
+            model,
+            hop_length=hop_length,
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            spectrogram_type=spectrogram_type,
+            n_mels=n_mels,
+        )
 
     def step(self, epoch):
         epoch_save_dir = os.path.join(self.save_dir, "samples", f"epoch_{epoch+1:03d}")

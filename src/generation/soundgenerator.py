@@ -9,9 +9,15 @@ from processing.preprocess_audio import MinMaxNormalizer
 
 class SoundGenerator:
 
-    def __init__(self, autoencoder, hop_length):
+    def __init__(self, autoencoder, hop_length, sample_rate=22050, n_fft=512, spectrogram_type="linear", n_mels=256):
         self.autoencoder = autoencoder 
         self.hop_length = hop_length
+        self.sample_rate = sample_rate
+        self.n_fft = n_fft
+        self.n_mels = n_mels
+        self.spectrogram_type = str(spectrogram_type).strip().lower()
+        if self.spectrogram_type not in ("linear", "mel"):
+            raise ValueError(f"Unsupported spectrogram_type '{spectrogram_type}'. Expected 'linear' or 'mel'.")
         self.__min_max_normalizer = MinMaxNormalizer(0, 1)
 
     
@@ -41,7 +47,13 @@ class SoundGenerator:
             with torch.no_grad():
                 x = x.to(device)
                 model: Any = self.autoencoder
-                x_hat, z_q = model.reconstruct(x)  # (N,1,H,W), (N, D, h, w)
+                recon_out = model.reconstruct(x)
+                if isinstance(recon_out, tuple):
+                    x_hat = recon_out[0]
+                    z_q = recon_out[1] if len(recon_out) > 1 else recon_out[0]
+                else:
+                    x_hat = recon_out
+                    z_q = recon_out
                 x_hat = x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()  # (N,H,W,1)
                 # For latent representations, return a detached cpu numpy copy
                 latent_representations = z_q.detach().cpu().numpy()
@@ -93,25 +105,46 @@ class SoundGenerator:
         Returns:
             1D numpy array audio signal
         """
-        # Log spectrogram (dB) to amplitude domain
-        amplitude_spectrogram = librosa.db_to_amplitude(log_spectrogram)
-        amplitude_spectrogram = np.nan_to_num(amplitude_spectrogram, nan=0.0, posinf=1e6, neginf=0.0)
-        amplitude_spectrogram = np.maximum(amplitude_spectrogram, 0.0)
-        
-        # Pad the spectrogram to restore the Nyquist frequency bin if it was trimmed
-        # STFT produces (n_fft // 2 + 1) bins, which is odd for even n_fft.
-        # If we have an even number of bins (e.g. 256), it means the Nyquist bin was removed.
-        if amplitude_spectrogram.shape[0] % 2 == 0:
-             amplitude_spectrogram = np.pad(amplitude_spectrogram, ((0, 1), (0, 0)), mode='constant')
+        if self.spectrogram_type == "mel":
+            # Mel extractor uses power_to_db, so invert with db_to_power.
+            mel_power = librosa.db_to_power(log_spectrogram)
+            mel_power = np.nan_to_num(mel_power, nan=0.0, posinf=1e6, neginf=0.0)
+            mel_power = np.maximum(mel_power, 0.0)
 
-        if method =='griffinlim':
-            # Use Griffin-Lim for phase estimation to improve audio quality
-            audio_signal = librosa.griffinlim(amplitude_spectrogram, hop_length=self.hop_length)
-        elif method == "istft":
-            # STFT to get audio signal (robotic without phase reconstruction)
-            audio_signal = librosa.istft(amplitude_spectrogram, hop_length=self.hop_length)
+            if method == 'griffinlim':
+                audio_signal = librosa.feature.inverse.mel_to_audio(
+                    M=mel_power,
+                    sr=self.sample_rate,
+                    n_fft=self.n_fft,
+                    hop_length=self.hop_length,
+                    power=2.0,
+                )
+            elif method == "istft":
+                magnitude_stft = librosa.feature.inverse.mel_to_stft(
+                    M=mel_power,
+                    sr=self.sample_rate,
+                    n_fft=self.n_fft,
+                    power=2.0,
+                )
+                audio_signal = librosa.istft(magnitude_stft, hop_length=self.hop_length, n_fft=self.n_fft)
+            else:
+                raise ValueError(f"Unsupported inversion method: {method}")
         else:
-            raise ValueError(f"Unsupported inversion method: {method}")
+            # Linear log-magnitude spectrogram path.
+            amplitude_spectrogram = librosa.db_to_amplitude(log_spectrogram)
+            amplitude_spectrogram = np.nan_to_num(amplitude_spectrogram, nan=0.0, posinf=1e6, neginf=0.0)
+            amplitude_spectrogram = np.maximum(amplitude_spectrogram, 0.0)
+
+            # If Nyquist bin was trimmed during preprocessing (256 bins for n_fft=512), restore it.
+            if amplitude_spectrogram.shape[0] == self.n_fft // 2:
+                amplitude_spectrogram = np.pad(amplitude_spectrogram, ((0, 1), (0, 0)), mode='constant')
+
+            if method == 'griffinlim':
+                audio_signal = librosa.griffinlim(amplitude_spectrogram, hop_length=self.hop_length, n_fft=self.n_fft)
+            elif method == "istft":
+                audio_signal = librosa.istft(amplitude_spectrogram, hop_length=self.hop_length, n_fft=self.n_fft)
+            else:
+                raise ValueError(f"Unsupported inversion method: {method}")
 
         audio_signal = np.nan_to_num(audio_signal, nan=0.0, posinf=0.0, neginf=0.0)
         
