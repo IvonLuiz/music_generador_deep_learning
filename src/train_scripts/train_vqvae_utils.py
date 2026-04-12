@@ -4,6 +4,7 @@ import matplotlib
 matplotlib.use('Agg') # Set non-interactive backend to avoid thread issues
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from typing import Optional
 
 import torch
 from torch import optim
@@ -16,7 +17,7 @@ from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
 from modeling.torch.vq_vae import VQ_VAE
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from datasets.spectrogram_dataset import SpectrogramDataset
-from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE
+from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE, FRAME_SIZE
 from utils import find_min_max_for_path
 from callbacks import EarlyStopping, ModelCheckpoint, LossPlotter, SampleGenerator
 
@@ -52,7 +53,13 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                              num_workers: int = 4,
                              pin_memory: bool = True,
                              persist_workers: bool = True,
-                             prefetch_factor: int = 4,):
+                             prefetch_factor: int = 4,
+                             spectrogram_type: str = 'linear',
+                             sample_rate: int = SAMPLE_RATE,
+                             hop_length: int = HOP_LENGTH,
+                             frame_size: int = FRAME_SIZE,
+                             n_mels: int = 256,
+                             seed: Optional[int] = None,):
     """
     Train a VQ-VAE Hierarchical model.
 
@@ -168,16 +175,32 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                 samples = x_train[:4]
             sample_paths = train_file_paths[:4] if train_file_paths else None
         
-        spectrograms_dir = os.path.dirname(sample_paths[0])
         sample_min_max = []
-        for fp in sample_paths:
-            mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
-            if mm is None:
-                print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
-                mm = {"min": 0.0, "max": 1.0}
-            sample_min_max.append(mm)
+        if sample_paths and len(sample_paths) > 0:
+            spectrograms_dir = os.path.dirname(sample_paths[0])
+            for fp in sample_paths:
+                mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
+                if mm is None:
+                    print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
+                    mm = {"min": 0.0, "max": 1.0}
+                sample_min_max.append(mm)
+        else:
+            # HDF5 workflows may not have file paths for per-file min/max lookup.
+            sample_min_max = [{"min": 0.0, "max": 1.0} for _ in range(len(samples))]
+            print("Info: sample file paths are unavailable; using default min/max [0, 1] for sample generation.")
             
-        sample_generator = SampleGenerator(model, samples, sample_min_max, os.path.dirname(save_path), device)
+        sample_generator = SampleGenerator(
+            model,
+            samples,
+            sample_min_max,
+            os.path.dirname(save_path),
+            device,
+            spectrogram_type=spectrogram_type,
+            hop_length=hop_length,
+            sample_rate=sample_rate,
+            n_fft=frame_size,
+            n_mels=n_mels,
+        )
 
     best_val_loss = float('inf')
 
@@ -350,6 +373,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                         min_max_values: dict,
                         data_variance: float,
                         batch_size: int,
+                        grad_accum_steps: int,
                         epochs: int,
                         learning_rate: float,
                         save_path: str,
@@ -364,7 +388,13 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                         prefetch_factor: int = 4,
                         resume_checkpoint_path: str = None,
                         resume_history: dict = None,
-                        initial_best_metric: float = None,):
+                        initial_best_metric: float = None,
+                        spectrogram_type: str = 'linear',
+                        sample_rate: int = SAMPLE_RATE,
+                        hop_length: int = HOP_LENGTH,
+                        frame_size: int = FRAME_SIZE,
+                        n_mels: int = 256,
+                        seed: Optional[int] = None,):
     """
     Train a Jukebox VQ-VAE model.
 
@@ -375,6 +405,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
         min_max_values (dict): Dictionary of min/max values for denormalization.
         data_variance (float): Variance of the training data for loss scaling.
         batch_size (int): Batch size for training.
+        grad_accum_steps (int): Number of steps to accumulate gradients before updating model weights.
         epochs (int): Number of training epochs.
         learning_rate (float): Learning rate for the optimizer.
         save_path (str): Path to save the trained model.
@@ -442,6 +473,9 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner for potential speedup
     scaler = GradScaler(enabled=amp and device.type == 'cuda')  # For mixed precision training
+    if grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
+    print(f"Using batch size {batch_size} with gradient accumulation over {grad_accum_steps} steps for effective batch size of {batch_size * grad_accum_steps}.")
 
     start_epoch = 0
     if resume_checkpoint_path:
@@ -502,16 +536,31 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
             sample_paths = train_file_paths[:4] if train_file_paths else None
 
         sample_min_max = []
-        for fp in sample_paths:
-            mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
-            if mm is None:
-                print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
-                mm = {"min": 0.0, "max": 1.0}
-            sample_min_max.append(mm)
+        if sample_paths and len(sample_paths) > 0:
+            spectrograms_dir = os.path.dirname(sample_paths[0])
+            for fp in sample_paths:
+                mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
+                if mm is None:
+                    print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
+                    mm = {"min": 0.0, "max": 1.0}
+                sample_min_max.append(mm)
+        else:
+            # HDF5 workflows may not have original file paths.
+            sample_min_max = [{"min": 0.0, "max": 1.0} for _ in range(len(samples))]
+            print("Info: sample file paths are unavailable; using default min/max [0, 1] for sample generation.")
             
-        sample_generator = SampleGenerator(model, samples, sample_min_max, os.path.dirname(save_path), device)
-
-    best_val_loss = float('inf')
+        sample_generator = SampleGenerator(
+            model,
+            samples,
+            sample_min_max,
+            os.path.dirname(save_path),
+            device,
+            spectrogram_type=spectrogram_type,
+            hop_length=hop_length,
+            sample_rate=sample_rate,
+            n_fft=frame_size,
+            n_mels=n_mels,
+        )
 
     if start_epoch >= epochs:
         print(
@@ -621,9 +670,9 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                     with autocast(device_type=device.type, enabled=scaler.is_enabled()):
                         reconstructions, total_vq_loss, vq_losses_details = model(batch)
                         vq_loss, codebook_loss, commitment_loss = vq_losses_details[0]  # Jukebox VQ-VAE has only one quantizer
+
                         recon_loss = F.mse_loss(reconstructions, batch) / (2 * data_variance)
                         loss = recon_loss + total_vq_loss
-                    loss = recon_loss + total_vq_loss
 
                     if not torch.isfinite(loss):
                         skipped_non_finite_val_batches += 1
