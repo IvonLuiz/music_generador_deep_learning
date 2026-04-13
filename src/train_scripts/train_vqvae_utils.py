@@ -703,10 +703,13 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
             epoch_metrics['val_codebook_loss'] = avg_val_vq_losses_val[1]
             epoch_metrics['val_commitment_loss'] = avg_val_vq_losses_val[2]
 
-            val_loss_str = f", Val Loss: {avg_val_loss:.4f}"
+            val_loss_str = f"Val Loss: {avg_val_loss:.4f}"
 
-        vq_str = f"VQ Top: {avg_vq_losses[0]:.4f}, VQ Bottom: {avg_vq_losses[1]:.4f}"
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_epoch_loss:.4f}, Recon: {avg_recon_loss:.4f}, {vq_str}{val_loss_str}")
+        vq_str = f"Codebook Loss: {avg_vq_losses[1]:.4f}; Commitment Loss: {avg_vq_losses[2]:.4f}"
+        print(f"Epoch [{epoch+1}/{epochs}], Train Loss: {avg_epoch_loss:.4f} (Recon: {avg_recon_loss:.4f}; {vq_str})")
+        if val_dataloader:
+            vq_str = f"Codebook Loss: {avg_val_vq_losses_val[1]:.4f}; Commitment Loss: {avg_val_vq_losses_val[2]:.4f}"
+            print(f"Epoch [{epoch+1}/{epochs}], {val_loss_str} (Recon: {avg_val_loss:.4f}; {vq_str})")
 
         # Callbacks Step
         if loss_plotter:

@@ -14,7 +14,7 @@ import torch
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from generation.soundgenerator import SoundGenerator
-from processing.preprocess_audio import HOP_LENGTH, MIN_MAX_VALUES_SAVE_DIR, SAMPLE_RATE, TARGET_TIME_FRAMES
+from processing.preprocess_audio import HOP_LENGTH, MIN_MAX_VALUES_SAVE_DIR, SAMPLE_RATE, TARGET_TIME_FRAMES, FRAME_SIZE, N_MELS
 from train_scripts.jukebox_utils import parse_level, load_jukebox_model
 from utils import find_min_max_for_path, load_maestro
 
@@ -93,21 +93,37 @@ def _save_spectrogram_comparisons(original_specs: np.ndarray, recon_specs: np.nd
         recon = recon_specs[i, :, :, 0]
         diff = np.abs(orig - recon)
 
-        fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-        im0 = axes[0].imshow(orig, origin='lower', aspect='auto')
-        axes[0].set_title(f'Original {i}')
-        plt.colorbar(im0, ax=axes[0])
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Original Spectrogram
+        im0 = axes[0].imshow(orig, origin='lower', aspect='auto', cmap='viridis', vmin=0, vmax=1)
+        axes[0].set_title('Original')
+        axes[0].set_xlabel('Time Frames')
+        axes[0].set_ylabel('Frequency Bins')
+        plt.colorbar(im0, ax=axes[0], label='Normalized Magnitude')
 
-        im1 = axes[1].imshow(recon, origin='lower', aspect='auto')
-        axes[1].set_title(f'Reconstructed {i}')
-        plt.colorbar(im1, ax=axes[1])
+        # Reconstructed Spectrogram
+        im1 = axes[1].imshow(recon, origin='lower', aspect='auto', cmap='viridis', vmin=0, vmax=1)
+        axes[1].set_title('Reconstructed')
+        axes[1].set_xlabel('Time Frames')
+        axes[1].set_ylabel('Frequency Bins')
+        plt.colorbar(im1, ax=axes[1], label='Normalized Magnitude')
 
-        im2 = axes[2].imshow(diff, origin='lower', aspect='auto', cmap='hot')
-        axes[2].set_title(f'Abs Diff {i}')
-        plt.colorbar(im2, ax=axes[2])
+        # Diff with fixed color scale for better visibility of errors
+        im2 = axes[2].imshow(diff, origin='lower', aspect='auto', cmap='hot', vmin=0, vmax=0.4)
+        axes[2].set_title('Abs Diff')
+        axes[2].set_xlabel('Time Frames')
+        axes[2].set_ylabel('Frequency Bins')
+        plt.colorbar(im2, ax=axes[2], label='|Original - Recon|')
 
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f'comparison_{i:03d}.png'), dpi=150)
+        # Error Statistics
+        mse = np.mean(diff ** 2)
+        mae = np.mean(diff)
+        psnr = 10 * np.log10(np.max(orig) ** 2 / mse) if mse > 0 else float('inf')
+        fig.suptitle(f'Sample {i} - MSE: {mse:.4f}, MAE: {mae:.4f}, PSNR: {psnr:.2f} dB', fontsize=10)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])  # leave top 5% for suptitle
+        plt.savefig(os.path.join(out_dir, f'comparison_{i:03d}.png'), dpi=150, bbox_inches='tight')
         plt.close()
 
 
@@ -172,6 +188,14 @@ def test_jukebox_vqvae(
 
     dataset_cfg = run_config.get('dataset', {})
     spectrograms_path = dataset_cfg.get('processed_path', './data/processed/maestro_spectrograms_test/')
+    sample_rate = int(dataset_cfg.get('sample_rate', SAMPLE_RATE))
+    hop_length = int(dataset_cfg.get('hop_length', HOP_LENGTH))
+    frame_size = int(dataset_cfg.get('frame_size', FRAME_SIZE))
+    spectrogram_type_cfg = dataset_cfg.get('spectrogram_type')
+    spectrogram_type = str(spectrogram_type_cfg).strip().lower() if spectrogram_type_cfg else (
+        'mel' if 'mel' in str(spectrograms_path).lower() else 'linear'
+    )
+    n_mels = int(dataset_cfg.get('n_mels', N_MELS))
 
     mm_path = _resolve_min_max_values_path(min_max_values_path)
     min_max_values = _load_min_max_values(mm_path)
@@ -197,7 +221,14 @@ def test_jukebox_vqvae(
     indices = _extract_code_indices(model, x)
     recon_specs = x_recon.detach().cpu().permute(0, 2, 3, 1).numpy()
 
-    generator = SoundGenerator(model, hop_length=HOP_LENGTH)
+    generator = SoundGenerator(
+        model,
+        hop_length=hop_length,
+        sample_rate=sample_rate,
+        n_fft=frame_size,
+        spectrogram_type=spectrogram_type,
+        n_mels=n_mels,
+    )
     print('Converting spectrograms to audio...')
     original_audio = generator.convert_spectrograms_to_audio(sampled_specs, sampled_min_max, method=audio_method)
     recon_audio = generator.convert_spectrograms_to_audio(recon_specs, sampled_min_max, method=audio_method)
