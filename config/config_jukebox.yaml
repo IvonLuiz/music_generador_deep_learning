@@ -1,11 +1,13 @@
 dataset:
-  raw_path: "./data/raw/maestro-v3.0.0/2011"
-  processed_path: "./data/processed/maestro_spectrograms_2011_time_frames_1024/"
-  min_max_values_path: "./data/processed/maestro_spectrograms_2011_time_frames_1024/min_max_values/min_max_values.pkl"
-  hdf5_path: "./data/processed/maestro_dataset.h5"
+  raw_path: "./data/raw/backing_tracks/"
+  processed_path: "./data/processed/backing_tracks_log_mel/"
+  spectrogram_type: "mel"
+  n_mels: 256
+  min_max_values_path: "./data/processed/backing_tracks_log_mel/min_max_values/min_max_values.pkl"
+  hdf5_path: "./data/processed/backing_tracks_log_mel/dataset.h5"
   sample_rate: 22050
   hop_length: 256
-  frame_size: 512
+  frame_size: 2048
   target_time_frames: 1024
 
 model:
@@ -45,18 +47,39 @@ model:
 # of 1024, 256, 64, which perfectly mimics the Jukebox scale for our 2D data.
 
 training:
-  batch_size: 8 # 12GB GPU can handle 32, to handle 64 will probably need 16GB
-  learning_rate: 0.0002
-  epochs: 150
-  validation_split: 0.2
+  seed: 42
+  bottom:
+    batch_size: 2
+    gradient_accumulation_steps: 32 # Effective batch size = batch_size * gradient_accumulation_steps
+    learning_rate: 0.0002 # TODO: change to 0.0003 since JUKEBOX uses it
+    epochs: 500
+    validation_split: 0.1
+    early_stopping_patience: 50
+    retrain: false
+    pretrained_weights_path: "./models/jukebox_vq_vae/jukebox_vqvae_backing_tracks_log_mel_time-frames-1024_bottom/2026-04-11_04-40-18/model.pth"
+  middle:
+    batch_size: 4
+    gradient_accumulation_steps: 16 # Effective batch size = batch_size * gradient_accumulation_steps
+    learning_rate: 0.0002
+    epochs: 200
+    validation_split: 0.1
+    early_stopping_patience: 50
+    retrain: false
+    pretrained_weights_path: ""
+  top:
+    batch_size: 8
+    gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
+    learning_rate: 0.0002
+    epochs: 200
+    validation_split: 0.1
+    early_stopping_patience: 50
+    retrain: false
+    pretrained_weights_path: ""
   save_dir: "./models/jukebox_vq_vae/"
-  early_stopping_patience: 7
   num_workers: 12
   pin_memory: true
   persist_workers: true
   prefetch_factor: 4
-  retrain: false 
-  pretrained_weights_path: "./models/jukebox_vq_vae/jukebox_vqvae_all_years/model.pth"
 
 testing:
   specific_run_dir: null
