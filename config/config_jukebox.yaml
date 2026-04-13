@@ -11,13 +11,12 @@ dataset:
   target_time_frames: 1024
 
 model:
-  name: "jukebox_vqvae_maestro2011_time-frames-1024"
+  name: "jukebox_vqvae_backing_tracks_log_mel_time-frames-1024"
   selected_level: "bottom"  # options: "bottom", "middle", "top"
   input_channels: 1
-  hidden_dim: 64
-  num_embeddings: 2048 # codebook size
-  embedding_dim: 64 # matching hidden_dim allows for better codebook utilization and richer representations, while still fitting in 12GB VRAM
-  beta: 0.25
+  num_embeddings: 2048 # codebook size (K)
+  embedding_dim: 128 # dimension of each codebook vector (D)
+  beta: 0.1 # Why it matters: The commitment loss forces the encoder's continuous outputs to stay close to the chosen discrete codebook vectors. When $\beta$ is high (0.25), the encoder is heavily penalized for exploring. Because drums and guitars have highly variable textures, the encoder needs more freedom to map these complex sounds. Dropping beta to 0.02 loosens the leash, reducing the "noise" in your loss curve as the encoder stops fighting the quantizer.
   ema_decay: 0.99           # Standard Jukebox/VQ-VAE EMA decay
   restart_threshold: 0.5    # Threshold for the EMAVectorQuantizer restart mechanism
   epsilon: 1e-5             # Small constant for numerical stability in EMA updates
@@ -29,12 +28,15 @@ model:
 
   level_profiles:
     bottom:
+      hidden_dim: 256 # encoder/decoder channel width. Is affected by channel_growth, but not dilation_growth_rate.
       levels: 3 # downsampling blocks -> 32x32 grid
       num_residual_layers: 8
     middle:
+      hidden_dim: 128 # encoder/decoder channel width. Is affected by channel_growth, but not dilation_growth_rate.
       levels: 4 # downsampling blocks -> 16x16 grid
       num_residual_layers: 4
     top:
+      hidden_dim: 64 # encoder/decoder channel width. Is affected by channel_growth, but not dilation_growth_rate.
       levels: 5 # downsampling blocks -> 8x8 grid
       num_residual_layers: 4
 
@@ -61,16 +63,16 @@ training:
     batch_size: 4
     gradient_accumulation_steps: 16 # Effective batch size = batch_size * gradient_accumulation_steps
     learning_rate: 0.0002
-    epochs: 200
+    epochs: 500
     validation_split: 0.1
     early_stopping_patience: 50
     retrain: false
-    pretrained_weights_path: ""
+    pretrained_weights_path: "models/jukebox_vq_vae/jukebox_vqvae_backing_tracks_log_mel_time-frames-1024_middle/2026-04-13_00-19-55/model.pth"
   top:
     batch_size: 8
     gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
     learning_rate: 0.0002
-    epochs: 200
+    epochs: 500
     validation_split: 0.1
     early_stopping_patience: 50
     retrain: false
