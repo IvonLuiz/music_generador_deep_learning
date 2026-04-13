@@ -4,13 +4,12 @@ from pathlib import Path
 import librosa
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as colors
 
-TARGET_TIME_FRAMES = 1024  # Adjust this for desired length TODO: change to 1024 later
+TARGET_TIME_FRAMES = 1024
 SAMPLE_RATE = 22050    # samples per second
-FRAME_SIZE = 512       # samples for each STFT window
+FRAME_SIZE = 2048       # samples for each STFT window
 HOP_LENGTH = 256       # move amount of samples between windows
-MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_spectrograms_2011_time_frames_1024/min_max_values/"
+MIN_MAX_VALUES_SAVE_DIR = "./data/processed/backing_tracks_log_mel/min_max_values/"
 
 
 class Loader:
@@ -72,6 +71,42 @@ class LogSpectrogramExtractor:
         return log_spectrogram
 
 
+class LogMelSpectrogramExtractor:
+    """
+    LogMelSpectrogramExtractor extracts log-mel spectrograms (in dB) from a
+    time-series signal. This allocates more bins to musically relevant frequencies,
+    which is crucial for capturing percussive transients like drums.
+    """
+
+    def __init__(self, sample_rate, frame_size, hop_length, n_mels=256):
+        """!
+        Initializes the LogMelSpectrogramExtractor.
+        @param sample_rate The sample rate of the audio signal.
+        @param frame_size The number of samples in each STFT window.
+        @param hop_length The number of samples to shift between windows.
+        @param n_mels The number of mel bins.
+        """
+        self.sample_rate = sample_rate
+        self.frame_size = frame_size
+        self.hop_length = hop_length
+        self.n_mels = n_mels
+
+    def extract(self, signal):
+        # Extract Mel Spectrogram (returns power spectrogram by default)
+        mel_spectrogram = librosa.feature.melspectrogram(
+            y=signal,
+            sr=self.sample_rate,
+            n_fft=self.frame_size,
+            hop_length=self.hop_length,
+            n_mels=self.n_mels
+        )
+        
+        # Convert power to decibels (Log-Mel)
+        log_mel_spectrogram = librosa.power_to_db(mel_spectrogram)
+        
+        return log_mel_spectrogram
+
+
 class MinMaxNormalizer:
     """MinMaxnormalizer applies min max normalisation to an array."""
 
@@ -80,7 +115,14 @@ class MinMaxNormalizer:
         self.max = max_val
 
     def normalize(self, array):
-        norm_array = (array - array.min()) / (array.max() - array.min())
+        array_min = float(array.min())
+        array_max = float(array.max())
+        denom = array_max - array_min
+        if denom <= 1e-12:
+            # Near-constant slices (e.g., silence) would otherwise produce NaNs.
+            return np.full_like(array, self.min, dtype=np.float32)
+
+        norm_array = (array - array_min) / denom
         norm_array = norm_array * (self.max - self.min) + self.min
         return norm_array
 
@@ -280,7 +322,7 @@ class PreprocessingPipeline:
     def visualizer(self, visualizer):
         self._visualizer = visualizer
 
-    def process(self, audio_files_dir):
+    def process(self, audio_files_dir, overlapping=0.5):
         """Process all audio files in a directory."""
         if self.saver is None:
             print("Error: Saver not set.")
@@ -291,13 +333,13 @@ class PreprocessingPipeline:
             for file in files:
                 if file.endswith(".wav"):
                     file_path = os.path.join(root, file)
-                    segments = self._process_file_with_segments(file_path)
+                    segments = self._process_file_with_segments(file_path, overlapping=overlapping)
                     total_segments += segments
                     print(f"Processed {file} -> {segments} segments")
         print(f"Total segments created: {total_segments}")
         self.saver.save_min_max_values(self.min_max_values)
 
-    def _process_file_with_segments(self, file_path):
+    def _process_file_with_segments(self, file_path, overlapping=0.5):
         """
         Process a single audio file by extracting multiple overlapping segments.
         This maximizes the use of available musical content.
@@ -313,7 +355,7 @@ class PreprocessingPipeline:
             
         # Calculate segment parameters
         segment_samples = self._num_expected_samples
-        hop_samples = segment_samples // 2  # 50% overlap between segments
+        hop_samples = int(segment_samples * (1 - overlapping))  # overlap percentage
         
         # Extract overlapping segments
         for start_idx in range(0, len(full_signal) - segment_samples + 1, hop_samples):
@@ -408,10 +450,12 @@ if __name__ == "__main__":
     # For 512 time frames: (512 * 256) / 22050 ≈ 5.95 seconds
     # For 1024 time frames: (1024 * 256) / 22050 ≈ 11.9 seconds
     
-    DURATION = (TARGET_TIME_FRAMES * HOP_LENGTH) / SAMPLE_RATE # ~2.97 seconds for 256 frames
+    DURATION = ((TARGET_TIME_FRAMES - 1) * HOP_LENGTH) / SAMPLE_RATE # Duration in seconds for each segment based on target time frames
+    overlapping = 0.0
+    use_mel_spectrogram = True # Set to True to use LogMelSpectrogramExtractor instead of LogSpectrogramExtractor
     
     print(f"Using {TARGET_TIME_FRAMES} time frames = {DURATION:.2f} seconds per segment")
-    print(f"With 50% overlap, a 3-minute song will generate ~{int(180/DURATION*2)} segments!")
+    print(f"With {overlapping*100:.0f}% overlap, a 3-minute song will generate ~{int(180/DURATION)} segments!")
     print(f"Expected spectrogram shape per segment: (256, {TARGET_TIME_FRAMES})")
     
     MONO = True
@@ -420,10 +464,10 @@ if __name__ == "__main__":
     # MIN_MAX_VALUES_SAVE_DIR = "./data/fsdd/"
     # FILES_DIR = "./data/fsdd/audio/"
     
-    FILES_DIR = "./data/raw/maestro-v3.0.0/2011"
-    SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro_spectrograms_2011_time_frames_1024/"
+    FILES_DIR = "./data/raw/backing_tracks"
+    SPECTROGRAMS_SAVE_DIR = "./data/processed/backing_tracks_log_mel/"
     VISUALIZATION_SAVE_DIR = SPECTROGRAMS_SAVE_DIR + "/spectrograms/"
-    MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_spectrograms_2011_time_frames_1024/min_max_values/"
+    MIN_MAX_VALUES_SAVE_DIR = "./data/processed/backing_tracks_log_mel/min_max_values/"
     
     # Enable visualization (set to False to disable)
     ENABLE_VISUALIZATION = False
@@ -431,7 +475,10 @@ if __name__ == "__main__":
     # instantiate all objects
     loader = Loader(SAMPLE_RATE, DURATION, MONO)
     padder = Padder()
-    log_spectrogram_extractor = LogSpectrogramExtractor(FRAME_SIZE, HOP_LENGTH)
+    if use_mel_spectrogram:
+        log_spectrogram_extractor = LogMelSpectrogramExtractor(SAMPLE_RATE, FRAME_SIZE, HOP_LENGTH)
+    else:
+        log_spectrogram_extractor = LogSpectrogramExtractor(FRAME_SIZE, HOP_LENGTH)
     # Normalize to [0, 1] range as expected by VQ-VAE
     min_max_normalizer = MinMaxNormalizer(0, 1)
     saver = Saver(SPECTROGRAMS_SAVE_DIR, MIN_MAX_VALUES_SAVE_DIR)
@@ -449,4 +496,4 @@ if __name__ == "__main__":
     preprocessing_pipeline.saver = saver
     preprocessing_pipeline.visualizer = visualizer
 
-    preprocessing_pipeline.process(FILES_DIR)
+    preprocessing_pipeline.process(FILES_DIR, overlapping=overlapping)
