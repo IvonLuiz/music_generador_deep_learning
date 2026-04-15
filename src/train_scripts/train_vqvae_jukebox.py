@@ -17,7 +17,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from generation.generate import *
-from utils import load_config
+from utils import load_config, compute_dataset_variance, compute_small_sample_variance
 from train_scripts.train_vqvae_utils import train_vqvae_jukebox
 from datasets.spectrogram_dataset import LazySpectrogramDataset
 from resume_utils import load_resume_artifacts
@@ -179,9 +179,10 @@ if __name__ == "__main__":
     print(f"Found {len(all_file_paths)} files. Creating lazy datasets...")
 
     # Data variance calculation
-    subset_data = np.stack([np.load(p) for p in all_file_paths])
-    data_variance = np.var(subset_data)
-    del subset_data
+    data_variance = compute_dataset_variance(all_file_paths)
+    print(f"Computed dataset variance: {data_variance:.6f}")
+    data_variance_small_sample = compute_small_sample_variance(all_file_paths, samples=500)
+    print(f"Computed small sample variance (500 samples): {data_variance_small_sample:.6f}")
     gc.collect()
 
     # Split into train/val
