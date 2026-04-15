@@ -115,24 +115,16 @@ if __name__ == "__main__":
     print(f"Dataset target_time_frames={target_time_frames}, validation_split={validation_split}")
     print(f"Audio inversion settings: spectrogram_type={spectrogram_type}, sample_rate={sample_rate}, hop_length={hop_length}, frame_size={frame_size}, n_mels={n_mels}")
 
+    # Individual level parameters
     level_profiles = model_cfg.get('level_profiles')
     if level_profiles is None:
-        legacy_levels = model_cfg.get('levels')
-        legacy_res_layers = model_cfg.get('num_residual_layers', 4)
-        if legacy_levels is None:
-            raise ValueError("Missing model.level_profiles and legacy model.levels in config.")
-        level_profiles = {
-            selected_level: {
-                'levels': legacy_levels,
-                'num_residual_layers': legacy_res_layers,
-            }
-        }
-
+        raise ValueError("model.level_profiles is missing from config. It should define parameters for each level (bottom, middle, top).")
     if selected_level not in level_profiles:
         available = ', '.join(level_profiles.keys())
         raise ValueError(f"Invalid selected level '{selected_level}'. Available levels: {available}")
 
     selected_profile = level_profiles[selected_level]
+    hidden_dim = selected_profile.get('hidden_dim')
     levels = selected_profile.get('levels')
     num_residual_layers = selected_profile.get('num_residual_layers', 4)
     if levels is None:
@@ -225,14 +217,14 @@ if __name__ == "__main__":
     activation_layer = nn.Sigmoid() if activation_name == 'sigmoid' else None
 
     # Assert model config has all paramters needed for model initialization
-    required_params = ['input_channels', 'hidden_dim', 'num_embeddings', 'embedding_dim', 'beta', 'conv_type', 'dilation_growth_rate', 'channel_growth', 'ema_decay', 'epsilon', 'restart_threshold']
+    required_params = ['input_channels', 'num_embeddings', 'embedding_dim', 'beta', 'conv_type', 'dilation_growth_rate', 'channel_growth', 'ema_decay', 'epsilon', 'restart_threshold']
     missing_params = [p for p in required_params if p not in model_cfg]
     if missing_params:
         raise ValueError(f"Missing required model config parameters: {', '.join(missing_params)}")
 
     jukebox_model = JukeboxVQVAE(
         input_channels=model_cfg['input_channels'],
-        hidden_dim=model_cfg['hidden_dim'],
+        hidden_dim=hidden_dim,
         levels=levels,
         num_residual_layers=num_residual_layers,
         num_embeddings=model_cfg.get('num_embeddings'),
