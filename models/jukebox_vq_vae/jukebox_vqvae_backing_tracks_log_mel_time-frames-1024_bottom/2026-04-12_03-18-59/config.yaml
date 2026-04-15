@@ -1,0 +1,75 @@
+dataset:
+  frame_size: 2048
+  hdf5_path: ./data/processed/backing_tracks_log_mel/dataset.h5
+  hop_length: 256
+  min_max_values_path: ./data/processed/backing_tracks_log_mel/min_max_values/min_max_values.pkl
+  n_mels: 256
+  processed_path: ./data/processed/backing_tracks_log_mel/
+  raw_path: ./data/raw/backing_tracks/
+  sample_rate: 22050
+  spectrogram_type: mel
+  target_time_frames: 1024
+model:
+  activation: sigmoid
+  beta: 0.1
+  channel_growth: 1
+  conv_type: 2
+  dilation_growth_rate: 3
+  ema_decay: 0.99
+  embedding_dim: 128
+  epsilon: 1e-5
+  hidden_dim: 256
+  input_channels: 1
+  level_profiles:
+    bottom:
+      levels: 3
+      num_residual_layers: 8
+    middle:
+      levels: 4
+      num_residual_layers: 4
+    top:
+      levels: 5
+      num_residual_layers: 4
+  name: jukebox_vqvae_backing_tracks_log_mel_time-frames-1024
+  num_embeddings: 2048
+  restart_threshold: 0.5
+  selected_level: bottom
+testing:
+  specific_run_dir: null
+  weights_file_choice: best_model.pth
+training:
+  bottom:
+    batch_size: 2
+    early_stopping_patience: 50
+    epochs: 500
+    gradient_accumulation_steps: 32
+    learning_rate: 0.0002
+    pretrained_weights_path: ./models/jukebox_vq_vae/jukebox_vqvae_backing_tracks_log_mel_time-frames-1024_bottom/2026-04-11_04-40-18/model.pth
+    retrain: false
+    validation_split: 0.1
+  middle:
+    batch_size: 4
+    early_stopping_patience: 50
+    epochs: 200
+    gradient_accumulation_steps: 8
+    learning_rate: 0.0002
+    pretrained_weights_path: ''
+    retrain: false
+    validation_split: 0.1
+  num_workers: 12
+  persist_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  pretrained_weights_path: ./models/jukebox_vq_vae/jukebox_vqvae_backing_tracks_log_mel_time-frames-1024_bottom/2026-04-11_04-40-18/model.pth
+  retrain: false
+  save_dir: ./models/jukebox_vq_vae/
+  seed: 42
+  top:
+    batch_size: 8
+    early_stopping_patience: 50
+    epochs: 200
+    gradient_accumulation_steps: 4
+    learning_rate: 0.0002
+    pretrained_weights_path: ''
+    retrain: false
+    validation_split: 0.1
