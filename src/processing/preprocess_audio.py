@@ -9,6 +9,7 @@ TARGET_TIME_FRAMES = 1024
 SAMPLE_RATE = 22050    # samples per second
 FRAME_SIZE = 2048       # samples for each STFT window
 HOP_LENGTH = 256       # move amount of samples between windows
+N_MELS = 256          # number of mel bins for LogMelSpectrogramExtractor (used only if use_mel_spectrogram=True)
 MIN_MAX_VALUES_SAVE_DIR = "./data/processed/backing_tracks_log_mel/min_max_values/"
 
 
@@ -476,9 +477,17 @@ if __name__ == "__main__":
     loader = Loader(SAMPLE_RATE, DURATION, MONO)
     padder = Padder()
     if use_mel_spectrogram:
-        log_spectrogram_extractor = LogMelSpectrogramExtractor(SAMPLE_RATE, FRAME_SIZE, HOP_LENGTH)
+        log_spectrogram_extractor = LogMelSpectrogramExtractor(
+            sample_rate=SAMPLE_RATE,
+            frame_size=FRAME_SIZE,
+            hop_length=HOP_LENGTH,
+            n_mels=N_MELS
+        )
     else:
-        log_spectrogram_extractor = LogSpectrogramExtractor(FRAME_SIZE, HOP_LENGTH)
+        log_spectrogram_extractor = LogSpectrogramExtractor(
+            frame_size=FRAME_SIZE,
+            hop_length=HOP_LENGTH
+        )
     # Normalize to [0, 1] range as expected by VQ-VAE
     min_max_normalizer = MinMaxNormalizer(0, 1)
     saver = Saver(SPECTROGRAMS_SAVE_DIR, MIN_MAX_VALUES_SAVE_DIR)
