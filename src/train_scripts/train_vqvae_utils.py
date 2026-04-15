@@ -592,13 +592,17 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                 print(f"Warning: non-finite values in training batch at epoch {epoch+1}. Skipping batch.")
                 continue
 
+            # On the last partial window, there may be fewer than grad_accum_steps batches, so we adjust the accumulation factor accordingly
+            batches_remaining = len(dataloader) - i
+            current_accum_steps = min(grad_accum_steps, batches_remaining)
+
             with autocast(device_type=device.type, enabled=scaler.is_enabled()):
                 reconstructions, total_vq_loss, vq_losses_details = model(batch)
                 vq_loss, codebook_loss, commitment_loss = vq_losses_details[0]  # Jukebox VQ-VAE has only one quantizer
 
                 recon_loss = F.mse_loss(reconstructions, batch) / (2 * data_variance)
                 loss = recon_loss + total_vq_loss
-                loss = loss / grad_accum_steps
+                loss = loss / current_accum_steps
 
             if not torch.isfinite(loss):
                 skipped_non_finite_batches += 1
@@ -608,7 +612,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
 
             scaler.scale(loss).backward()
             
-            if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(dataloader):
+            if (i + 1) % current_accum_steps == 0 or (i + 1) == len(dataloader):
                 # Gradient clipping
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -619,7 +623,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
 
             batch_size_current = batch.size(0)
             # Reconstruct original loss for metrics logging
-            actual_loss = loss.item() * grad_accum_steps
+            actual_loss = loss.item() * current_accum_steps
             epoch_loss += actual_loss * batch_size_current
             epoch_recon_loss += recon_loss.item() * batch_size_current
             epoch_vq_losses[0] += vq_loss.item() * batch_size_current

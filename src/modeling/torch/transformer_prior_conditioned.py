@@ -170,8 +170,8 @@ class TransformerPriorConditioned(nn.Module):
         @param indices The input token indices for the current level (shape: [batch_size, seq_len]).
         @param upper_indices The input token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
         This is used as conditioning information for upsampler priors. Defaults to None (no conditioning).
-        @param time_ids Optional time step IDs used for temporal conditioning.
-        Accepts shape [batch_size], [batch_size, 1], or [batch_size, seq_len].
+        @param time_ids Optional time step IDs used for temporal conditioning. Temporal conditioning is applied per
+        batch element. Accepts shape [batch_size] or [batch_size, 1].
         @return Logits over the vocabulary for the next token prediction (shape: [batch_size, seq_len, num_embeddings]).
         """
         if indices.ndim != 2:

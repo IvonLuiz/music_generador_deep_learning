@@ -1,4 +1,5 @@
 import os
+from random import random
 import numpy as np
 from typing import Union
 from tqdm import tqdm
@@ -341,3 +342,54 @@ def load_vqvae_hierarchical_model_wrapper(model_path: str, device: torch.device)
     model.load_state_dict(checkpoint['model_state'])
     model.eval()
     return model
+
+
+def compute_dataset_variance(file_paths: list[str]) -> float:
+    """!
+    Compute the population variance of all values across all files
+    using Chan's parallel algorithm, one file at a time, to avoid
+    loading the entire dataset into memory.
+
+    Chan et al. (1979) "Updating Formulae and a Pairwise Algorithm
+    for Computing Sample Statistics."
+    
+    @param file_paths List of file paths to the spectrogram .npy files.
+    @return The population variance of all values across all files.
+    """
+    total_n = 0
+    total_mean = 0.0
+    total_M2 = 0.0
+
+    for path in file_paths:
+        arr = np.load(path).astype(np.float64).ravel()
+        b_n = arr.size
+        if b_n == 0:
+            continue
+
+        b_mean = arr.mean()
+        b_M2 = arr.var() * b_n          # sum of squared deviations
+
+        # Chan's parallel merge
+        delta = b_mean - total_mean
+        combined_n = total_n + b_n
+        total_M2 = total_M2 + b_M2 + delta**2 * (total_n * b_n / combined_n)
+        total_mean = total_mean + delta * (b_n / combined_n)
+        total_n = combined_n
+
+    if total_n == 0:
+        raise ValueError("No data found: all arrays were empty.")
+
+    return total_M2 / total_n           # population variance
+
+
+def compute_small_sample_variance(all_file_paths: list[str], samples: int = 500) -> float:
+    """!
+    Computes the variance of a small sample of the dataset.
+    @param all_file_paths: List of file paths to the spectrogram .npy files.
+    @param samples: Number of samples to use for variance calculation.
+    @return: The variance of the small sample.
+    """
+    sample_paths = random.sample(all_file_paths, min(samples, len(all_file_paths)))
+    subset_data = np.concatenate([np.load(p).ravel() for p in sample_paths])
+    data_variance = float(np.var(subset_data))
+    return data_variance
