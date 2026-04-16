@@ -16,7 +16,9 @@ model:
   input_channels: 1
   num_embeddings: 2048 # codebook size (K)
   embedding_dim: 128 # dimension of each codebook vector (D)
-  beta: 0.1 # Why it matters: The commitment loss forces the encoder's continuous outputs to stay close to the chosen discrete codebook vectors. When $\beta$ is high (0.25), the encoder is heavily penalized for exploring. Because drums and guitars have highly variable textures, the encoder needs more freedom to map these complex sounds. Dropping beta to 0.02 loosens the leash, reducing the "noise" in your loss curve as the encoder stops fighting the quantizer.
+  beta: 0.1 # The commitment loss forces the encoder's continuous outputs to stay close to the chosen discrete codebook
+            # vectors. When beta is high (0.25), the encoder is heavily penalized for exploring. Because drums and
+            # guitars have highly variable textures, the encoder needs more freedom to map these complex sounds.
   ema_decay: 0.99           # Standard Jukebox/VQ-VAE EMA decay
   restart_threshold: 0.5    # Threshold for the EMAVectorQuantizer restart mechanism
   epsilon: 1e-5             # Small constant for numerical stability in EMA updates

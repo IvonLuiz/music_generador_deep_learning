@@ -349,6 +349,10 @@ class PreprocessingPipeline:
             print("Error: Loader not set.")
             return 0
 
+        if overlapping < 0 or overlapping >= 1:
+            print("Error: Overlapping must be in the range [0, 1).")
+            return 0
+
         segments_created = 0
 
         # Load the full audio file without duration limit
