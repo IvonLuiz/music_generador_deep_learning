@@ -208,7 +208,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
         model.train()
 
         optimizer.zero_grad(set_to_none=True)
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
+        progress_bar = tqdm(dataloader, desc=f"Epoch [{epoch+1}/{epochs}] [Train]")
 
         epoch_loss = 0.0
         epoch_recon_loss = 0.0
@@ -289,7 +289,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
             skipped_non_finite_val_batches = 0
             
             with torch.no_grad():
-                for batch in tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
+                for batch in tqdm(val_dataloader, desc=f"Epoch [{epoch+1}/{epochs}] [Val]"):
                     batch = batch.to(device)
 
                     if not torch.isfinite(batch).all():
@@ -650,6 +650,10 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
         epoch_metrics['vq_loss'] = avg_vq_losses[0]
         epoch_metrics['codebook_loss'] = avg_vq_losses[1]
         epoch_metrics['commitment_loss'] = avg_vq_losses[2]
+
+        vq_str = f"Codebook Loss: {avg_vq_losses[1]:.4f}; Commitment Loss: {avg_vq_losses[2]:.4f}"
+        print(f"Epoch [{epoch+1}/{epochs}], Train Loss: {avg_epoch_loss:.4f} (Recon: {avg_recon_loss:.4f}; {vq_str})")
+
         # Validation Loop
         val_loss_str = ""
         avg_val_loss = None
@@ -701,19 +705,18 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                 avg_val_loss = val_epoch_loss / val_total_samples
                 avg_val_vq_losses_val = [v / val_total_samples for v in val_epoch_vq_losses]
 
+            avg_val_recon_loss = val_epoch_recon_loss / val_total_samples if val_total_samples else float('nan')
+
             epoch_metrics['val_total'] = avg_val_loss
-            epoch_metrics['val_reconstruction_loss'] = val_epoch_recon_loss / val_total_samples if val_total_samples else float('nan')
+            epoch_metrics['val_reconstruction_loss'] = avg_val_recon_loss
             epoch_metrics['val_vq_loss'] = avg_val_vq_losses_val[0]
             epoch_metrics['val_codebook_loss'] = avg_val_vq_losses_val[1]
             epoch_metrics['val_commitment_loss'] = avg_val_vq_losses_val[2]
 
             val_loss_str = f"Val Loss: {avg_val_loss:.4f}"
 
-        vq_str = f"Codebook Loss: {avg_vq_losses[1]:.4f}; Commitment Loss: {avg_vq_losses[2]:.4f}"
-        print(f"Epoch [{epoch+1}/{epochs}], Train Loss: {avg_epoch_loss:.4f} (Recon: {avg_recon_loss:.4f}; {vq_str})")
-        if val_dataloader:
             vq_str = f"Codebook Loss: {avg_val_vq_losses_val[1]:.4f}; Commitment Loss: {avg_val_vq_losses_val[2]:.4f}"
-            print(f"Epoch [{epoch+1}/{epochs}], {val_loss_str} (Recon: {avg_val_loss:.4f}; {vq_str})")
+            print(f"Epoch [{epoch+1}/{epochs}], {val_loss_str} (Recon: {avg_val_recon_loss:.4f}; {vq_str})")
 
         # Callbacks Step
         if loss_plotter:
