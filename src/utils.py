@@ -1,5 +1,5 @@
 import os
-from random import random
+import random
 import numpy as np
 from typing import Union
 from tqdm import tqdm
@@ -382,7 +382,7 @@ def compute_dataset_variance(file_paths: list[str]) -> float:
     return total_M2 / total_n           # population variance
 
 
-def compute_small_sample_variance(all_file_paths: list[str], samples: int = 500) -> float:
+def compute_small_sample_variance(all_file_paths, samples: int = 500) -> float:
     """!
     Computes the variance of a small sample of the dataset.
     @param all_file_paths: List of file paths to the spectrogram .npy files.

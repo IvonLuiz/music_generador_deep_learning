@@ -20,7 +20,7 @@ from generation.generate import *
 from utils import load_config, compute_dataset_variance, compute_small_sample_variance
 from train_scripts.train_vqvae_utils import train_vqvae_jukebox
 from datasets.spectrogram_dataset import LazySpectrogramDataset
-from resume_utils import load_resume_artifacts
+from train_scripts.resume_utils import load_resume_artifacts
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -179,10 +179,8 @@ if __name__ == "__main__":
     print(f"Found {len(all_file_paths)} files. Creating lazy datasets...")
 
     # Data variance calculation
-    data_variance = compute_dataset_variance(all_file_paths)
-    print(f"Computed dataset variance: {data_variance:.6f}")
-    data_variance_small_sample = compute_small_sample_variance(all_file_paths, samples=500)
-    print(f"Computed small sample variance (500 samples): {data_variance_small_sample:.6f}")
+    data_variance = compute_small_sample_variance(all_file_paths, samples=500)
+    print(f"Computed small sample variance (500 samples): {data_variance:.6f}")
     gc.collect()
 
     # Split into train/val
