@@ -1,16 +1,16 @@
 dataset:
-  processed_path: "./data/processed/maestro_spectrograms_2011_time_frames_1024/"
+  processed_path: "./data/processed/backing_tracks_log_mel/"
   target_time_frames: 1024
 
 vqvae:
   # Update to your latest trained Jukebox VQ-VAE runs per level.
-  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_time-frames-1024_top/2026-03-26_10-56-18"
-  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_time-frames-1024_middle/2026-03-26_07-18-14"
-  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro2011_time-frames-1024_bottom/2026-03-26_04-13-02"
+  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_backing_tracks_log_mel_time-frames-1024_top/2026-04-13_02-00-45"
+  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_backing_tracks_log_mel_time-frames-1024_middle/2026-04-13_09-38-42"
+  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_backing_tracks_log_mel_time-frames-1024_bottom/2026-04-12_03-18-59"
   weights_file: "best_model.pth"
 
 model:
-  name: "jukebox_maestro2011_target_time_frames_1024"
+  name: "jukebox_backing_tracks_logmel_prior"
 
 # Configurations related to the upsampler are calculated in the script, example:
 # the python training script will read the VQ-VAE configs to determine the number of tokens at each level,
@@ -20,17 +20,20 @@ model:
 # needing to hardcode those details here.
 priors:
   top_prior:
-    model_dim: 1200       # Transformer width (size of the embedding vector for each token) (Jukebox uses 4800)
+    model_dim: 512       # Transformer width (size of the embedding vector for each token) (Jukebox uses 4800)
     num_heads: 8          # Atention heads (Jukebox uses 8 for Top)
     num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
-    dim_feedforward: 1200 # Transformer feedforward layers
+    dim_feedforward: 2048 # Transformer feedforward layers
     dropout: 0.1
-    block_len: 8  # Because Top grid is 8x8
+    max_time_steps: 2048
+    attention_qkv_ratio: 0.25
+    block_len: 8  # Top Grid: 8 (Freq) * 32 (Time) -> block_len must be 8
+    use_bos_token: true
   middle_prior:
-    model_dim: 960        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
+    model_dim: 512        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
     num_heads: 1          # Atention heads (Jukebox uses 1 for Middle)
     num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
-    dim_feedforward: 960  # Transformer feedforward layers
+    dim_feedforward: 2048 # Transformer feedforward layers
     dropout: 0.1
     block_len: 16  # Because Middle grid is 16x16
     # condiditioner parameters
@@ -40,7 +43,7 @@ priors:
     conditioner_conv_channels: 1024
     conditioner_dilation_growth_rate: 3
     conditioner_dilation_cycle: 8
-    conditioner_upsample_stride: 4 # Because Middle grid is 16x16 and Top grid is 8x8, we need to upsample by a factor of 2 in each dimension (16/8 = 2)
+    conditioner_upsample_stride: 4 # Upsampling 256 tokens to 1024 tokens (1024 / 256 = 4). Another example (256 target time frames): upsample by a factor of 2 in each dimension (16/8 = 2)
   bottom_prior:
     model_dim: 960        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
     num_heads: 1          # Atention heads (Jukebox uses 1 for Bottom)
@@ -55,27 +58,33 @@ priors:
     conditioner_conv_channels: 1024
     conditioner_dilation_growth_rate: 3
     conditioner_dilation_cycle: 8
-    conditioner_upsample_stride: 4 # Because Bottom grid is 32x32 and Middle grid is 16x16, we need to upsample by a factor of 2 in each dimension (32/16 = 2)
+    conditioner_upsample_stride: 4 # Upsampling 1024 tokens to 4096 tokens (4096 / 1024 = 4)
 
 training:
   top_prior:
     batch_size: 8
     gradient_accumulation_steps: 4
-    learning_rate: 0.00015  # Warmup to lr then cosine decay
+    learning_rate: 0.00005  # Warmup to lr then cosine decay
     weight_decay: 0.002
-    epochs: 150
+    epochs: 200
+    retrain: true
+    pretrained_weights_path: "./models/transformer_prior/jukebox_backing_tracks_logmel_prior_top_transformer_prior/2026-04-14_10-06-58/model_epoch_200.pth"
   middle_prior:
     batch_size: 2
     gradient_accumulation_steps: 16
     learning_rate: 0.0003  # Warmup to lr then cosine decay
     weight_decay: 0.01
-    epochs: 150
+    epochs: 200
+    retrain: true
+    pretrained_weights_path: "./models/transformer_prior/jukebox_backing_tracks_logmel_prior_middle_transformer_prior/2026-04-14_10-11-41/model_epoch_200.pth"
   bottom_prior:
     batch_size: 1
     gradient_accumulation_steps: 32
     learning_rate: 0.0003  # Warmup to lr then cosine decay
     weight_decay: 0.01
-    epochs: 150
-  validation_split: 0.2
-  early_stopping_patience: 7
+    epochs: 200
+    retrain: true
+    pretrained_weights_path: "./models/transformer_prior/jukebox_backing_tracks_logmel_prior_bottom_transformer_prior/2026-04-14_10-28-05/model_epoch_200.pth"
+  validation_split: 0.0
+  early_stopping_patience: 10
   save_dir: "./models/transformer_prior/"

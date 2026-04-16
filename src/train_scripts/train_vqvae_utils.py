@@ -4,6 +4,7 @@ import matplotlib
 matplotlib.use('Agg') # Set non-interactive backend to avoid thread issues
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from typing import Optional
 
 import torch
 from torch import optim
@@ -16,7 +17,7 @@ from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
 from modeling.torch.vq_vae import VQ_VAE
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from datasets.spectrogram_dataset import SpectrogramDataset
-from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE
+from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE, FRAME_SIZE
 from utils import find_min_max_for_path
 from callbacks import EarlyStopping, ModelCheckpoint, LossPlotter, SampleGenerator
 
@@ -52,7 +53,13 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                              num_workers: int = 4,
                              pin_memory: bool = True,
                              persist_workers: bool = True,
-                             prefetch_factor: int = 4,):
+                             prefetch_factor: int = 4,
+                             spectrogram_type: str = 'linear',
+                             sample_rate: int = SAMPLE_RATE,
+                             hop_length: int = HOP_LENGTH,
+                             frame_size: int = FRAME_SIZE,
+                             n_mels: int = 256,
+                             seed: Optional[int] = None,):
     """
     Train a VQ-VAE Hierarchical model.
 
@@ -168,16 +175,32 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
                 samples = x_train[:4]
             sample_paths = train_file_paths[:4] if train_file_paths else None
         
-        spectrograms_dir = os.path.dirname(sample_paths[0])
         sample_min_max = []
-        for fp in sample_paths:
-            mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
-            if mm is None:
-                print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
-                mm = {"min": 0.0, "max": 1.0}
-            sample_min_max.append(mm)
+        if sample_paths and len(sample_paths) > 0:
+            spectrograms_dir = os.path.dirname(sample_paths[0])
+            for fp in sample_paths:
+                mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
+                if mm is None:
+                    print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
+                    mm = {"min": 0.0, "max": 1.0}
+                sample_min_max.append(mm)
+        else:
+            # HDF5 workflows may not have file paths for per-file min/max lookup.
+            sample_min_max = [{"min": 0.0, "max": 1.0} for _ in range(len(samples))]
+            print("Info: sample file paths are unavailable; using default min/max [0, 1] for sample generation.")
             
-        sample_generator = SampleGenerator(model, samples, sample_min_max, os.path.dirname(save_path), device)
+        sample_generator = SampleGenerator(
+            model,
+            samples,
+            sample_min_max,
+            os.path.dirname(save_path),
+            device,
+            spectrogram_type=spectrogram_type,
+            hop_length=hop_length,
+            sample_rate=sample_rate,
+            n_fft=frame_size,
+            n_mels=n_mels,
+        )
 
     best_val_loss = float('inf')
 
@@ -185,7 +208,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
         model.train()
 
         optimizer.zero_grad(set_to_none=True)
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
+        progress_bar = tqdm(dataloader, desc=f"Epoch [{epoch+1}/{epochs}] [Train]")
 
         epoch_loss = 0.0
         epoch_recon_loss = 0.0
@@ -266,7 +289,7 @@ def train_vqvae_hierarchical(model: VQ_VAE_Hierarchical,
             skipped_non_finite_val_batches = 0
             
             with torch.no_grad():
-                for batch in tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
+                for batch in tqdm(val_dataloader, desc=f"Epoch [{epoch+1}/{epochs}] [Val]"):
                     batch = batch.to(device)
 
                     if not torch.isfinite(batch).all():
@@ -350,6 +373,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                         min_max_values: dict,
                         data_variance: float,
                         batch_size: int,
+                        grad_accum_steps: int,
                         epochs: int,
                         learning_rate: float,
                         save_path: str,
@@ -364,7 +388,13 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                         prefetch_factor: int = 4,
                         resume_checkpoint_path: str = None,
                         resume_history: dict = None,
-                        initial_best_metric: float = None,):
+                        initial_best_metric: float = None,
+                        spectrogram_type: str = 'linear',
+                        sample_rate: int = SAMPLE_RATE,
+                        hop_length: int = HOP_LENGTH,
+                        frame_size: int = FRAME_SIZE,
+                        n_mels: int = 256,
+                        seed: Optional[int] = None,):
     """
     Train a Jukebox VQ-VAE model.
 
@@ -375,6 +405,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
         min_max_values (dict): Dictionary of min/max values for denormalization.
         data_variance (float): Variance of the training data for loss scaling.
         batch_size (int): Batch size for training.
+        grad_accum_steps (int): Number of steps to accumulate gradients before updating model weights.
         epochs (int): Number of training epochs.
         learning_rate (float): Learning rate for the optimizer.
         save_path (str): Path to save the trained model.
@@ -442,6 +473,9 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner for potential speedup
     scaler = GradScaler(enabled=amp and device.type == 'cuda')  # For mixed precision training
+    if grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
+    print(f"Using batch size {batch_size} with gradient accumulation over {grad_accum_steps} steps for effective batch size of {batch_size * grad_accum_steps}.")
 
     start_epoch = 0
     if resume_checkpoint_path:
@@ -502,16 +536,31 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
             sample_paths = train_file_paths[:4] if train_file_paths else None
 
         sample_min_max = []
-        for fp in sample_paths:
-            mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
-            if mm is None:
-                print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
-                mm = {"min": 0.0, "max": 1.0}
-            sample_min_max.append(mm)
+        if sample_paths and len(sample_paths) > 0:
+            spectrograms_dir = os.path.dirname(sample_paths[0])
+            for fp in sample_paths:
+                mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
+                if mm is None:
+                    print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
+                    mm = {"min": 0.0, "max": 1.0}
+                sample_min_max.append(mm)
+        else:
+            # HDF5 workflows may not have original file paths.
+            sample_min_max = [{"min": 0.0, "max": 1.0} for _ in range(len(samples))]
+            print("Info: sample file paths are unavailable; using default min/max [0, 1] for sample generation.")
             
-        sample_generator = SampleGenerator(model, samples, sample_min_max, os.path.dirname(save_path), device)
-
-    best_val_loss = float('inf')
+        sample_generator = SampleGenerator(
+            model,
+            samples,
+            sample_min_max,
+            os.path.dirname(save_path),
+            device,
+            spectrogram_type=spectrogram_type,
+            hop_length=hop_length,
+            sample_rate=sample_rate,
+            n_fft=frame_size,
+            n_mels=n_mels,
+        )
 
     if start_epoch >= epochs:
         print(
@@ -535,7 +584,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
         total_samples = 0
         skipped_non_finite_batches = 0
         
-        for batch in progress_bar:
+        for i, batch in enumerate(progress_bar):
             batch = batch.to(device)
 
             if not torch.isfinite(batch).all():
@@ -543,31 +592,39 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                 print(f"Warning: non-finite values in training batch at epoch {epoch+1}. Skipping batch.")
                 continue
 
-            optimizer.zero_grad()
+            # On the last partial window, there may be fewer than grad_accum_steps batches, so we adjust the accumulation factor accordingly
+            batches_remaining = len(dataloader) - i
+            current_accum_steps = min(grad_accum_steps, batches_remaining)
+
             with autocast(device_type=device.type, enabled=scaler.is_enabled()):
                 reconstructions, total_vq_loss, vq_losses_details = model(batch)
                 vq_loss, codebook_loss, commitment_loss = vq_losses_details[0]  # Jukebox VQ-VAE has only one quantizer
 
                 recon_loss = F.mse_loss(reconstructions, batch) / (2 * data_variance)
                 loss = recon_loss + total_vq_loss
+                loss = loss / current_accum_steps
 
             if not torch.isfinite(loss):
                 skipped_non_finite_batches += 1
                 print(f"Warning: non-finite training loss at epoch {epoch+1}. Skipping optimizer step for this batch.")
-                optimizer.zero_grad(set_to_none=True)
+                # We do not reset gradients here since we might have successfully accumulated some
                 continue
 
             scaler.scale(loss).backward()
             
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            scaler.step(optimizer)
-            scaler.update()
+            if (i + 1) % current_accum_steps == 0 or (i + 1) == len(dataloader):
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
             batch_size_current = batch.size(0)
-            epoch_loss += loss.item() * batch_size_current
+            # Reconstruct original loss for metrics logging
+            actual_loss = loss.item() * current_accum_steps
+            epoch_loss += actual_loss * batch_size_current
             epoch_recon_loss += recon_loss.item() * batch_size_current
             epoch_vq_losses[0] += vq_loss.item() * batch_size_current
             epoch_vq_losses[1] += codebook_loss.item() * batch_size_current
@@ -593,6 +650,10 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
         epoch_metrics['vq_loss'] = avg_vq_losses[0]
         epoch_metrics['codebook_loss'] = avg_vq_losses[1]
         epoch_metrics['commitment_loss'] = avg_vq_losses[2]
+
+        vq_str = f"Codebook Loss: {avg_vq_losses[1]:.4f}; Commitment Loss: {avg_vq_losses[2]:.4f}"
+        print(f"Epoch [{epoch+1}/{epochs}], Train Loss: {avg_epoch_loss:.4f} (Recon: {avg_recon_loss:.4f}; {vq_str})")
+
         # Validation Loop
         val_loss_str = ""
         avg_val_loss = None
@@ -614,11 +675,12 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                         print(f"Warning: non-finite values in validation batch at epoch {epoch+1}. Skipping batch.")
                         continue
 
-                    reconstructions, total_vq_loss, vq_losses_details = model(batch)
-                    vq_loss, codebook_loss, commitment_loss = vq_losses_details[0]  # Jukebox VQ-VAE has only one quantizer
+                    with autocast(device_type=device.type, enabled=scaler.is_enabled()):
+                        reconstructions, total_vq_loss, vq_losses_details = model(batch)
+                        vq_loss, codebook_loss, commitment_loss = vq_losses_details[0]  # Jukebox VQ-VAE has only one quantizer
 
-                    recon_loss = F.mse_loss(reconstructions, batch) / (2 * data_variance)
-                    loss = recon_loss + total_vq_loss
+                        recon_loss = F.mse_loss(reconstructions, batch) / (2 * data_variance)
+                        loss = recon_loss + total_vq_loss
 
                     if not torch.isfinite(loss):
                         skipped_non_finite_val_batches += 1
@@ -643,16 +705,18 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                 avg_val_loss = val_epoch_loss / val_total_samples
                 avg_val_vq_losses_val = [v / val_total_samples for v in val_epoch_vq_losses]
 
+            avg_val_recon_loss = val_epoch_recon_loss / val_total_samples if val_total_samples else float('nan')
+
             epoch_metrics['val_total'] = avg_val_loss
-            epoch_metrics['val_reconstruction_loss'] = val_epoch_recon_loss / val_total_samples if val_total_samples else float('nan')
+            epoch_metrics['val_reconstruction_loss'] = avg_val_recon_loss
             epoch_metrics['val_vq_loss'] = avg_val_vq_losses_val[0]
             epoch_metrics['val_codebook_loss'] = avg_val_vq_losses_val[1]
             epoch_metrics['val_commitment_loss'] = avg_val_vq_losses_val[2]
 
-            val_loss_str = f", Val Loss: {avg_val_loss:.4f}"
+            val_loss_str = f"Val Loss: {avg_val_loss:.4f}"
 
-        vq_str = f"VQ Top: {avg_vq_losses[0]:.4f}, VQ Bottom: {avg_vq_losses[1]:.4f}"
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_epoch_loss:.4f}, Recon: {avg_recon_loss:.4f}, {vq_str}{val_loss_str}")
+            vq_str = f"Codebook Loss: {avg_val_vq_losses_val[1]:.4f}; Commitment Loss: {avg_val_vq_losses_val[2]:.4f}"
+            print(f"Epoch [{epoch+1}/{epochs}], {val_loss_str} (Recon: {avg_val_recon_loss:.4f}; {vq_str})")
 
         # Callbacks Step
         if loss_plotter:
