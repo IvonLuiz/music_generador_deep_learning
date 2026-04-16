@@ -344,7 +344,7 @@ def load_vqvae_hierarchical_model_wrapper(model_path: str, device: torch.device)
     return model
 
 
-def compute_dataset_variance(file_paths: list[str]) -> float:
+def compute_dataset_variance(file_paths) -> float:
     """!
     Compute the population variance of all values across all files
     using Chan's parallel algorithm, one file at a time, to avoid
