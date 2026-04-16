@@ -136,6 +136,10 @@ def load_jukebox_model(model_dir_or_file: str, level_name: str, device: torch.de
 
     config = load_config(config_path)
     model_cfg = config['model']
+    model_level_cfg = model_cfg.get('level_profiles', {}).get(level_name)
+    if not model_level_cfg:
+        raise ValueError(f"Level '{level_name}' not found in model config's level_profiles at {config_path}")
+    model_cfg = {**model_cfg, **model_level_cfg}  # Merge level-specific config into main model config for easier access
 
     level_profiles = model_cfg.get('level_profiles', {})
     if level_name not in level_profiles:
@@ -153,13 +157,13 @@ def load_jukebox_model(model_dir_or_file: str, level_name: str, device: torch.de
         hidden_dim=model_cfg['hidden_dim'],
         levels=levels,
         num_residual_layers=num_residual_layers,
-        num_embeddings=model_cfg.get('num_embeddings', 2048),
-        embedding_dim=model_cfg.get('embedding_dim', 64),
-        beta=model_cfg.get('beta', 0.25),
-        conv_type=model_cfg.get('conv_type', 2),
+        num_embeddings=model_cfg['num_embeddings'],
+        embedding_dim=model_cfg['embedding_dim'],
+        beta=model_cfg['beta'],
+        conv_type=model_cfg['conv_type'],
         activation_layer=activation_layer,
-        dilation_growth_rate=model_cfg.get('dilation_growth_rate', 3),
-        channel_growth=model_cfg.get('channel_growth', 1),
+        dilation_growth_rate=model_cfg['dilation_growth_rate'],
+        channel_growth=model_cfg['channel_growth'],
     ).to(device)
 
     print(f'Loading Jukebox {level_name} model from {model_file}')

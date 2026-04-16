@@ -50,19 +50,21 @@ class JukeboxVQVAE(nn.Module):
                  restart_threshold: float = 0.5,
                  ):
         """
-        Args:
-            input_channels: Number of input channels (e.g., 1 for mono audio, 2 for stereo, 1 for spectrogram).
-            hidden_dim: Number of hidden channels in encoder/decoder.
-            levels: Number of downsampling levels (Jukebox: Bottom=3, Mid=5, Top=7 approx).
-            num_residual_layers: ResBlocks per level.
-            conv_type: 1 for 1D (Audio), 2 for 2D (Spectrograms).
-            activation_layer: Optional activation after final decoder layer (e.g., Tanh for raw audio, Sigmoid for spectrograms).
-            dilation_growth_rate: Factor to grow dilation in residual stack (Jukebox uses 3).
-            channel_growth: Channel multiplier per downsampling level. For Jukebox-style stability,
-                            keep this at 1 (constant width).
-            ema_decay: Decay factor for EMA updates in the vector quantizer.
-            epsilon: Small constant for numerical stability in EMA updates.
-            restart_threshold: Threshold for triggering random restarts in the codebook to prevent collapse.
+        @input_channels: Number of input channels (e.g., 1 for mono audio, 2 for stereo, 1 for spectrogram).
+        @hidden_dim: Number of hidden channels in encoder/decoder.
+        @levels: Number of downsampling levels (Jukebox: Bottom=3, Mid=5, Top=7 approx).
+        @num_residual_layers: ResBlocks per level.
+        @num_embeddings: Codebook size for vector quantization.
+        @embedding_dim: Dimensionality of each codebook embedding vector.
+        @beta: Commitment loss weight for VQ-VAE.
+        @conv_type: 1 for 1D (Audio), 2 for 2D (Spectrograms).
+        @activation_layer: Optional activation after final decoder layer (e.g., Tanh for raw audio, Sigmoid for spectrograms).
+        @dilation_growth_rate: Factor to grow dilation in residual stack (Jukebox uses 3).
+        @channel_growth: Channel multiplier per downsampling level. For Jukebox-style stability,
+                         keep this at 1 (constant width).
+        @ema_decay: Decay factor for EMA updates in the vector quantizer.
+        @epsilon: Small constant for numerical stability in EMA updates.
+        @restart_threshold: Threshold for triggering random restarts in the codebook to prevent collapse.
         """
         if conv_type != 1 and conv_type != 2:
             raise ValueError("conv_type must be either 1 (Conv1d) or 2 (Conv2d)")
@@ -149,12 +151,11 @@ class JukeboxVQVAE(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """
         Forward pass through the hierarchical VQ-VAE.
-        Args:
-            x: Input tensor of shape (B, C, H, W)
-        Returns:
-            x_recon: Reconstructed tensor of shape (B, C, H, W)
-            total_vq_loss: Scalar VQ loss combining top and bottom quantizers
-            vq_losses_details: List with entries (vq_loss, codebook_loss, commitment_loss) for top and bottom quantizers
+
+        @param x: Input tensor of shape (B, C, H, W)
+        @return x_recon: Reconstructed tensor of shape (B, C, H, W)
+        @return total_vq_loss: Scalar VQ loss combining top and bottom quantizers
+        @return vq_losses_details: List with entries (vq_loss, codebook_loss, commitment_loss) for top and bottom quantizers
         """
         # Encoder
         z = self.encoder(x)  # (B, hidden_dim, H/2^levels, W/2^levels)
@@ -179,15 +180,15 @@ class JukeboxVQVAE(nn.Module):
     def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
         """
         Reconstruct input x using the trained model.
-        Args:
-            x: Input tensor of shape (B, C, H, W)
-        Returns:
-            x_recon: Reconstructed tensor of shape (B, C, H, W)
+
+        @return x: Input tensor of shape (B, C, H, W)
+        @return x_recon: Reconstructed tensor of shape (B, C, H, W)
         """
         self.eval()
         with torch.no_grad():
-            x_recon, _, _ = self.forward(x)
-        return x_recon
+            with torch.autocast(device_type=x.device.type, enabled=x.device.type == 'cuda'):
+                x_recon, _, _ = self.forward(x)
+        return x_recon.float()
 
 
 if __name__ == "__main__":
