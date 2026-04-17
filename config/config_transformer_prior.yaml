@@ -35,7 +35,8 @@ priors:
     num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
     dim_feedforward: 2048 # Transformer feedforward layers
     dropout: 0.1
-    block_len: 16  # Because Middle grid is 16x16
+    attention_qkv_ratio: 0.25
+    block_len: 16  # Middle Grid: 16 (Freq) * 64 (Time) -> block_len must be 16
     # condiditioner parameters
     conditioner_residual_block_width: 1024
     conditioner_residual_blocks: 16
@@ -43,14 +44,15 @@ priors:
     conditioner_conv_channels: 1024
     conditioner_dilation_growth_rate: 3
     conditioner_dilation_cycle: 8
-    conditioner_upsample_stride: 4 # Upsampling 256 tokens to 1024 tokens (1024 / 256 = 4). Another example (256 target time frames): upsample by a factor of 2 in each dimension (16/8 = 2)
+    conditioner_upsample_stride: 4 # Upsampling 256 tokens to 1024 tokens (1024 / 256 = 4). Another example (256 target time frames): upsampling 8x8 image to 16x16 image (256 / 64 = 4)
   bottom_prior:
-    model_dim: 960        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
+    model_dim: 512        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
     num_heads: 1          # Atention heads (Jukebox uses 1 for Bottom)
     num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
-    dim_feedforward: 960  # Transformer feedforward layers
+    dim_feedforward: 2048  # Transformer feedforward layers
     dropout: 0.1
-    block_len: 32  # Because Bottom grid is 32x32
+    attention_qkv_ratio: 0.25
+    block_len: 32  # Bottom Grid: 32 (Freq) * 128 (Time) -> block_len must be 32
     # condiditioner parameters
     conditioner_residual_block_width: 1024
     conditioner_residual_blocks: 16

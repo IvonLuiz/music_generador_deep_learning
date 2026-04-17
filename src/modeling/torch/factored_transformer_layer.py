@@ -10,7 +10,16 @@ except ImportError:
 
 
 class FactoredTransformerLayer(nn.Module):
-    def __init__(self, model_dim: int, num_heads: int, block_len: int, attention_type: str, mlp_dim: int, dropout: float):
+    def __init__(
+        self,
+        model_dim: int,
+        num_heads: int,
+        block_len: int,
+        attention_type: str,
+        mlp_dim: int,
+        dropout: float,
+        qkv_ratio: float = 1.0
+    ):
         super().__init__()
         
         # Factored Attention Branch
@@ -19,7 +28,8 @@ class FactoredTransformerLayer(nn.Module):
             model_dim=model_dim,
             num_heads=num_heads,
             block_len=block_len,
-            attention_type=attention_type
+            attention_type=attention_type,
+            qkv_ratio=qkv_ratio,
         )
         self.dropout1 = nn.Dropout(dropout)
         
