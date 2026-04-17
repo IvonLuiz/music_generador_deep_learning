@@ -46,10 +46,11 @@ class FactoredAttention(nn.Module):
         @param x: Input tensor of shape (batch_size, seq_len, model_dim).
         @return: Output tensor of shape (batch_size, seq_len, model_dim).
         """
-        batch_size, seq_len, model_dim = x.size() # seq_len is the amount of tokens in the sequence (block_len * num_blocks)
+        batch_size, seq_len, model_dim_in = x.size() # seq_len is the amount of tokens in the sequence (block_len * num_blocks)
         num_blocks = seq_len // self.block_len
         
         assert self.qkv_dim_total == self.num_heads * self.head_dim, "qkv_dim_total must be equal to num_heads * head_dim"
+        assert self.model_dim == model_dim_in, "model_dim must match the input feature dimension"
         assert seq_len % self.block_len == 0, "seq_len must be divisible by block_len"
 
         # project input to Q, K, V
@@ -77,7 +78,7 @@ class FactoredAttention(nn.Module):
             v = v.transpose(2,3).reshape(batch_size * num_blocks, self.num_heads, self.block_len, self.head_dim)
 
             # SDPA thinks it is processing Batch * Num_Blocks completely separate sequences of length Block_Len. The blocks cannot see each other
-            # apply standard casual mask here since it's autoregressive within each block
+            # apply standard causal mask here since it's autoregressive within each block
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)   # (batch_size * num_blocks, num_heads, block_len, head_dim)
             out = out.transpose(1,2).reshape(batch_size, num_blocks, self.block_len, self.qkv_dim_total) # (batch_size, num_blocks, block_len, qkv_dim_total)
         
