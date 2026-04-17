@@ -172,6 +172,8 @@ def train_transformer_prior(
         conditioner_dilation_growth_rate=int(prior_cfg.get('conditioner_dilation_growth_rate', 3)),
         conditioner_dilation_cycle=int(prior_cfg.get('conditioner_dilation_cycle', 8)),
         dropout=float(prior_cfg.get('dropout', 0.1)),
+        attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
+        use_bos_token=bool(prior_cfg.get('use_bos_token', False)),
     ).to(device)
 
     retrain = bool(train_cfg.get('retrain', False))
