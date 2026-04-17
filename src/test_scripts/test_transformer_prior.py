@@ -302,6 +302,8 @@ def test_transformer_prior(
         for i, signal in enumerate(audio_signals):
             sf.write(os.path.join(audio_dir, f'sample_{i}.wav'), signal, SAMPLE_RATE)
         print(f'Saved audio to {audio_dir}')
+    else:
+        print('No bottom VQ-VAE path provided, skipping spectrogram decoding and audio generation.')
 
 
 if __name__ == '__main__':

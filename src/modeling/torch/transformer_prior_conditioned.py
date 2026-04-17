@@ -196,10 +196,34 @@ class TransformerPriorConditioned(nn.Module):
 
         # Add time embeddings if time_ids are provided (for upsampler priors, this should help the model learn temporal structure)
         if time_ids is not None:
-            time_ids = time_ids.view(batch_size)    # (batch,)
-            t_emb = self.time_embedding(time_ids)   # (batch, model_dim)
-            t_emb = t_emb.unsqueeze(1)              # (batch, 1, model_dim) to add to each token position
-            x = x + t_emb.expand(-1, seq_len, -1)   # (batch, seq_len, model_dim) broadcast addition of time embedding to each token position
+            time_ids = time_ids.to(device=device, dtype=torch.long)
+
+            if time_ids.ndim == 1:
+                if time_ids.shape[0] != batch_size:
+                    raise ValueError(
+                        f"time_ids with shape {tuple(time_ids.shape)} must match batch_size={batch_size}"
+                    )
+                time_ids = time_ids.unsqueeze(1).expand(-1, seq_len)
+            elif time_ids.ndim == 2:
+                if time_ids.shape == (batch_size, 1):
+                    time_ids = time_ids.expand(-1, seq_len)
+                elif time_ids.shape != (batch_size, seq_len):
+                    raise ValueError(
+                        f"time_ids must have shape (B,), (B,1), or (B,T). Got {tuple(time_ids.shape)}"
+                    )
+                # else case is already (B, seq_len)
+            else:
+                raise ValueError(
+                    f"time_ids must have shape (B,), (B,1), or (B,T). Got {tuple(time_ids.shape)}"
+                )
+
+            if torch.any(time_ids < 0) or torch.any(time_ids >= self.max_time_steps):
+                raise ValueError(
+                    f"time_ids values must be in [0, {self.max_time_steps - 1}]"
+                )
+
+            t_emb = self.time_embedding(time_ids)   # (batch, seq_len, model_dim)
+            x = x + t_emb
 
         if self.is_upsampler:
             if upper_indices is None:
