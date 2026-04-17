@@ -58,6 +58,7 @@ class TransformerPriorConditioned(nn.Module):
         conditioner_dilation_growth_rate: int = 3,
         conditioner_dilation_cycle: int = 8,
         dropout: float = 0.1,
+        attention_qkv_ratio: float = 1.0,
     ):
         """!
         @brief Initializes the TransformerPrior model.
@@ -104,6 +105,7 @@ class TransformerPriorConditioned(nn.Module):
         self.dropout = dropout
         self.max_time_steps = max_time_steps
         self.use_bos_token = use_bos_token
+        self.attention_qkv_ratio = float(attention_qkv_ratio)
         self.bos_token_id = num_embeddings if use_bos_token else None
         self.input_vocab_size = num_embeddings + (1 if use_bos_token else 0)
 
@@ -151,6 +153,7 @@ class TransformerPriorConditioned(nn.Module):
                 attention_type = attention_patterns[num_layer % len(attention_patterns)],
                 mlp_dim=self.dim_feedforward,
                 dropout=self.dropout,
+                qkv_ratio=self.attention_qkv_ratio,
             ) for num_layer in range(self.num_layers)
         ])
 
