@@ -153,6 +153,14 @@ def train_transformer_prior(
         cond_num_embeddings = num_embeddings_map[cond_level]
         upsample_stride = _compute_stride(seq_lens[selected_level], seq_lens[cond_level], selected_level)
 
+    max_time_steps_cfg = int(prior_cfg.get('max_time_steps', 500))
+    max_time_id = _extract_max_segment_time_id(file_paths)
+    if max_time_id is not None:
+        required_time_steps = int(max_time_id) + 1
+        max_time_steps = max(max_time_steps_cfg, required_time_steps)
+    else:
+        max_time_steps = max_time_steps_cfg
+
     prior = TransformerPriorConditioned(
         num_embeddings=num_embeddings_map[selected_level],
         model_dim=int(prior_cfg['model_dim']),
@@ -269,6 +277,7 @@ def train_transformer_prior(
             top_indices = batch[0].to(device)
             mid_indices = batch[1].to(device)
             bot_indices = batch[2].to(device)
+            time_id = batch[3].to(device)
 
             if selected_level == 'top':
                 target_indices = top_indices
@@ -320,6 +329,7 @@ def train_transformer_prior(
                 top_indices = batch[0].to(device)
                 mid_indices = batch[1].to(device)
                 bot_indices = batch[2].to(device)
+                time_id = batch[3].to(device)
 
                 if selected_level == 'top':
                     target_indices = top_indices
@@ -348,6 +358,8 @@ def train_transformer_prior(
 
         print(f'Epoch {epoch + 1}: Train Loss={epoch_train_loss:.4f}, Val Loss={epoch_val_loss:.4f}')
 
+        # Save models
+        ## Save best model based on validation loss
         if epoch_val_loss < best_val_loss:
             best_val_loss = epoch_val_loss
             best_epoch = len(val_losses)
@@ -364,6 +376,7 @@ def train_transformer_prior(
             )
             print('Saved best model.')
 
+        ## Periodic checkpointing every 10 epochs
         if (epoch + 1) % 10 == 0:
             torch.save(
                 {
@@ -375,6 +388,18 @@ def train_transformer_prior(
                 },
                 os.path.join(run_dir, f'model_epoch_{epoch + 1}.pth')
             )
+
+        ## Always save the latest checkpoint
+        torch.save(
+            {
+                'model_state': prior.state_dict(),
+                'epoch': epoch + 1,
+                'train_loss': epoch_train_loss,
+                'val_loss': epoch_val_loss,
+                'history': {'train_loss': train_losses, 'val_loss': val_losses},
+            },
+            os.path.join(run_dir, f'latest_model.pth')
+        )
 
         early_stopping(epoch_val_loss)
         if early_stopping.early_stop:
