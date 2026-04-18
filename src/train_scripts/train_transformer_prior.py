@@ -63,6 +63,35 @@ def _compute_stride(lower_len: int, upper_len: int, level_name: str) -> int:
         )
     return lower_len // upper_len
 
+
+def _extract_max_segment_time_id(file_paths) -> Optional[int]:
+    max_time_id = None
+    pattern = re.compile(r'_segment_(\d+)\.npy$')
+    for path in file_paths:
+        s = str(path)
+        match = pattern.search(s)
+        if not match:
+            continue
+        tid = int(match.group(1))
+        if max_time_id is None or tid > max_time_id:
+            max_time_id = tid
+    return max_time_id
+
+
+def _resolve_vqvae_config_path(model_dir_or_file: Optional[str]) -> Optional[str]:
+    if not model_dir_or_file:
+        return None
+    if os.path.isdir(model_dir_or_file):
+        cfg = os.path.join(model_dir_or_file, 'config.yaml')
+        return cfg if os.path.exists(cfg) else None
+    if os.path.isfile(model_dir_or_file):
+        name = os.path.basename(model_dir_or_file).lower()
+        if name in ('config.yaml', 'config.yml'):
+            return model_dir_or_file
+        cfg = os.path.join(os.path.dirname(model_dir_or_file), 'config.yaml')
+        return cfg if os.path.exists(cfg) else None
+    return None
+
 def train_transformer_prior(
     config_path: str,
     level_override: Optional[str] = None,
