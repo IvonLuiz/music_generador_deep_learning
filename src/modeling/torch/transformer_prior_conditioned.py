@@ -223,11 +223,28 @@ class TransformerPriorConditioned(nn.Module):
                 )
 
             t_emb = self.time_embedding(time_ids)   # (batch, seq_len, model_dim)
-            x = x + t_emb
+            x = x + t_emb   # add time embeddings to the token+position embeddings
 
         if self.is_upsampler:
             if upper_indices is None:
                 raise ValueError('upper_indices must be provided for upsampler priors')
+            upper_indices = upper_indices.to(device=device, dtype=torch.long)
+            # Conditioning embedding vocabulary comes from the upper level codebook size
+            cond_vocab = self.conditioner.token_embedding.weight.shape[0]
+
+            if torch.any(upper_indices < 0):
+                raise ValueError("upper_indices contains negative values")
+
+            # Allow exactly one out-of-range ID for BOS from an upper prior with BOS enabled
+            # BOS id is expected to be exactly equal to cond_vocab and is mapped to a neutral token
+            if torch.any(upper_indices >= cond_vocab):
+                if torch.any(upper_indices > cond_vocab):
+                    raise ValueError(
+                        f"upper_indices contains values above conditioning vocab (max allowed={cond_vocab})"
+                    )
+                upper_indices = upper_indices.clone()
+                upper_indices[upper_indices == cond_vocab] = 0
+
             # Process the conditioning input through the WaveNet conditioner
             cond_emb = self.conditioner(upper_indices)  # [batch_size, upper_seq_len, model_dim]
             # Add the conditioning embeddings to the token embeddings
@@ -325,6 +342,8 @@ class TransformerPriorConditioned(nn.Module):
         if device is None:
             device = next(self.parameters()).device
         
+        bos_prefix_len = 0
+
         if start_tokens is not None:
             if start_tokens.ndim != 2:
                 raise ValueError(f"start_tokens must have shape (B, T), got {tuple(start_tokens.shape)}")

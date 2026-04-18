@@ -29,6 +29,7 @@ class FactoredAttention(nn.Module):
         assert qkv_ratio > 0, "qkv_ratio must be > 0"
 
         self.num_heads = num_heads
+        self.model_dim = model_dim
         self.qkv_ratio = float(qkv_ratio)
         self.qkv_dim_total = max(num_heads, int(round(model_dim * self.qkv_ratio)))
         if self.qkv_dim_total % num_heads != 0:
