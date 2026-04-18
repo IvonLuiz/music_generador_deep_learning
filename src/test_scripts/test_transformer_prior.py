@@ -24,10 +24,21 @@ from train_scripts.jukebox_utils import load_jukebox_model
 
 
 def _extract_num_embeddings(state_dict: dict) -> int:
+    # Prefer output projection size because BOS only affects input token embedding size.
+    for key in ('to_logits.weight', 'to_logits.weight_orig'):
+        if key in state_dict:
+            return int(state_dict[key].shape[0])
     for key in ('token_embedding.weight', 'token_embedding.weight_orig'):
         if key in state_dict:
             return int(state_dict[key].shape[0])
     raise KeyError('Could not infer num_embeddings from checkpoint state_dict')
+
+
+def _extract_time_embedding_steps(state_dict: dict) -> Optional[int]:
+    for key in ('time_embedding.weight', 'time_embedding.weight_orig'):
+        if key in state_dict:
+            return int(state_dict[key].shape[0])
+    return None
 
 
 def _extract_cond_num_embeddings(state_dict: dict) -> Optional[int]:
@@ -70,9 +81,35 @@ def load_transformer_prior(
     if prior_cfg is None:
         raise ValueError(f"Missing priors.{model_layer}_prior in config.")
 
-    num_embeddings = int(prior_cfg.get('num_embeddings', 0))
-    if num_embeddings <= 0:
-        num_embeddings = _extract_num_embeddings(state_dict)
+    inferred_num_embeddings = _extract_num_embeddings(state_dict)
+    num_embeddings_cfg = int(prior_cfg.get('num_embeddings', 0))
+    num_embeddings = inferred_num_embeddings if num_embeddings_cfg <= 0 else num_embeddings_cfg
+
+    # If config disagrees with checkpoint shape, trust checkpoint for load compatibility.
+    if num_embeddings != inferred_num_embeddings:
+        print(f'Warning: num_embeddings from config ({num_embeddings}) does not match checkpoint ({inferred_num_embeddings}). Using checkpoint value for loading model.')
+        num_embeddings = inferred_num_embeddings
+
+    use_bos_token = bool(prior_cfg.get('use_bos_token', False))
+    token_embedding_weight = state_dict.get('token_embedding.weight')
+    if token_embedding_weight is None:
+        token_embedding_weight = state_dict.get('token_embedding.weight_orig')
+
+    to_logits_weight = state_dict.get('to_logits.weight')
+    if to_logits_weight is None:
+        to_logits_weight = state_dict.get('to_logits.weight_orig')
+
+    if token_embedding_weight is not None and to_logits_weight is not None:
+        token_vocab = int(token_embedding_weight.shape[0])
+        output_vocab = int(to_logits_weight.shape[0])
+        if token_vocab == output_vocab + 1:
+            use_bos_token = True
+        elif token_vocab == output_vocab:
+            use_bos_token = False
+
+    inferred_time_steps = _extract_time_embedding_steps(state_dict)
+    max_time_steps_cfg = int(prior_cfg.get('max_time_steps', 0))
+    max_time_steps = inferred_time_steps if inferred_time_steps is not None else (max_time_steps_cfg if max_time_steps_cfg > 0 else 100)
     
     cond_num_embeddings = None
     upsample_stride = None
