@@ -274,6 +274,22 @@ def train_transformer_prior(
     config_to_save['vqvae']['middle_model_dir'] = effective_middle_model_dir
     config_to_save['vqvae']['bottom_model_dir'] = effective_bottom_model_dir
     config_to_save['vqvae']['weights_file'] = effective_weights_file
+
+    bottom_vqvae_cfg_path = _resolve_vqvae_config_path(effective_bottom_model_dir)
+    bottom_vqvae_dataset_cfg = {}
+    if bottom_vqvae_cfg_path is not None:
+        try:
+            bottom_vqvae_cfg = load_config(bottom_vqvae_cfg_path)
+            if isinstance(bottom_vqvae_cfg, dict):
+                bottom_vqvae_dataset_cfg = dict(bottom_vqvae_cfg.get('dataset', {}))
+        except Exception:
+            bottom_vqvae_dataset_cfg = {}
+
+    existing_dataset_cfg = dict(config.get('dataset', {}))
+    merged_dataset_cfg = dict(bottom_vqvae_dataset_cfg)
+    merged_dataset_cfg.update(existing_dataset_cfg)
+    config_to_save['dataset'] = merged_dataset_cfg
+
     config_to_save['model'] = dict(config.get('model', {}))
     config_to_save['model']['selected_level'] = selected_level
     config_to_save['model']['inferred_seq_lens'] = dict(seq_lens)
@@ -282,6 +298,8 @@ def train_transformer_prior(
         'middle': [int(middle_h), int(middle_w)],
         'bottom': [int(bottom_h), int(bottom_w)],
     }
+    config_to_save['model']['use_bos_token'] = bool(prior_cfg.get('use_bos_token', False))
+    config_to_save['model']['max_time_steps'] = int(max_time_steps)
     if upsample_stride is not None:
         config_to_save['model']['inferred_upsample_stride'] = int(upsample_stride)
 
