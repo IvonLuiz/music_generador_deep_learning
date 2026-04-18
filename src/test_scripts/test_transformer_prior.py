@@ -23,6 +23,24 @@ from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH
 from train_scripts.jukebox_utils import load_jukebox_model
 
 
+def _resolve_vqvae_config_path(model_dir_or_file: str) -> str:
+    if os.path.isdir(model_dir_or_file):
+        config_path = os.path.join(model_dir_or_file, 'config.yaml')
+    elif os.path.isfile(model_dir_or_file):
+        filename = os.path.basename(model_dir_or_file).lower()
+        if filename in ('config.yaml', 'config.yml'):
+            config_path = model_dir_or_file
+        else:
+            config_path = os.path.join(os.path.dirname(model_dir_or_file), 'config.yaml')
+    else:
+        raise FileNotFoundError(f'Bottom VQ-VAE reference does not exist: {model_dir_or_file}')
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f'Bottom VQ-VAE config.yaml not found at {config_path}')
+
+    return config_path
+
+
 def _extract_num_embeddings(state_dict: dict) -> int:
     # Prefer output projection size because BOS only affects input token embedding size.
     for key in ('to_logits.weight', 'to_logits.weight_orig'):
@@ -134,9 +152,12 @@ def load_transformer_prior(
         dim_feedforward=int(prior_cfg['dim_feedforward']),
         max_seq_len=seq_len,
         block_len=int(prior_cfg.get('block_len', 16)),
+        max_time_steps=max_time_steps,
         is_upsampler=model_layer != 'top',
         cond_num_embeddings=cond_num_embeddings if model_layer != 'top' else None,
         upsample_stride=upsample_stride if model_layer != 'top' else None,
+        use_bos_token=use_bos_token,
+        attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
         dropout=float(prior_cfg.get('dropout', 0.1)),
     ).to(device)
 
@@ -209,25 +230,35 @@ def _decode_bottom_indices(
     vqvae,
     indices: torch.Tensor,
     grid: Optional[list],
-    device: torch.device,
 ) -> np.ndarray:
+    """
+    Decode bottom-level VQ-VAE indices into spectrograms.
+
+    @param vqvae: Loaded JukeboxVQVAE model (will be moved to CPU for safety).
+    @param indices: numpy array of shape (B, T) with integer token indices.
+    @param grid: [time_steps, freq_bins] matching the bottom level grid.
+    @return: numpy array of shape (B, H, W, 1) decoded spectrograms.
+    """
     if indices.ndim != 2:
         raise ValueError(f'Expected indices shape (B, T), got {tuple(indices.shape)}')
     if not (isinstance(grid, list) and len(grid) == 2):
         raise ValueError('Bottom grid is required to reshape indices into (H, W)')
 
+    device = next(vqvae.parameters()).device
     # grid[0] is now Time, grid[1] is now Frequency
     time_steps, freq_bins = int(grid[0]), int(grid[1])
-    
     if time_steps * freq_bins != indices.shape[1]:
         raise ValueError(f'Grid {grid} does not match seq_len={indices.shape[1]}')
 
-    # View as (Batch, Time, Freq), then transpose to (Batch, Freq, Time)
-    idx_2d = indices.view(indices.shape[0], time_steps, freq_bins).transpose(1, 2).contiguous().long().to(device)
+    idx_2d = indices.long().to(device)  # (B, T)
+    idx_2d = idx_2d.view(idx_2d.shape[0], time_steps, freq_bins).transpose(1, 2).contiguous()  # (B, freq_bins, time_steps)
     
     vqvae.eval()
     with torch.no_grad():
-        emb = vqvae.vq.embedding[idx_2d]  # (B, Freq, Time, D)
+        B, H, W = idx_2d.shape
+        idx_flat = idx_2d.reshape(-1).to(device)   # (B * H * W)
+        emb_flat = vqvae.vq.embedding[idx_flat]  # (B * H * W, D)
+        emb = emb_flat.view(B, H, W, -1)  # (B, freq_bins, time_steps, D)
         z_q = emb.permute(0, 3, 1, 2).contiguous()  # (B, D, Freq, Time)
         x_hat = vqvae.decoder(z_q)
         if vqvae.activation_layer is not None:
@@ -255,10 +286,24 @@ def test_transformer_prior(
     top_prior, top_config, _ = load_transformer_prior('top', top_prior_path, device, weights_file)
     top_seq_len = int(top_config['model']['inferred_seq_lens']['top'])
     top_grid = top_config['model'].get('inferred_grids', {}).get('top')
-    
+
+    print(f'Loading middle Transformer prior from {middle_prior_path}')
+    middle_prior, middle_config, _ = load_transformer_prior('middle', middle_prior_path, device, weights_file)
+    middle_seq_len = int(middle_config['model']['inferred_seq_lens']['middle'])
+    middle_grid = middle_config['model'].get('inferred_grids', {}).get('middle')
+
+    print(f'Loading bottom Transformer prior from {bottom_prior_path}')
+    bottom_prior, bottom_config, _ = load_transformer_prior('bottom', bottom_prior_path, device, weights_file)
+    bottom_seq_len = int(bottom_config['model']['inferred_seq_lens']['bottom'])
+    bottom_grid = bottom_config['model'].get('inferred_grids', {}).get('bottom')
+    bottom_prior_cfg = bottom_config.get('priors', {}).get('bottom_prior', {}) if isinstance(bottom_config, dict) else {}
+    bottom_condition_on_top = bool(bottom_prior_cfg.get('condition_on_top', False))
+
+    # Top-level prior generation
     if time_ids is None:
         time_ids=torch.zeros((num_samples, 1), dtype=torch.long, device=device)
 
+    print(f'Generating top-level indices...')
     with torch.no_grad():
         top_tokens = top_prior.generate(
             batch_size=num_samples,
@@ -270,11 +315,7 @@ def test_transformer_prior(
             time_id=time_ids,
         )
 
-    print(f'Loading middle Transformer prior from {middle_prior_path}')
-    middle_prior, middle_config, _ = load_transformer_prior('middle', middle_prior_path, device, weights_file)
-    middle_seq_len = int(middle_config['model']['inferred_seq_lens']['middle'])
-    middle_grid = middle_config['model'].get('inferred_grids', {}).get('middle')
-
+    print(f'Generating middle-level indices...')
     with torch.no_grad():
         middle_tokens = middle_prior.generate(
             batch_size=num_samples,
@@ -284,13 +325,10 @@ def test_transformer_prior(
             temperature=temperature,
             top_k=top_k_value,
             device=device,
+            time_id=time_ids,
         )
 
-    print(f'Loading bottom Transformer prior from {bottom_prior_path}')
-    bottom_prior, bottom_config, _ = load_transformer_prior('bottom', bottom_prior_path, device, weights_file)
-    bottom_seq_len = int(bottom_config['model']['inferred_seq_lens']['bottom'])
-    bottom_grid = bottom_config['model'].get('inferred_grids', {}).get('bottom')
-
+    print(f'Generating bottom-level indices...')
     with torch.no_grad():
         bottom_tokens = bottom_prior.generate(
             batch_size=num_samples,
@@ -300,20 +338,44 @@ def test_transformer_prior(
             temperature=temperature,
             top_k=top_k_value,
             device=device,
+            time_id=time_ids,
         )
 
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    save_dir = os.path.join('samples', 'transformer_hierarchical_generated', current_time)
+    save_dir = os.path.join('samples', 'transformer_prior_backing_tracks', current_time)
     os.makedirs(save_dir, exist_ok=True)
 
     _save_indices(top_tokens.cpu().numpy().astype(np.int64), save_dir, 'top', top_grid)
     _save_indices(middle_tokens.cpu().numpy().astype(np.int64), save_dir, 'middle', middle_grid)
     _save_indices(bottom_tokens.cpu().numpy().astype(np.int64), save_dir, 'bottom', bottom_grid)
 
+    # del models from GPU before decoding and audio generation to free up memory for large tensors in decoding and Griffin-Lim
+    del top_prior, middle_prior, bottom_prior
+    torch.cuda.empty_cache()
+
     vqvae_cfg = bottom_config.get('vqvae', {}) if isinstance(bottom_config, dict) else {}
     effective_bottom_vqvae = bottom_vqvae_path or vqvae_cfg.get('bottom_model_dir')
     effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
-    min_max_values_path = bottom_config['dataset']['min_max_values_path']
+    if not effective_bottom_vqvae:
+        raise ValueError('Bottom VQ-VAE path is required. Provide --bottom_vqvae or set vqvae.bottom_model_dir in Transformer config.')
+
+    vqvae_config_path = _resolve_vqvae_config_path(effective_bottom_vqvae)
+    vqvae_config = load_config(vqvae_config_path)
+    resolved_dataset_cfg = vqvae_config.get('dataset', {}) if isinstance(vqvae_config, dict) else {}
+
+    min_max_values_path = resolved_dataset_cfg.get('min_max_values_path')
+    if not min_max_values_path:
+        raise ValueError(f'Missing dataset.min_max_values_path in bottom VQ-VAE config: {vqvae_config_path}')
+
+    sample_rate = int(resolved_dataset_cfg.get('sample_rate', SAMPLE_RATE))
+    hop_length = int(resolved_dataset_cfg.get('hop_length', HOP_LENGTH))
+    frame_size = int(resolved_dataset_cfg.get('frame_size', FRAME_SIZE))
+    spectrograms_path = resolved_dataset_cfg.get('processed_path', '')
+    spectrogram_type_cfg = resolved_dataset_cfg.get('spectrogram_type')
+    spectrogram_type = str(spectrogram_type_cfg).strip().lower() if spectrogram_type_cfg else (
+        'mel' if 'mel' in str(spectrograms_path).lower() else 'linear'
+    )
+    n_mels = int(resolved_dataset_cfg.get('n_mels', N_MELS))
 
     if effective_bottom_vqvae is not None:
         print(f'Loading bottom VQ-VAE from {effective_bottom_vqvae}')
@@ -325,11 +387,18 @@ def test_transformer_prior(
         with open(min_max_values_path, 'rb') as f:
             min_max_values = pickle.load(f)
 
-        decoded_specs = _decode_bottom_indices(vqvae, bottom_tokens, bottom_grid, device)
+        decoded_specs = _decode_bottom_indices(vqvae, bottom_tokens, bottom_grid, torch.device('cpu'))  # Decode on CPU
         _save_decoded_spectrograms(decoded_specs, save_dir)
         min_max_list = _prepare_min_max_values(min_max_values, decoded_specs.shape[0])
 
-        sound_generator = SoundGenerator(vqvae, hop_length=HOP_LENGTH)
+        sound_generator = SoundGenerator(
+            vqvae,
+            hop_length=hop_length,
+            sample_rate=sample_rate,
+            n_fft=frame_size,
+            spectrogram_type=spectrogram_type,
+            n_mels=n_mels,
+        )
         audio_signals = sound_generator.convert_spectrograms_to_audio(
             decoded_specs, min_max_list, method=audio_method
         )
@@ -337,7 +406,7 @@ def test_transformer_prior(
         audio_dir = os.path.join(save_dir, 'audio')
         os.makedirs(audio_dir, exist_ok=True)
         for i, signal in enumerate(audio_signals):
-            sf.write(os.path.join(audio_dir, f'sample_{i}.wav'), signal, SAMPLE_RATE)
+            sf.write(os.path.join(audio_dir, f'sample_{i}.wav'), signal, sample_rate)
         print(f'Saved audio to {audio_dir}')
     else:
         print('No bottom VQ-VAE path provided, skipping spectrogram decoding and audio generation.')
@@ -349,7 +418,6 @@ if __name__ == '__main__':
     parser.add_argument('--middle_prior', type=str, required=True, help='Path to middle prior run directory, config, or .pth')
     parser.add_argument('--bottom_prior', type=str, required=True, help='Path to bottom prior run directory, config, or .pth')
     parser.add_argument('--bottom_vqvae', type=str, default=None, help='Path to bottom VQ-VAE run directory, config, or .pth')
-    parser.add_argument('--min_max_values', type=str, default=None, help='Path to min_max_values.pkl (optional)')
     parser.add_argument('--audio_method', type=str, default='griffinlim', help='Audio inversion: griffinlim or istft')
     parser.add_argument('--weights_file', type=str, default='best_model.pth')
     parser.add_argument('--n_samples', type=int, default=6, help='Number of samples to generate (default: 6)')
@@ -370,7 +438,6 @@ if __name__ == '__main__':
         middle_prior_path=args.middle_prior,
         bottom_prior_path=args.bottom_prior,
         bottom_vqvae_path=args.bottom_vqvae,
-        min_max_values_path=args.min_max_values,
         audio_method=args.audio_method,
         num_samples=args.n_samples,
         temperature=args.temperature,
