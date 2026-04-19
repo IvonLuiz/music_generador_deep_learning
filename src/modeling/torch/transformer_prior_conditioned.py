@@ -50,6 +50,8 @@ class TransformerPriorConditioned(nn.Module):
         is_upsampler: bool = False,
         cond_num_embeddings: Optional[int] = None,
         upsample_stride: Optional[int] = None,
+        second_cond_num_embeddings: Optional[int] = None,
+        second_upsample_stride: Optional[int] = None,
         use_bos_token: bool = False,
         conditioner_residual_block_width: int = 1024,
         conditioner_residual_blocks: int = 16,
@@ -129,6 +131,23 @@ class TransformerPriorConditioned(nn.Module):
                 dropout=dropout,
             )
 
+            self.second_conditioner = None
+            if second_cond_num_embeddings is not None and second_upsample_stride is not None:
+                self.second_conditioner = WaveNetConditioner(
+                    num_embeddings=second_cond_num_embeddings,
+                    embedding_dim=model_dim,
+                    num_layers=conditioner_residual_blocks,
+                    num_channels=conditioner_residual_block_width,
+                    kernel_size=conditioner_kernel_size,
+                    conv_channels=conditioner_conv_channels,
+                    dilation_growth=conditioner_dilation_growth_rate,
+                    dilation_cycle=conditioner_dilation_cycle,
+                    upsample_stride=second_upsample_stride,
+                    dropout=dropout,
+                )
+        else:
+            self.second_conditioner = None
+
         # Embedding layers for tokens and positions        
         self.token_embedding = nn.Embedding(self.input_vocab_size, model_dim)
         self.pos_embedding = nn.Embedding(max_seq_len, model_dim)
@@ -161,6 +180,7 @@ class TransformerPriorConditioned(nn.Module):
         self,
         indices: torch.Tensor,
         upper_indices: Optional[torch.Tensor] = None,
+        second_upper_indices: Optional[torch.Tensor] = None,
         time_ids: torch.Tensor = None
     ) -> torch.Tensor:
         """
@@ -250,6 +270,27 @@ class TransformerPriorConditioned(nn.Module):
             # Add the conditioning embeddings to the token embeddings
             x = x + cond_emb[:, :seq_len, :]  # Ensure the conditioning embeddings are added only up to the current sequence length (in case of any length mismatch)
 
+            if self.second_conditioner is not None:
+                if second_upper_indices is None:
+                    raise ValueError('second_upper_indices must be provided when second_conditioner is enabled')
+
+                second_upper_indices = second_upper_indices.to(device=device, dtype=torch.long)
+                cond_vocab_2 = self.second_conditioner.token_embedding.weight.shape[0]
+
+                if torch.any(second_upper_indices < 0):
+                    raise ValueError("second_upper_indices contains negative values")
+
+                if torch.any(second_upper_indices >= cond_vocab_2):
+                    if torch.any(second_upper_indices > cond_vocab_2):
+                        raise ValueError(
+                            f"second_upper_indices contains values above conditioning vocab (max allowed={cond_vocab_2})"
+                        )
+                    second_upper_indices = second_upper_indices.clone()
+                    second_upper_indices[second_upper_indices == cond_vocab_2] = 0
+
+                cond_emb_2 = self.second_conditioner(second_upper_indices)
+                x = x + cond_emb_2[:, :seq_len, :]
+
         # pass through transformer layers
         # FactoredAttention requires seq_len to be a multiple of block_len
         # During token-by-token generation, we pad the sequence temporarily
@@ -276,6 +317,7 @@ class TransformerPriorConditioned(nn.Module):
         self,
         indices: torch.Tensor,
         upper_indices: Optional[torch.Tensor] = None,
+        second_upper_indices: Optional[torch.Tensor] = None,
         time_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """!
@@ -308,6 +350,7 @@ class TransformerPriorConditioned(nn.Module):
         logits = self.forward(
             input_tokens,
             upper_indices=upper_indices,
+            second_upper_indices=second_upper_indices,
             time_ids=time_ids,
         )
         return F.cross_entropy(logits.reshape(-1, self.num_embeddings), target.reshape(-1))
@@ -318,6 +361,7 @@ class TransformerPriorConditioned(nn.Module):
         batch_size: int,
         start_tokens: Optional[torch.Tensor] = None,
         upper_indices: Optional[torch.Tensor] = None,
+        second_upper_indices: Optional[torch.Tensor] = None,
         time_id: torch.Tensor = None,
         seq_len: int = 64,
         temperature: float = 1.0,
@@ -342,6 +386,8 @@ class TransformerPriorConditioned(nn.Module):
             raise ValueError(f"Requested seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}")
         if self.is_upsampler and upper_indices is None:
             raise ValueError("upper_indices must be provided to generate from an upsampler.")
+        if self.second_conditioner is not None and second_upper_indices is None:
+            raise ValueError("second_upper_indices must be provided when second_conditioner is enabled.")
 
         if device is None:
             device = next(self.parameters()).device
@@ -371,6 +417,7 @@ class TransformerPriorConditioned(nn.Module):
             logits = self.forward(
                 tokens,
                 upper_indices=upper_indices,
+                second_upper_indices=second_upper_indices,
                 time_ids=time_id,
             )
             
