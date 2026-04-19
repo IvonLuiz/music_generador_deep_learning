@@ -7,6 +7,7 @@ import numpy as np
 from datetime import datetime
 from typing import Optional
 import math
+import re
 
 import torch
 import torch.nn as nn
@@ -198,7 +199,7 @@ def train_transformer_prior(
         dim_feedforward=int(prior_cfg['dim_feedforward']),
         max_seq_len=seq_lens[selected_level],
         block_len=int(prior_cfg.get('block_len', 16)),
-        max_time_steps=int(prior_cfg.get('max_time_steps', 500)),
+        max_time_steps=max_time_steps,
         is_upsampler=is_upsampler,
         cond_num_embeddings=cond_num_embeddings,
         upsample_stride=upsample_stride,
@@ -282,8 +283,11 @@ def train_transformer_prior(
             bottom_vqvae_cfg = load_config(bottom_vqvae_cfg_path)
             if isinstance(bottom_vqvae_cfg, dict):
                 bottom_vqvae_dataset_cfg = dict(bottom_vqvae_cfg.get('dataset', {}))
-        except Exception:
-            bottom_vqvae_dataset_cfg = {}
+        except (FileNotFoundError, OSError, yaml.YAMLError, ValueError) as exc:
+            print(
+                f"Warning: failed to load bottom VQ-VAE config from {bottom_vqvae_cfg_path}: {exc}",
+                file=sys.stderr,
+            )
 
     existing_dataset_cfg = dict(config.get('dataset', {}))
     merged_dataset_cfg = dict(bottom_vqvae_dataset_cfg)
@@ -341,11 +345,11 @@ def train_transformer_prior(
 
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                    loss = prior.loss(target_seq, upper_indices=cond_seq)
+                    loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
                 loss_to_backward = loss / grad_accum_steps
                 scaler.scale(loss_to_backward).backward()
             else:
-                loss = prior.loss(target_seq, upper_indices=cond_seq)
+                loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
                 loss_to_backward = loss / grad_accum_steps
                 loss_to_backward.backward()
 
@@ -392,9 +396,9 @@ def train_transformer_prior(
                 cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
                 if use_amp:
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                        loss = prior.loss(target_seq, upper_indices=cond_seq)
+                        loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
                 else:
-                    loss = prior.loss(target_seq, upper_indices=cond_seq)
+                    loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
                 val_running_loss += loss.item()
 
         epoch_val_loss = val_running_loss / max(len(val_loader), 1)
