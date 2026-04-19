@@ -35,6 +35,7 @@ priors:
     num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
     dim_feedforward: 2048 # Transformer feedforward layers
     dropout: 0.1
+    max_time_steps: 2048
     attention_qkv_ratio: 0.25
     block_len: 16  # Middle Grid: 16 (Freq) * 64 (Time) -> block_len must be 16
     # condiditioner parameters
@@ -51,6 +52,7 @@ priors:
     num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
     dim_feedforward: 2048  # Transformer feedforward layers
     dropout: 0.1
+    max_time_steps: 2048
     attention_qkv_ratio: 0.25
     block_len: 32  # Bottom Grid: 32 (Freq) * 128 (Time) -> block_len must be 32
     # condiditioner parameters

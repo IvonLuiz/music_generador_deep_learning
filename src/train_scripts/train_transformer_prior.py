@@ -7,6 +7,7 @@ import numpy as np
 from datetime import datetime
 from typing import Optional
 import math
+import re
 
 import torch
 import torch.nn as nn
@@ -62,6 +63,35 @@ def _compute_stride(lower_len: int, upper_len: int, level_name: str) -> int:
             f'Cannot infer upsample_stride for {level_name}: lower_len={lower_len}, upper_len={upper_len}'
         )
     return lower_len // upper_len
+
+
+def _extract_max_segment_time_id(file_paths) -> Optional[int]:
+    max_time_id = None
+    pattern = re.compile(r'_segment_(\d+)\.npy$')
+    for path in file_paths:
+        s = str(path)
+        match = pattern.search(s)
+        if not match:
+            continue
+        tid = int(match.group(1))
+        if max_time_id is None or tid > max_time_id:
+            max_time_id = tid
+    return max_time_id
+
+
+def _resolve_vqvae_config_path(model_dir_or_file: Optional[str]) -> Optional[str]:
+    if not model_dir_or_file:
+        return None
+    if os.path.isdir(model_dir_or_file):
+        cfg = os.path.join(model_dir_or_file, 'config.yaml')
+        return cfg if os.path.exists(cfg) else None
+    if os.path.isfile(model_dir_or_file):
+        name = os.path.basename(model_dir_or_file).lower()
+        if name in ('config.yaml', 'config.yml'):
+            return model_dir_or_file
+        cfg = os.path.join(os.path.dirname(model_dir_or_file), 'config.yaml')
+        return cfg if os.path.exists(cfg) else None
+    return None
 
 def train_transformer_prior(
     config_path: str,
@@ -153,6 +183,14 @@ def train_transformer_prior(
         cond_num_embeddings = num_embeddings_map[cond_level]
         upsample_stride = _compute_stride(seq_lens[selected_level], seq_lens[cond_level], selected_level)
 
+    max_time_steps_cfg = int(prior_cfg.get('max_time_steps', 500))
+    max_time_id = _extract_max_segment_time_id(file_paths)
+    if max_time_id is not None:
+        required_time_steps = int(max_time_id) + 1
+        max_time_steps = max(max_time_steps_cfg, required_time_steps)
+    else:
+        max_time_steps = max_time_steps_cfg
+
     prior = TransformerPriorConditioned(
         num_embeddings=num_embeddings_map[selected_level],
         model_dim=int(prior_cfg['model_dim']),
@@ -161,7 +199,7 @@ def train_transformer_prior(
         dim_feedforward=int(prior_cfg['dim_feedforward']),
         max_seq_len=seq_lens[selected_level],
         block_len=int(prior_cfg.get('block_len', 16)),
-        max_time_steps=int(prior_cfg.get('max_time_steps', 500)),
+        max_time_steps=max_time_steps,
         is_upsampler=is_upsampler,
         cond_num_embeddings=cond_num_embeddings,
         upsample_stride=upsample_stride,
@@ -237,6 +275,25 @@ def train_transformer_prior(
     config_to_save['vqvae']['middle_model_dir'] = effective_middle_model_dir
     config_to_save['vqvae']['bottom_model_dir'] = effective_bottom_model_dir
     config_to_save['vqvae']['weights_file'] = effective_weights_file
+
+    bottom_vqvae_cfg_path = _resolve_vqvae_config_path(effective_bottom_model_dir)
+    bottom_vqvae_dataset_cfg = {}
+    if bottom_vqvae_cfg_path is not None:
+        try:
+            bottom_vqvae_cfg = load_config(bottom_vqvae_cfg_path)
+            if isinstance(bottom_vqvae_cfg, dict):
+                bottom_vqvae_dataset_cfg = dict(bottom_vqvae_cfg.get('dataset', {}))
+        except (FileNotFoundError, OSError, yaml.YAMLError, ValueError) as exc:
+            print(
+                f"Warning: failed to load bottom VQ-VAE config from {bottom_vqvae_cfg_path}: {exc}",
+                file=sys.stderr,
+            )
+
+    existing_dataset_cfg = dict(config.get('dataset', {}))
+    merged_dataset_cfg = dict(bottom_vqvae_dataset_cfg)
+    merged_dataset_cfg.update(existing_dataset_cfg)
+    config_to_save['dataset'] = merged_dataset_cfg
+
     config_to_save['model'] = dict(config.get('model', {}))
     config_to_save['model']['selected_level'] = selected_level
     config_to_save['model']['inferred_seq_lens'] = dict(seq_lens)
@@ -245,6 +302,8 @@ def train_transformer_prior(
         'middle': [int(middle_h), int(middle_w)],
         'bottom': [int(bottom_h), int(bottom_w)],
     }
+    config_to_save['model']['use_bos_token'] = bool(prior_cfg.get('use_bos_token', False))
+    config_to_save['model']['max_time_steps'] = int(max_time_steps)
     if upsample_stride is not None:
         config_to_save['model']['inferred_upsample_stride'] = int(upsample_stride)
 
@@ -269,6 +328,7 @@ def train_transformer_prior(
             top_indices = batch[0].to(device)
             mid_indices = batch[1].to(device)
             bot_indices = batch[2].to(device)
+            time_id = batch[3].to(device)
 
             if selected_level == 'top':
                 target_indices = top_indices
@@ -285,11 +345,11 @@ def train_transformer_prior(
 
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                    loss = prior.loss(target_seq, upper_indices=cond_seq)
+                    loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
                 loss_to_backward = loss / grad_accum_steps
                 scaler.scale(loss_to_backward).backward()
             else:
-                loss = prior.loss(target_seq, upper_indices=cond_seq)
+                loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
                 loss_to_backward = loss / grad_accum_steps
                 loss_to_backward.backward()
 
@@ -320,6 +380,7 @@ def train_transformer_prior(
                 top_indices = batch[0].to(device)
                 mid_indices = batch[1].to(device)
                 bot_indices = batch[2].to(device)
+                time_id = batch[3].to(device)
 
                 if selected_level == 'top':
                     target_indices = top_indices
@@ -335,9 +396,9 @@ def train_transformer_prior(
                 cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
                 if use_amp:
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                        loss = prior.loss(target_seq, upper_indices=cond_seq)
+                        loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
                 else:
-                    loss = prior.loss(target_seq, upper_indices=cond_seq)
+                    loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
                 val_running_loss += loss.item()
 
         epoch_val_loss = val_running_loss / max(len(val_loader), 1)
@@ -348,6 +409,8 @@ def train_transformer_prior(
 
         print(f'Epoch {epoch + 1}: Train Loss={epoch_train_loss:.4f}, Val Loss={epoch_val_loss:.4f}')
 
+        # Save models
+        ## Save best model based on validation loss
         if epoch_val_loss < best_val_loss:
             best_val_loss = epoch_val_loss
             best_epoch = len(val_losses)
@@ -364,6 +427,7 @@ def train_transformer_prior(
             )
             print('Saved best model.')
 
+        ## Periodic checkpointing every 10 epochs
         if (epoch + 1) % 10 == 0:
             torch.save(
                 {
@@ -375,6 +439,18 @@ def train_transformer_prior(
                 },
                 os.path.join(run_dir, f'model_epoch_{epoch + 1}.pth')
             )
+
+        ## Always save the latest checkpoint
+        torch.save(
+            {
+                'model_state': prior.state_dict(),
+                'epoch': epoch + 1,
+                'train_loss': epoch_train_loss,
+                'val_loss': epoch_val_loss,
+                'history': {'train_loss': train_losses, 'val_loss': val_losses},
+            },
+            os.path.join(run_dir, f'latest_model.pth')
+        )
 
         early_stopping(epoch_val_loss)
         if early_stopping.early_stop:
