@@ -19,7 +19,7 @@ from utils import load_config
 
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
 from generation.soundgenerator import SoundGenerator
-from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH
+from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH, FRAME_SIZE, N_MELS
 from train_scripts.jukebox_utils import load_jukebox_model
 
 
@@ -234,7 +234,7 @@ def _decode_bottom_indices(
     """
     Decode bottom-level VQ-VAE indices into spectrograms.
 
-    @param vqvae: Loaded JukeboxVQVAE model (will be moved to CPU for safety).
+    @param vqvae: Loaded JukeboxVQVAE model.
     @param indices: numpy array of shape (B, T) with integer token indices.
     @param grid: [time_steps, freq_bins] matching the bottom level grid.
     @return: numpy array of shape (B, H, W, 1) decoded spectrograms.
@@ -387,7 +387,7 @@ def test_transformer_prior(
         with open(min_max_values_path, 'rb') as f:
             min_max_values = pickle.load(f)
 
-        decoded_specs = _decode_bottom_indices(vqvae, bottom_tokens, bottom_grid, torch.device('cpu'))  # Decode on CPU
+        decoded_specs = _decode_bottom_indices(vqvae, bottom_tokens, bottom_grid)
         _save_decoded_spectrograms(decoded_specs, save_dir)
         min_max_list = _prepare_min_max_values(min_max_values, decoded_specs.shape[0])
 
