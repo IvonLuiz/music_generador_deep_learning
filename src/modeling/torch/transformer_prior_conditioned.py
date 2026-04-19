@@ -194,7 +194,7 @@ class TransformerPriorConditioned(nn.Module):
         # base embeddings (tokens + position)
         x = self.token_embedding(indices) + self.pos_embedding(pos)
 
-        # Add time embeddings if time_ids are provided (for upsampler priors, this should help the model learn temporal structure)
+        # Add time embeddings if time_ids are provided
         if time_ids is not None:
             time_ids = time_ids.to(device=device, dtype=torch.long)
 
@@ -223,7 +223,7 @@ class TransformerPriorConditioned(nn.Module):
                 )
 
             t_emb = self.time_embedding(time_ids)   # (batch, seq_len, model_dim)
-            x = x + t_emb   # add time embeddings to the token+position embeddings
+            x = x + t_emb
 
         if self.is_upsampler:
             if upper_indices is None:
@@ -305,7 +305,11 @@ class TransformerPriorConditioned(nn.Module):
             target = indices[:, 1:]         # Length: T - 1
         
         # Pass upper_indices through to forward
-        logits = self.forward(input_tokens, upper_indices=upper_indices)
+        logits = self.forward(
+            input_tokens,
+            upper_indices=upper_indices,
+            time_ids=time_ids,
+        )
         return F.cross_entropy(logits.reshape(-1, self.num_embeddings), target.reshape(-1))
 
     @torch.no_grad()
@@ -316,9 +320,9 @@ class TransformerPriorConditioned(nn.Module):
         upper_indices: Optional[torch.Tensor] = None,
         time_id: torch.Tensor = None,
         seq_len: int = 64,
-        temperature: float = 1.0,  
+        temperature: float = 1.0,
         top_k: Optional[int] = None,
-        device: Optional[torch.device] = None,   
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """!
         @brief Generates a sequence of token indices autoregressively given an initial input and optional conditioning.
@@ -351,14 +355,24 @@ class TransformerPriorConditioned(nn.Module):
                 raise ValueError("start_tokens batch size does not match requested batch_size")
             tokens = start_tokens.to(device).long()
         else:
-            tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+            if self.use_bos_token:
+                tokens = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
+                bos_prefix_len = 1
+            else:
+                tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
         
         if tokens.shape[1] > seq_len:
             raise ValueError("start_tokens length cannot exceed requested seq_len")
-        
-        while tokens.shape[1] < seq_len:
+
+        target_len = seq_len + bos_prefix_len
+
+        while tokens.shape[1] < target_len:
             # Pass upper_indices during generation
-            logits = self.forward(tokens, upper_indices=upper_indices, time_ids=time_id)
+            logits = self.forward(
+                tokens,
+                upper_indices=upper_indices,
+                time_ids=time_id,
+            )
             
             next_logits = logits[:, -1, :] / temperature
             next_logits_filtered = self._top_k_filter(next_logits, top_k)
@@ -366,7 +380,10 @@ class TransformerPriorConditioned(nn.Module):
             next_token = torch.multinomial(probs, num_samples=1)
             
             tokens = torch.cat([tokens, next_token], dim=1)
-        
+
+        if bos_prefix_len > 0:
+            tokens = tokens[:, bos_prefix_len:]
+
         return tokens
 
     @staticmethod
