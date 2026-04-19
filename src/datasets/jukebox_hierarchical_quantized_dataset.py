@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 import numpy as np
+import re
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 
 
@@ -43,29 +44,68 @@ class JukeboxHierarchicalQuantizedDataset(Dataset):
         )
 
         num_samples = len(x_train)
+        current_batch_size = max(1, int(batch_size))
+
+        def _is_cuda_oom(exc: RuntimeError) -> bool:
+            msg = str(exc).lower()
+            return 'out of memory' in msg and 'cuda' in msg
+
         with torch.no_grad():
-            for i in tqdm(range(0, num_samples, batch_size)):
-                batch = x_train[i:i + batch_size]
-                batch_torch = torch.from_numpy(batch).permute(0, 3, 1, 2).float().to(device)
+            pbar = tqdm(total=num_samples)
+            i = 0
+            while i < num_samples:
+                end = min(i + current_batch_size, num_samples)
+                batch = x_train[i:end]
 
-                # Top indices
-                top_encoded = top_model.encoder(batch_torch)
-                top_pre_vq = top_model.pre_vq_conv(top_encoded)
-                _, idx_top, _, _, _ = top_model.vq(top_pre_vq)
+                try:
+                    batch_torch = torch.from_numpy(batch).permute(0, 3, 1, 2).float().to(device)
 
-                # Middle indices
-                middle_encoded = middle_model.encoder(batch_torch)
-                middle_pre_vq = middle_model.pre_vq_conv(middle_encoded)
-                _, idx_middle, _, _, _ = middle_model.vq(middle_pre_vq)
+                    # Top indices
+                    top_encoded = top_model.encoder(batch_torch)
+                    top_pre_vq = top_model.pre_vq_conv(top_encoded)
+                    _, idx_top, _, _, _ = top_model.vq(top_pre_vq)
 
-                # Bottom indices
-                bottom_encoded = bottom_model.encoder(batch_torch)
-                bottom_pre_vq = bottom_model.pre_vq_conv(bottom_encoded)
-                _, idx_bottom, _, _, _ = bottom_model.vq(bottom_pre_vq)
+                    # Middle indices
+                    middle_encoded = middle_model.encoder(batch_torch)
+                    middle_pre_vq = middle_model.pre_vq_conv(middle_encoded)
+                    _, idx_middle, _, _, _ = middle_model.vq(middle_pre_vq)
 
-                self.top_indices.append(idx_top.cpu())
-                self.middle_indices.append(idx_middle.cpu())
-                self.bottom_indices.append(idx_bottom.cpu())
+                    # Bottom indices
+                    bottom_encoded = bottom_model.encoder(batch_torch)
+                    bottom_pre_vq = bottom_model.pre_vq_conv(bottom_encoded)
+                    _, idx_bottom, _, _, _ = bottom_model.vq(bottom_pre_vq)
+
+                    self.top_indices.append(idx_top.cpu())
+                    self.middle_indices.append(idx_middle.cpu())
+                    self.bottom_indices.append(idx_bottom.cpu())
+
+                    # Release transient CUDA tensors before next chunk
+                    del batch_torch
+                    del top_encoded, top_pre_vq, idx_top
+                    del middle_encoded, middle_pre_vq, idx_middle
+                    del bottom_encoded, bottom_pre_vq, idx_bottom
+
+                    pbar.update(end - i)
+                    i = end
+
+                except RuntimeError as exc:
+                    if not _is_cuda_oom(exc):
+                        pbar.close()
+                        raise
+
+                    if device.type != 'cuda' or current_batch_size == 1:
+                        pbar.close()
+                        raise
+
+                    new_batch_size = max(1, current_batch_size // 2)
+                    print(
+                        f"CUDA OOM while precomputing indices at batch_size={current_batch_size}. "
+                        f"Retrying with batch_size={new_batch_size}."
+                    )
+                    current_batch_size = new_batch_size
+                    torch.cuda.empty_cache()
+
+            pbar.close()
 
         # Transpose dim 1 (Freq) and dim 2 (Time), then make contiguous in memory.
         # This ensures that when the training script flattens the grid, 
@@ -78,17 +118,24 @@ class JukeboxHierarchicalQuantizedDataset(Dataset):
         print(f"Middle indices shape: {tuple(self.middle_indices.shape)}")
         print(f"Bottom indices shape: {tuple(self.bottom_indices.shape)}")
 
+    @staticmethod
+    def _extract_time_id_from_path(file_path: str) -> int:
+        match = re.search(r'_segment_(\d+)\.npy$', str(file_path))
+        if match is None:
+            raise ValueError(
+                f"Could not parse segment index from file path: {file_path}. "
+                "Expected suffix '_segment_<int>.npy'."
+            )
+        return int(match.group(1))
+
     def __len__(self):
         return self.top_indices.shape[0]
 
     def __getitem__(self, idx):
-        # Assuming we have a list of file paths in the dataset class
         file_path = self.file_paths[idx]
-        
         # Extract the segmenter number from the string 
         # example: MIDI-Unprocessed_01_R1_2011_MID--AUDIO_R1-D1_02_Track02_wav.wav_segment_000.npy -> "000"
-        segmenter_number_str = file_path.split('_segment_')[-1].replace('.npy', '')
-        time_id = int(segmenter_number_str)
+        time_id = self._extract_time_id_from_path(file_path)
 
         return [
             self.top_indices[idx],
