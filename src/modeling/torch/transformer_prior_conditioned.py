@@ -194,16 +194,57 @@ class TransformerPriorConditioned(nn.Module):
         # base embeddings (tokens + position)
         x = self.token_embedding(indices) + self.pos_embedding(pos)
 
-        # Add time embeddings if time_ids are provided (for upsampler priors, this should help the model learn temporal structure)
+        # Add time embeddings if time_ids are provided
         if time_ids is not None:
-            time_ids = time_ids.view(batch_size)    # (batch,)
-            t_emb = self.time_embedding(time_ids)   # (batch, model_dim)
-            t_emb = t_emb.unsqueeze(1)              # (batch, 1, model_dim) to add to each token position
-            x = x + t_emb.expand(-1, seq_len, -1)   # (batch, seq_len, model_dim) broadcast addition of time embedding to each token position
+            time_ids = time_ids.to(device=device, dtype=torch.long)
+
+            if time_ids.ndim == 1:
+                if time_ids.shape[0] != batch_size:
+                    raise ValueError(
+                        f"time_ids with shape {tuple(time_ids.shape)} must match batch_size={batch_size}"
+                    )
+                time_ids = time_ids.unsqueeze(1).expand(-1, seq_len)
+            elif time_ids.ndim == 2:
+                if time_ids.shape == (batch_size, 1):
+                    time_ids = time_ids.expand(-1, seq_len)
+                elif time_ids.shape != (batch_size, seq_len):
+                    raise ValueError(
+                        f"time_ids must have shape (B,), (B,1), or (B,T). Got {tuple(time_ids.shape)}"
+                    )
+                # else case is already (B, seq_len)
+            else:
+                raise ValueError(
+                    f"time_ids must have shape (B,), (B,1), or (B,T). Got {tuple(time_ids.shape)}"
+                )
+
+            if torch.any(time_ids < 0) or torch.any(time_ids >= self.max_time_steps):
+                raise ValueError(
+                    f"time_ids values must be in [0, {self.max_time_steps - 1}]"
+                )
+
+            t_emb = self.time_embedding(time_ids)   # (batch, seq_len, model_dim)
+            x = x + t_emb
 
         if self.is_upsampler:
             if upper_indices is None:
                 raise ValueError('upper_indices must be provided for upsampler priors')
+            upper_indices = upper_indices.to(device=device, dtype=torch.long)
+            # Conditioning embedding vocabulary comes from the upper level codebook size
+            cond_vocab = self.conditioner.token_embedding.weight.shape[0]
+
+            if torch.any(upper_indices < 0):
+                raise ValueError("upper_indices contains negative values")
+
+            # Allow exactly one out-of-range ID for BOS from an upper prior with BOS enabled
+            # BOS id is expected to be exactly equal to cond_vocab and is mapped to a neutral token
+            if torch.any(upper_indices >= cond_vocab):
+                if torch.any(upper_indices > cond_vocab):
+                    raise ValueError(
+                        f"upper_indices contains values above conditioning vocab (max allowed={cond_vocab})"
+                    )
+                upper_indices = upper_indices.clone()
+                upper_indices[upper_indices == cond_vocab] = 0
+
             # Process the conditioning input through the WaveNet conditioner
             cond_emb = self.conditioner(upper_indices)  # [batch_size, upper_seq_len, model_dim]
             # Add the conditioning embeddings to the token embeddings
@@ -264,7 +305,11 @@ class TransformerPriorConditioned(nn.Module):
             target = indices[:, 1:]         # Length: T - 1
         
         # Pass upper_indices through to forward
-        logits = self.forward(input_tokens, upper_indices=upper_indices)
+        logits = self.forward(
+            input_tokens,
+            upper_indices=upper_indices,
+            time_ids=time_ids,
+        )
         return F.cross_entropy(logits.reshape(-1, self.num_embeddings), target.reshape(-1))
 
     @torch.no_grad()
@@ -275,9 +320,9 @@ class TransformerPriorConditioned(nn.Module):
         upper_indices: Optional[torch.Tensor] = None,
         time_id: torch.Tensor = None,
         seq_len: int = 64,
-        temperature: float = 1.0,  
+        temperature: float = 1.0,
         top_k: Optional[int] = None,
-        device: Optional[torch.device] = None,   
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """!
         @brief Generates a sequence of token indices autoregressively given an initial input and optional conditioning.
@@ -301,6 +346,8 @@ class TransformerPriorConditioned(nn.Module):
         if device is None:
             device = next(self.parameters()).device
         
+        bos_prefix_len = 0
+
         if start_tokens is not None:
             if start_tokens.ndim != 2:
                 raise ValueError(f"start_tokens must have shape (B, T), got {tuple(start_tokens.shape)}")
@@ -308,14 +355,24 @@ class TransformerPriorConditioned(nn.Module):
                 raise ValueError("start_tokens batch size does not match requested batch_size")
             tokens = start_tokens.to(device).long()
         else:
-            tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+            if self.use_bos_token:
+                tokens = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
+                bos_prefix_len = 1
+            else:
+                tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
         
         if tokens.shape[1] > seq_len:
             raise ValueError("start_tokens length cannot exceed requested seq_len")
-        
-        while tokens.shape[1] < seq_len:
+
+        target_len = seq_len + bos_prefix_len
+
+        while tokens.shape[1] < target_len:
             # Pass upper_indices during generation
-            logits = self.forward(tokens, upper_indices=upper_indices, time_ids=time_id)
+            logits = self.forward(
+                tokens,
+                upper_indices=upper_indices,
+                time_ids=time_id,
+            )
             
             next_logits = logits[:, -1, :] / temperature
             next_logits_filtered = self._top_k_filter(next_logits, top_k)
@@ -323,7 +380,10 @@ class TransformerPriorConditioned(nn.Module):
             next_token = torch.multinomial(probs, num_samples=1)
             
             tokens = torch.cat([tokens, next_token], dim=1)
-        
+
+        if bos_prefix_len > 0:
+            tokens = tokens[:, bos_prefix_len:]
+
         return tokens
 
     @staticmethod
