@@ -66,6 +66,13 @@ def _extract_cond_num_embeddings(state_dict: dict) -> Optional[int]:
     return None
 
 
+def _extract_second_cond_num_embeddings(state_dict: dict) -> Optional[int]:
+    for key in ('second_conditioner.token_embedding.weight', 'second_conditioner.token_embedding.weight_orig'):
+        if key in state_dict:
+            return int(state_dict[key].shape[0])
+    return None
+
+
 def _load_config_and_checkpoint(model_dir_or_file: str, weights_file: str):
     config_path, model_path = resolve_model_paths(model_dir_or_file, weights_file)
 

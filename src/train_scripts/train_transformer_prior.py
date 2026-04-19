@@ -28,6 +28,7 @@ from train_scripts.resume_utils import load_resume_artifacts
 
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
 COND_LEVEL = {'top': None, 'middle': 'top', 'bottom': 'middle'}
+SECOND_COND_LEVEL = {'top': None, 'middle': None, 'bottom': 'top'}
 
 
 def plot_losses(train_losses, val_losses, save_dir, best_epoch=None, best_val_loss=None, level_name: str = 'top'):
@@ -175,13 +176,20 @@ def train_transformer_prior(
 
     prior_cfg = _get_prior_cfg(config, LEVEL_TO_PRIOR_CFG[selected_level])
     cond_level = COND_LEVEL[selected_level]
+    second_cond_level = SECOND_COND_LEVEL[selected_level]
+    condition_on_top = bool(prior_cfg.get('condition_on_top', False)) and selected_level == 'bottom'
 
     is_upsampler = cond_level is not None
     upsample_stride = None
     cond_num_embeddings = None
+    second_upsample_stride = None
+    second_cond_num_embeddings = None
     if is_upsampler:
         cond_num_embeddings = num_embeddings_map[cond_level]
         upsample_stride = _compute_stride(seq_lens[selected_level], seq_lens[cond_level], selected_level)
+    if condition_on_top and second_cond_level is not None:
+        second_cond_num_embeddings = num_embeddings_map[second_cond_level]
+        second_upsample_stride = _compute_stride(seq_lens[selected_level], seq_lens[second_cond_level], selected_level)
 
     max_time_steps_cfg = int(prior_cfg.get('max_time_steps', 500))
     max_time_id = _extract_max_segment_time_id(file_paths)
@@ -203,6 +211,8 @@ def train_transformer_prior(
         is_upsampler=is_upsampler,
         cond_num_embeddings=cond_num_embeddings,
         upsample_stride=upsample_stride,
+        second_cond_num_embeddings=second_cond_num_embeddings,
+        second_upsample_stride=second_upsample_stride,
         conditioner_residual_block_width=int(prior_cfg.get('conditioner_residual_block_width', 1024)),
         conditioner_residual_blocks=int(prior_cfg.get('conditioner_residual_blocks', 16)),
         conditioner_kernel_size=int(prior_cfg.get('conditioner_kernel_size', 3)),
@@ -306,6 +316,8 @@ def train_transformer_prior(
     config_to_save['model']['max_time_steps'] = int(max_time_steps)
     if upsample_stride is not None:
         config_to_save['model']['inferred_upsample_stride'] = int(upsample_stride)
+    if second_upsample_stride is not None:
+        config_to_save['model']['inferred_second_upsample_stride'] = int(second_upsample_stride)
 
     config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['retrain'] = retrain
     config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['pretrained_weights_path'] = pretrained_weights_path
@@ -333,23 +345,27 @@ def train_transformer_prior(
             if selected_level == 'top':
                 target_indices = top_indices
                 cond_indices = None
+                second_cond_indices = None
             elif selected_level == 'middle':
                 target_indices = mid_indices
                 cond_indices = top_indices
+                second_cond_indices = None
             else:
                 target_indices = bot_indices
                 cond_indices = mid_indices
+                second_cond_indices = top_indices if condition_on_top else None
 
             target_seq = target_indices.view(target_indices.shape[0], -1)
             cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
+            second_cond_seq = second_cond_indices.view(second_cond_indices.shape[0], -1) if second_cond_indices is not None else None
 
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                    loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
+                    loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, time_ids=time_id)
                 loss_to_backward = loss / grad_accum_steps
                 scaler.scale(loss_to_backward).backward()
             else:
-                loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
+                loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, time_ids=time_id)
                 loss_to_backward = loss / grad_accum_steps
                 loss_to_backward.backward()
 
@@ -385,20 +401,24 @@ def train_transformer_prior(
                 if selected_level == 'top':
                     target_indices = top_indices
                     cond_indices = None
+                    second_cond_indices = None
                 elif selected_level == 'middle':
                     target_indices = mid_indices
                     cond_indices = top_indices
+                    second_cond_indices = None
                 else:
                     target_indices = bot_indices
                     cond_indices = mid_indices
+                    second_cond_indices = top_indices if condition_on_top else None
 
                 target_seq = target_indices.view(target_indices.shape[0], -1)
                 cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
+                second_cond_seq = second_cond_indices.view(second_cond_indices.shape[0], -1) if second_cond_indices is not None else None
                 if use_amp:
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                        loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
+                        loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, time_ids=time_id)
                 else:
-                    loss = prior.loss(target_seq, upper_indices=cond_seq, time_ids=time_id)
+                    loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, time_ids=time_id)
                 val_running_loss += loss.item()
 
         epoch_val_loss = val_running_loss / max(len(val_loader), 1)
