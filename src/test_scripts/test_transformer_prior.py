@@ -138,6 +138,9 @@ def load_transformer_prior(
     
     cond_num_embeddings = None
     upsample_stride = None
+    second_cond_num_embeddings = None
+    second_upsample_stride = None
+    condition_on_top = bool(prior_cfg.get('condition_on_top', False)) if model_layer == 'bottom' else False
     if model_layer != 'top':
         cond_num_embeddings = int(prior_cfg.get('cond_num_embeddings', 0))
         if cond_num_embeddings <= 0:
@@ -151,6 +154,23 @@ def load_transformer_prior(
             if upper_len > 0 and seq_len % upper_len == 0:
                 upsample_stride = seq_len // upper_len
 
+        if model_layer == 'bottom':
+            second_cond_num_embeddings = int(prior_cfg.get('second_cond_num_embeddings', 0))
+            if second_cond_num_embeddings <= 0:
+                second_cond_num_embeddings = _extract_second_cond_num_embeddings(state_dict)
+
+            inferred_second_stride = int(model_cfg.get('inferred_second_upsample_stride', 0))
+            if inferred_second_stride > 0:
+                second_upsample_stride = inferred_second_stride
+            else:
+                top_len = int(inferred_seq_lens.get('top', 0))
+                if top_len > 0 and seq_len % top_len == 0:
+                    second_upsample_stride = seq_len // top_len
+
+            # If checkpoint contains second conditioner, force-enable dual conditioning.
+            if second_cond_num_embeddings is not None and second_upsample_stride is not None:
+                condition_on_top = True
+
     prior_transformer = TransformerPriorConditioned(
         num_embeddings=num_embeddings,
         model_dim=int(prior_cfg['model_dim']),
@@ -163,6 +183,8 @@ def load_transformer_prior(
         is_upsampler=model_layer != 'top',
         cond_num_embeddings=cond_num_embeddings if model_layer != 'top' else None,
         upsample_stride=upsample_stride if model_layer != 'top' else None,
+        second_cond_num_embeddings=second_cond_num_embeddings if condition_on_top else None,
+        second_upsample_stride=second_upsample_stride if condition_on_top else None,
         use_bos_token=use_bos_token,
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
         dropout=float(prior_cfg.get('dropout', 0.1)),
@@ -278,7 +300,6 @@ def test_transformer_prior(
     middle_prior_path: str,
     bottom_prior_path: str,
     bottom_vqvae_path: Optional[str],
-    min_max_values_path: Optional[str],
     audio_method: str,
     num_samples: int,
     temperature: float,
@@ -341,6 +362,7 @@ def test_transformer_prior(
             batch_size=num_samples,
             start_tokens=None,
             upper_indices=middle_tokens,
+            second_upper_indices=top_tokens if bottom_condition_on_top else None,
             seq_len=bottom_seq_len,
             temperature=temperature,
             top_k=top_k_value,
