@@ -88,6 +88,10 @@ echo "Starting sequential Jukebox Transformer prior training: ${LEVELS[*]}"
 echo "Project root: $ROOT_DIR"
 echo "Python: $PYTHON_BIN"
 
+# Help CUDA allocator deal with large temporary tensors during VQ index precompute.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+echo "PYTORCH_CUDA_ALLOC_CONF: $PYTORCH_CUDA_ALLOC_CONF"
+
 for level in "${LEVELS[@]}"; do
   echo ""
   echo "============================================="
