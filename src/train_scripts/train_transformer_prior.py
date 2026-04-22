@@ -21,7 +21,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from datasets.jukebox_hierarchical_quantized_dataset import JukeboxHierarchicalQuantizedDataset
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
-from utils import load_maestro, load_config
+from utils import list_npy_files, load_config
 from callbacks import EarlyStopping
 from train_scripts.jukebox_utils import load_jukebox_model, parse_level
 from train_scripts.resume_utils import load_resume_artifacts
@@ -124,8 +124,11 @@ def train_transformer_prior(
     middle_model = load_jukebox_model(effective_middle_model_dir, 'middle', device, effective_weights_file)
     bottom_model = load_jukebox_model(effective_bottom_model_dir, 'bottom', device, effective_weights_file)
 
-    x_all, file_paths = load_maestro(dataset_cfg['processed_path'], dataset_cfg.get('target_time_frames', 256))
-    print(f'Loaded data shape: {x_all.shape}')
+    target_time_frames = int(dataset_cfg.get('target_time_frames', 256))
+    file_paths = list_npy_files(dataset_cfg['processed_path'])
+    if len(file_paths) == 0:
+        raise ValueError(f"No .npy files found under dataset path: {dataset_cfg['processed_path']}")
+    print(f'Found {len(file_paths)} spectrogram files for quantization.')
 
     quant_batch_size = train_cfg.get('quantization_batch_size', 32)
     dataset = JukeboxHierarchicalQuantizedDataset(
