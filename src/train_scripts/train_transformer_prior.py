@@ -132,13 +132,13 @@ def train_transformer_prior(
 
     quant_batch_size = train_cfg.get('quantization_batch_size', 32)
     dataset = JukeboxHierarchicalQuantizedDataset(
-        x_train=x_all,
         file_paths=file_paths,
         top_model=top_model,
         middle_model=middle_model,
         bottom_model=bottom_model,
         device=device,
         batch_size=quant_batch_size,
+        target_time_frames=target_time_frames,
     )
 
     num_embeddings_map = {
