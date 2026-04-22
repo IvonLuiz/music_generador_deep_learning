@@ -13,6 +13,16 @@ from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
 
+def list_npy_files(path):
+    all_files = []
+    for root, _, file_names in os.walk(path):
+        for file_name in file_names:
+            if file_name.endswith('.npy'):
+                all_files.append(os.path.join(root, file_name))
+    all_files.sort()
+    return all_files
+
+
 def load_maestro(path, target_time_frames=256, debug_print=False):
     # Check for cached dataset to speed up loading
     # We use the parent directory of the path if path is a directory, or just path
@@ -36,12 +46,8 @@ def load_maestro(path, target_time_frames=256, debug_print=False):
     file_paths = []
     
     # First, collect all file paths to know the total for tqdm
-    all_files = []
     print("Scanning files in:", path)
-    for root, _, file_names in os.walk(path):
-        for file_name in file_names:
-            if file_name.endswith(".npy"):
-                all_files.append(os.path.join(root, file_name))
+    all_files = list_npy_files(path)
 
     print(f"Found {len(all_files)} spectrograms. Loading...")
 
