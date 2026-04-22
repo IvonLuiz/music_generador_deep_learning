@@ -86,9 +86,9 @@ training:
     gradient_accumulation_steps: 32
     learning_rate: 0.0003  # Warmup to lr then cosine decay
     weight_decay: 0.01
-    epochs: 200
-    retrain: true
-    pretrained_weights_path: "./models/transformer_prior/jukebox_backing_tracks_logmel_prior_bottom_transformer_prior/2026-04-14_10-28-05/model_epoch_200.pth"
-  validation_split: 0.0
+    epochs: 1000
+    retrain: false
+    pretrained_weights_path: ""
+  validation_split: 0.1
   early_stopping_patience: 10
   save_dir: "./models/transformer_prior/"
