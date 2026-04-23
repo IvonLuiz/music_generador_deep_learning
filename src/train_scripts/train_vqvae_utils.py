@@ -437,7 +437,20 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                 kwargs['prefetch_factor'] = prefetch_factor
         return kwargs
 
+    historical_counter = 0
+    if resume_history and initial_best_metric is not None:
+        val_losses_history = resume_history.get('val_loss', resume_history.get('val_total', []))
+        for loss in reversed(val_losses_history):
+            if loss > initial_best_metric:
+                historical_counter += 1
+            else:
+                break
+
     if x_val is not None:
+        initial_best_score = None
+        if initial_best_metric is not None:
+            initial_best_score = -initial_best_metric
+
         if isinstance(x_val, (np.ndarray, list)):
             if len(x_val) > 0:
                 print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
@@ -446,7 +459,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                     val_dataset, batch_size=batch_size, shuffle=False,
                     **_loader_kwargs(),
                 )
-                early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
+                early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True, best_score=initial_best_score, counter=historical_counter)
         else:
             # Assume x_val is a Dataset
             print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
@@ -455,7 +468,7 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
                 val_dataset, batch_size=batch_size, shuffle=False,
                 **_loader_kwargs(),
             )
-            early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
+            early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True, best_score=initial_best_score, counter=historical_counter)
     
     if val_dataloader is None:
         print(f"Using all {len(x_train)} samples for training (no validation set provided).")
@@ -486,9 +499,14 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
         model.load_state_dict(checkpoint['model_state'])
         if 'optimizer_state' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state'])
-        start_epoch = int(checkpoint.get('epoch', -1)) + 1
-        print(f"Resumed training from checkpoint: {resume_checkpoint_path}")
-        print(f"Starting from epoch index {start_epoch} (human epoch {start_epoch + 1}).")
+
+        if 'epoch' in checkpoint:
+            start_epoch = int(checkpoint['epoch'])
+            print(f"Resumed training from checkpoint: {resume_checkpoint_path}")
+            print(f"Starting from epoch index {start_epoch}.")
+        else:
+            start_epoch = len(resume_history.get('val_total', []) if resume_history else [])
+            print(f"Checkpoint did not contain an epoch key. Inferred start_epoch {start_epoch} from history.")
 
     print("Model will be saved to :", save_path)
     
@@ -562,10 +580,11 @@ def train_vqvae_jukebox(model: JukeboxVQVAE,
             n_mels=n_mels,
         )
 
-    if start_epoch >= epochs:
+    if start_epoch >= epochs or (early_stopping is not None and early_stopping.counter >= early_stopping.patience):
         print(
-            f"Checkpoint epoch ({start_epoch}) is already >= configured epochs ({epochs}). "
-            "Nothing to train."
+            f"Checkpoint epoch ({start_epoch}) is already >= configured epochs ({epochs}) "
+            f"or patience ({early_stopping.patience if early_stopping else 'N/A'}) has been exhausted "
+            f"(counter: {early_stopping.counter if early_stopping else 'N/A'}). Nothing to train."
         )
         if loss_plotter:
             loss_plotter.plot()
