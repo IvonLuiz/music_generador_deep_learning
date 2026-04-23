@@ -232,6 +232,9 @@ def train_transformer_prior(
 
     resume_history = {}
     initial_best_metric = None
+    start_epoch = 0
+    historical_counter = 0
+
     if retrain:
         if not pretrained_weights_path:
             raise ValueError("training.retrain is true but training.pretrained_weights_path is empty.")
@@ -244,10 +247,39 @@ def train_transformer_prior(
 
         prior.load_state_dict(checkpoint['model_state'])
 
+        if 'epoch' in checkpoint:
+            start_epoch = int(checkpoint['epoch'])
+            print(f"Restoring from checkpoint epoch index {start_epoch}.")
+        else:
+            start_epoch = len(resume_history.get('val_loss', []))
+            print(f"Checkpoint did not contain an epoch key. Inferred start_epoch {start_epoch} from history.")
+
+        val_losses_history = resume_history.get('val_loss', [])
+        if initial_best_metric is not None and val_losses_history:
+            for loss in reversed(val_losses_history):
+                if loss > initial_best_metric:
+                    historical_counter += 1
+                else:
+                    break
+
     epochs = int(train_cfg['epochs'])
-    early_stopping = EarlyStopping(patience=int(train_cfg.get('early_stopping_patience', 10)), verbose=True)
+    
+    # Initialize EarlyStopping with initial best score
+    initial_best_score = None
+    if retrain and initial_best_metric is not None:
+        initial_best_score = -initial_best_metric  # Note: EarlyStopping score represents -loss
+        
+    early_stopping = EarlyStopping(
+        patience=int(train_cfg.get('early_stopping_patience', 10)), 
+        verbose=True,
+        best_score=initial_best_score,
+        counter=historical_counter
+    )
 
     optimizer = optim.AdamW(prior.parameters(), lr=float(train_cfg['learning_rate']), weight_decay=float(train_cfg.get('weight_decay', 0.01)))
+
+    if retrain and 'optimizer_state' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state'])
 
     grad_accum_steps = int(train_cfg.get('gradient_accumulation_steps', 1))
     if grad_accum_steps < 1:
@@ -268,6 +300,12 @@ def train_transformer_prior(
         pct_start=0.05, # Peaks at 5% of training, then gently decays
         anneal_strategy='cos'
     )
+    
+    if retrain and 'scheduler_state' in checkpoint:
+        try:
+            scheduler.load_state_dict(checkpoint['scheduler_state'])
+        except Exception as e:
+            print(f"Warning: Failed to load scheduler state ({e}).")
 
     # Use mixed precision training if on CUDA for potential speedup and reduced memory usage
     use_amp = device.type == 'cuda'
@@ -331,9 +369,13 @@ def train_transformer_prior(
     train_losses = resume_history.get('train_loss', [])
     val_losses = resume_history.get('val_loss', [])
     best_val_loss = initial_best_metric if initial_best_metric is not None else float('inf')
-    best_epoch = 0
+    best_epoch = start_epoch if start_epoch > 0 else 0
 
-    for epoch in range(epochs):
+    if start_epoch >= epochs or early_stopping.counter >= early_stopping.patience:
+        print(f"Checkpoint epoch ({start_epoch}) is already >= configured epochs ({epochs}) or patience ({early_stopping.patience}) has been exhausted (counter: {early_stopping.counter}). Nothing to train.")
+        return
+
+    for epoch in range(start_epoch, epochs):
         prior.train()
         running_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
