@@ -17,21 +17,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from generation.generate import *
-from utils import load_config, compute_dataset_variance, compute_small_sample_variance
+from utils import set_global_seed, load_config, compute_dataset_variance, compute_small_sample_variance
 from train_scripts.train_vqvae_utils import train_vqvae_jukebox
 from datasets.spectrogram_dataset import LazySpectrogramDataset
 from train_scripts.resume_utils import load_resume_artifacts
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-
-def set_global_seed(seed: int) -> None:
-    """Set global RNG seeds without forcing deterministic kernels (keeps training fast)."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 if __name__ == "__main__":
     # Optional: faster matmul on Ampere+ GPUs
