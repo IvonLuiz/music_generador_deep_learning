@@ -21,7 +21,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from datasets.jukebox_hierarchical_quantized_dataset import JukeboxHierarchicalQuantizedDataset
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
-from utils import list_npy_files, load_config
+from utils import set_global_seed, list_npy_files, load_config
 from callbacks import EarlyStopping
 from train_scripts.jukebox_utils import load_jukebox_model, parse_level
 from train_scripts.resume_utils import load_resume_artifacts
@@ -114,6 +114,8 @@ def train_transformer_prior(
     train_prior_cfg = config['training'][LEVEL_TO_PRIOR_CFG[selected_level]]
     train_cfg = {**train_general_cfg, **train_prior_cfg}  # Prior-specific settings override general settings
     transformer_cfg['selected_level'] = selected_level
+    seed = int(train_cfg.get('seed', 42))
+    set_global_seed(seed)
 
     effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
     effective_top_model_dir = top_model_dir or vqvae_cfg['top_model_dir']
