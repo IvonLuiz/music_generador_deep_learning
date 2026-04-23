@@ -13,6 +13,14 @@ from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
 
+def set_global_seed(seed: int) -> None:
+    """Set global RNG seeds without forcing deterministic kernels (keeps training fast)."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 def list_npy_files(path):
     all_files = []
     for root, _, file_names in os.walk(path):
