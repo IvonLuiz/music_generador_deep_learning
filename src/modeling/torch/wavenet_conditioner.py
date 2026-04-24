@@ -3,6 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _is_cudnn_runtime_error(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return 'cudnn' in msg and ('internal_error' in msg or 'execution_failed' in msg or 'not_supported' in msg)
+
+
 class WaveNetResidualBlock(nn.Module):
     """!
     @brief A single residual block used in the WaveNetConditioner, consisting of a dilated convolution followed by a
@@ -136,10 +141,26 @@ class WaveNetConditioner(nn.Module):
         x = self.token_embedding(x)  # (B, T, E)
         x = x.permute(0, 2, 1)  # (B, E, T) for Conv1d
         
+        # TODO: check if this try except is necessary. I was having CUDA errors during
         for layer in self.layers:
-            x = layer(x)
-        
-        x = self.upsample(x)  # (B, C, T')
+            try:
+                x = layer(x)
+            except RuntimeError as exc:
+                print(f"RuntimeError in WaveNetResidualBlock: {exc}")
+                if not x.is_cuda or not _is_cudnn_runtime_error(exc):
+                    raise
+                # Retry without cuDNN for stability on some Conv1d+dilation shapes.
+                with torch.backends.cudnn.flags(enabled=False):
+                    x = layer(x)
+
+        try:
+            x = self.upsample(x)  # (B, C, T')
+        except RuntimeError as exc:
+            print(f"RuntimeError in WaveNetConditioner: {exc}")
+            if not x.is_cuda or not _is_cudnn_runtime_error(exc):
+                raise
+            with torch.backends.cudnn.flags(enabled=False):
+                x = self.upsample(x)
         
         x = x.permute(0, 2, 1)  # (B, T', C) for LayerNorm matching the output of the inferior transformer
         x = self.layer_norm(x)  # (B, T', C)

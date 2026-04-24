@@ -90,15 +90,15 @@ class EMAVectorQuantizer(nn.Module):
         # Update EMA codebook
         if self.training:
             # Update cluster size (how many times each code was used)
-            # N_i^(t) = \gamma * N_i^(t-1) + (1 - \gamma) * n_i^(t)
+            # N_i^(t) = gamma * N_i^(t-1) + (1 - gamma) * n_i^(t)
             # for decay (gamma) 0.99, this means we keep 99% of the previous count and add 1% of the new count
             encodings_sum = encodings.sum(dim=0)  # (K,)
-            self.cluster_size.data.mul_(self.decay).add_(encodings_sum, alpha=1 - self.decay)
+            self.cluster_size.data.mul_(self.decay).add_(encodings_sum, alpha = 1 - self.decay)
 
             # Update embedding average
-            # m_i^(t) = \gamma * m_i^(t-1) + (1 - \gamma) * sum_{j} z_j * 1{e_j = i}
+            # m_i^(t) = gamma * m_i^(t-1) + (1 - gamma) * sum_{j} z_j * 1{e_j = i}
             encodings_weighted_sum = encodings.t() @ z_flat  # (K, D)
-            self.embedding_avg.data.mul_(self.decay).add_(encodings_weighted_sum, alpha=1 - self.decay)
+            self.embedding_avg.data.mul_(self.decay).add_(encodings_weighted_sum, alpha = 1 - self.decay)
 
             # Random restarts for underutilized codes
             dead_codes_idx = torch.where(self.cluster_size < self.restart_threshold)[0]  # indices of underutilized codes
