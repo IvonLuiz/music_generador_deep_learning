@@ -3,8 +3,6 @@ import argparse
 import torch
 import numpy as np
 import os
-import random
-import json
 import yaml
 import sys
 import pickle
@@ -257,7 +255,6 @@ if __name__ == "__main__":
         hop_length=hop_length,
         frame_size=frame_size,
         n_mels=n_mels,
-        seed=seed,
     )
 
     best_model_path = os.path.join(run_dir, 'best_model.pth')
