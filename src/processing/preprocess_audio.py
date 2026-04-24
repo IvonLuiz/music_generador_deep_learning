@@ -10,7 +10,7 @@ SAMPLE_RATE = 22050    # samples per second
 FRAME_SIZE = 2048       # samples for each STFT window
 HOP_LENGTH = 256       # move amount of samples between windows
 N_MELS = 256          # number of mel bins for LogMelSpectrogramExtractor (used only if use_mel_spectrogram=True)
-MIN_MAX_VALUES_SAVE_DIR = "./data/processed/backing_tracks_log_mel/min_max_values/"
+MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_mel_spectrograms/min_max_values/"
 
 
 class Loader:
@@ -469,10 +469,10 @@ if __name__ == "__main__":
     # MIN_MAX_VALUES_SAVE_DIR = "./data/fsdd/"
     # FILES_DIR = "./data/fsdd/audio/"
     
-    FILES_DIR = "./data/raw/backing_tracks"
-    SPECTROGRAMS_SAVE_DIR = "./data/processed/backing_tracks_log_mel/"
+    FILES_DIR = "./data/raw/maestro-v3.0.0"
+    SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro_mel_spectrograms/"
     VISUALIZATION_SAVE_DIR = SPECTROGRAMS_SAVE_DIR + "/spectrograms/"
-    MIN_MAX_VALUES_SAVE_DIR = "./data/processed/backing_tracks_log_mel/min_max_values/"
+    MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_mel_spectrograms/min_max_values/"
     
     # Enable visualization (set to False to disable)
     ENABLE_VISUALIZATION = False
