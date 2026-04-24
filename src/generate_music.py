@@ -20,31 +20,18 @@ from utils import load_maestro, load_config
 from train_scripts.jukebox_utils import load_jukebox_model
 from test_scripts.test_transformer_prior import load_transformer_prior
 from generation.soundgenerator import SoundGenerator
-from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH
+from generation.transformer_io_utils import (
+    prepare_min_max_values,
+    resolve_min_max_values_path,
+    resolve_vqvae_config_path,
+    save_decoded_spectrograms,
+)
+from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH, FRAME_SIZE
 
 
 DEFAULT_TOP_RUN_ROOT = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_top_transformer_prior"
 DEFAULT_MIDDLE_RUN_ROOT = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_middle_transformer_prior"
 DEFAULT_BOTTOM_RUN_ROOT = "models/transformer_prior/jukebox_maestro2011_target_time_frames_1024_bottom_transformer_prior"
-
-
-def _prepare_min_max_values(min_max_values: object, count: int) -> list:
-    if isinstance(min_max_values, dict):
-        values = list(min_max_values.values())
-    elif isinstance(min_max_values, list):
-        values = min_max_values
-    else:
-        raise ValueError('min_max_values must be a dict or list')
-
-    if not values:
-        raise ValueError('min_max_values is empty')
-
-    if len(values) >= count:
-        return values[:count]
-
-    repeats = (count + len(values) - 1) // len(values)
-    tiled = (values * repeats)[:count]
-    return tiled
 
 
 def _resolve_latest_config_path(run_root: str, level_name: str) -> str:
@@ -92,58 +79,6 @@ def _resolve_prior_config_path(
 
 def _debug(msg: str) -> None:
     print(f'[DEBUG] {msg}')
-
-
-def _normalize_candidate_path(path: Optional[str]) -> Optional[str]:
-    if not path or not isinstance(path, str):
-        return None
-    return os.path.abspath(os.path.expanduser(path))
-
-
-def _resolve_min_max_values_path(bottom_config: dict) -> str:
-    candidates: List[str] = []
-
-    direct_path = _normalize_candidate_path(bottom_config.get('dataset', {}).get('min_max_values_path'))
-    if direct_path:
-        candidates.append(direct_path)
-
-    processed_path = _normalize_candidate_path(bottom_config.get('dataset', {}).get('processed_path'))
-    if processed_path:
-        candidates.append(os.path.join(processed_path, 'min_max_values.pkl'))
-
-    bottom_model_dir = _normalize_candidate_path(bottom_config.get('vqvae', {}).get('bottom_model_dir'))
-    if bottom_model_dir:
-        bottom_vqvae_cfg = os.path.join(bottom_model_dir, 'config.yaml')
-        if os.path.exists(bottom_vqvae_cfg):
-            _debug(f'Loading bottom VQ-VAE config for min/max fallback: {bottom_vqvae_cfg}')
-            vq_cfg = load_config(bottom_vqvae_cfg)
-            vq_direct = _normalize_candidate_path(vq_cfg.get('dataset', {}).get('min_max_values_path'))
-            if vq_direct:
-                candidates.append(vq_direct)
-            vq_processed = _normalize_candidate_path(vq_cfg.get('dataset', {}).get('processed_path'))
-            if vq_processed:
-                candidates.append(os.path.join(vq_processed, 'min_max_values.pkl'))
-
-    seen = set()
-    unique_candidates = []
-    for path in candidates:
-        if path not in seen:
-            seen.add(path)
-            unique_candidates.append(path)
-
-    _debug('Min/max candidate paths checked:')
-    for path in unique_candidates:
-        _debug(f'  - {path}')
-
-    for path in unique_candidates:
-        if os.path.exists(path):
-            _debug(f'Using min/max path: {path}')
-            return path
-
-    raise FileNotFoundError(
-        'Could not resolve min_max_values.pkl. Checked dataset.min_max_values_path, '
-        'dataset.processed_path/min_max_values.pkl, and bottom VQ-VAE config fallbacks.'
-    )
 
 
 def _generate_level_tokens(
@@ -348,13 +283,20 @@ def generate_hierarchical_music(args) -> str:
     middle_seq_len = int(middle_config['model']['inferred_seq_lens']['middle'])
     bottom_seq_len = int(bottom_config['model']['inferred_seq_lens']['bottom'])
     bottom_grid = bottom_config['model'].get('inferred_grids', {}).get('bottom')
+    bottom_prior_cfg = bottom_config.get('priors', {}).get('bottom_prior', {}) if isinstance(bottom_config, dict) else {}
+    bottom_condition_on_top = bool(bottom_prior_cfg.get('condition_on_top', False))
 
     _debug('Resolving min_max_values.pkl path...')
     min_max_values_path = _resolve_min_max_values_path(bottom_config)
 
     _debug('Loading bottom VQ-VAE decoder...')
+    bottom_vqvae_ref = bottom_config['vqvae']['bottom_model_dir']
+    bottom_vqvae_config_path = resolve_vqvae_config_path(bottom_vqvae_ref)
+    bottom_vqvae_config = load_config(bottom_vqvae_config_path)
+    bottom_vqvae_dataset_cfg = bottom_vqvae_config.get('dataset', {}) if isinstance(bottom_vqvae_config, dict) else {}
+
     vqvae_bottom_decoder = load_jukebox_model(
-        bottom_config['vqvae']['bottom_model_dir'],
+        bottom_vqvae_ref,
         'bottom',
         device,
         bottom_config['vqvae']['weights_file'],
@@ -429,10 +371,28 @@ def generate_hierarchical_music(args) -> str:
     with open(min_max_values_path, 'rb') as f:
         min_max_values = pickle.load(f)
 
-    _save_decoded_spectrograms(final_spectrogram, save_dir)
-    min_max_list = _prepare_min_max_values(min_max_values, final_spectrogram.shape[0])
+    dataset_cfg = bottom_vqvae_dataset_cfg
+    sample_rate = int(dataset_cfg.get('sample_rate', SAMPLE_RATE))
+    hop_length = int(dataset_cfg.get('hop_length', HOP_LENGTH))
+    frame_size = int(dataset_cfg.get('frame_size', FRAME_SIZE))
+    spectrograms_path = dataset_cfg.get('processed_path', '')
+    spectrogram_type_cfg = dataset_cfg.get('spectrogram_type')
+    spectrogram_type = str(spectrogram_type_cfg).strip().lower() if spectrogram_type_cfg else (
+        'mel' if 'mel' in str(spectrograms_path).lower() else 'linear'
+    )
+    n_mels = int(dataset_cfg.get('n_mels', 256))
 
-    sound_generator = SoundGenerator(vqvae_bottom_decoder, hop_length=HOP_LENGTH)
+    save_decoded_spectrograms(final_spectrogram, save_dir)
+    min_max_list = prepare_min_max_values(min_max_values, final_spectrogram.shape[0])
+
+    sound_generator = SoundGenerator(
+        vqvae_bottom_decoder,
+        hop_length=hop_length,
+        sample_rate=sample_rate,
+        n_fft=frame_size,
+        spectrogram_type=spectrogram_type,
+        n_mels=n_mels,
+    )
     audio_signals = sound_generator.convert_spectrograms_to_audio(
         final_spectrogram, min_max_list, method=args.audio_method
     )
