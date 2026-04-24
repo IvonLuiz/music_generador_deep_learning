@@ -171,6 +171,9 @@ def train_transformer_prior(
         f"Bottom indices shape: {tuple(dataset.bottom_indices.shape)} -> seq_len={seq_lens['bottom']}"
     )
 
+    # Split into train/val
+    split_rng = np.random.default_rng(seed)
+    split_rng.shuffle(dataset.file_paths)
     val_split = train_cfg.get('validation_split', 0.1)
     train_size = int((1 - val_split) * len(dataset))
     val_size = len(dataset) - train_size
