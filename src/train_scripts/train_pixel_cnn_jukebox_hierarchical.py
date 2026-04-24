@@ -3,7 +3,6 @@ import os
 import sys
 from datetime import datetime
 from typing import Optional, Tuple
-import glob
 
 import matplotlib.pyplot as plt
 import torch
@@ -33,6 +32,17 @@ LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'b
 COND_LEVEL = {'top': None, 'middle': 'top', 'bottom': 'middle'}
 LATEST_ALIASES = {'latest', 'newest', 'auto', 'most_recent'}
 
+
+def _resolve_level_subdir_if_group(path: Optional[str], level_name: str) -> Optional[str]:
+    if not path:
+        return path
+    if os.path.isfile(path):
+        return path
+    level_dir = os.path.join(path, level_name)
+    if os.path.isdir(level_dir):
+        return level_dir
+    return path
+
 def _get_prior_cfg(config: dict, name: str) -> dict:
     priors = config.get('priors')
     if priors and name in priors:
@@ -42,18 +52,19 @@ def _get_prior_cfg(config: dict, name: str) -> dict:
 
 def _get_conditioning_model_path(config: dict, cond_level: str) -> Optional[str]:
     conditioning_cfg = config.get('conditioning_priors', {})
-    key = f'{cond_level}_model_dir'
-    model_dir = conditioning_cfg.get(key)
-    if _is_latest_alias(model_dir):
+    run_dir = conditioning_cfg.get('run_dir')
+    if _is_latest_alias(run_dir):
         return _resolve_latest_prior_dir(config, cond_level)
-    return model_dir
+    if isinstance(run_dir, str) and run_dir.strip():
+        return _resolve_level_subdir_if_group(run_dir.strip(), cond_level)
+    return None
 
 
 def _is_latest_alias(value: Optional[str]) -> bool:
     return isinstance(value, str) and value.strip().lower() in LATEST_ALIASES
 
 
-def _find_latest_run_dir(parent_dir: str) -> Optional[str]:
+def _find_latest_group_run_dir(parent_dir: str, level_name: str) -> Optional[str]:
     if not os.path.isdir(parent_dir):
         return None
 
@@ -62,15 +73,16 @@ def _find_latest_run_dir(parent_dir: str) -> Optional[str]:
         run_dir = os.path.join(parent_dir, name)
         if not os.path.isdir(run_dir):
             continue
-        config_file = os.path.join(run_dir, 'config.yaml')
-        if not os.path.isfile(config_file):
+        level_dir = os.path.join(run_dir, level_name)
+        if not os.path.isdir(level_dir):
+            continue
+        if not os.path.isfile(os.path.join(level_dir, 'config.yaml')):
             continue
         candidates.append(run_dir)
 
     if not candidates:
         return None
 
-    # Timestamped run dirs sort correctly lexicographically; fallback by mtime if needed.
     candidates.sort()
     latest = candidates[-1]
     candidates_by_mtime = sorted(candidates, key=lambda p: os.path.getmtime(p))
@@ -83,28 +95,16 @@ def _resolve_latest_prior_dir(config: dict, level_name: str) -> str:
     model_name = str(config.get('model', {}).get('name', '')).strip()
     save_root = str(config.get('training', {}).get('save_dir', './models/')).strip()
 
-    primary_parent = os.path.join(save_root, f'{model_name}_{level_name}_prior') if model_name else None
-    if primary_parent:
-        latest = _find_latest_run_dir(primary_parent)
-        if latest:
-            return latest
-
-    # Fallback: scan save_root for matching prior parent dirs.
-    pattern = os.path.join(save_root, f'*_{level_name}_prior')
-    parent_dirs = [p for p in glob.glob(pattern) if os.path.isdir(p)]
-    latest_candidates = []
-    for parent in parent_dirs:
-        run_dir = _find_latest_run_dir(parent)
-        if run_dir:
-            latest_candidates.append(run_dir)
-
-    if latest_candidates:
-        latest_candidates.sort(key=lambda p: os.path.getmtime(p))
-        return latest_candidates[-1]
+    # New grouped layout: <save_root>/<model_name>_prior/<timestamp>/<level>/
+    grouped_parent = os.path.join(save_root, f'{model_name}_prior') if model_name else None
+    if grouped_parent:
+        latest_group = _find_latest_group_run_dir(grouped_parent, level_name)
+        if latest_group:
+            return os.path.join(latest_group, level_name)
 
     raise FileNotFoundError(
         f"Could not resolve latest prior for level={level_name}. "
-        f"Expected runs under '{save_root}' matching '*_{level_name}_prior/<timestamp>/'"
+        f"Expected grouped runs under '{save_root}/{model_name}_prior/<timestamp>/{level_name}/'"
     )
 
 
@@ -126,7 +126,12 @@ def plot_losses(train_losses, val_losses, save_dir, best_epoch=None, best_val_lo
     plt.close()
 
 
-def train_jukebox_hierarchical_pixelcnn(config_path: str, level_override: Optional[str] = None, conditioning_mode_override: Optional[str] = None):
+def train_jukebox_hierarchical_pixelcnn(
+    config_path: str,
+    level_override: Optional[str] = None,
+    conditioning_mode_override: Optional[str] = None,
+    run_dir_root: Optional[str] = None,
+):
     config = load_config(config_path)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Training on {device}')
@@ -198,10 +203,10 @@ def train_jukebox_hierarchical_pixelcnn(config_path: str, level_override: Option
         cond_weights_file = config.get('conditioning_priors', {}).get('weights_file', 'best_model.pth')
         if not cond_model_dir:
             raise ValueError(
-                f"conditioning_mode=generated for level={selected_level} requires conditioning_priors.{cond_level}_model_dir"
+                f"conditioning_mode=generated for level={selected_level} requires conditioning_priors.run_dir"
             )
         print(f'Loading conditioning prior ({cond_level}) from {cond_model_dir}')
-        conditioning_prior = load_single_level_prior(cond_model_dir, device, cond_weights_file)
+        conditioning_prior = load_single_level_prior(cond_model_dir, device, cond_weights_file, level_name=cond_level)
 
     optimizer = optim.Adam(pixelcnn.parameters(), lr=train_cfg['learning_rate'])
     criterion = nn.CrossEntropyLoss()
@@ -211,14 +216,20 @@ def train_jukebox_hierarchical_pixelcnn(config_path: str, level_override: Option
 
     model_name = model_cfg['name']
     save_root = train_cfg['save_dir']
-    run_dir = os.path.join(save_root, f'{model_name}_{selected_level}_prior', datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+    run_root = run_dir_root or os.path.join(save_root, f'{model_name}_prior', datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+    run_dir = os.path.join(run_root, selected_level)
     os.makedirs(run_dir, exist_ok=True)
+    print(f'Saving {selected_level} prior artifacts under: {run_dir}')
 
     config_to_save = dict(config)
     config_to_save['model'] = dict(config.get('model', {}))
     config_to_save['model']['selected_level'] = selected_level
     config_to_save['training'] = dict(config.get('training', {}))
     config_to_save['training']['conditioning_mode'] = conditioning_mode
+    config_to_save['pixelcnn_run'] = {
+        'root_dir': run_root,
+        'level_subdir': selected_level,
+    }
 
     with open(os.path.join(run_dir, 'config.yaml'), 'w') as f:
         yaml.dump(config_to_save, f)
@@ -371,6 +382,12 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, default='./config/config_pixelcnn_jukebox_hierarchical.yaml')
     parser.add_argument('--level', type=str, default=None, choices=['top', 'middle', 'bottom'])
     parser.add_argument('--conditioning_mode', type=str, default=None, choices=['real', 'generated'])
+    parser.add_argument('--run_dir_root', type=str, default=None, help='Shared run root. Each level saves to <run_dir_root>/<level>/')
     args = parser.parse_args()
 
-    train_jukebox_hierarchical_pixelcnn(args.config, level_override=args.level, conditioning_mode_override=args.conditioning_mode)
+    train_jukebox_hierarchical_pixelcnn(
+        args.config,
+        level_override=args.level,
+        conditioning_mode_override=args.conditioning_mode,
+        run_dir_root=args.run_dir_root,
+    )
