@@ -89,6 +89,7 @@ def _generate_level_tokens(
     temperature: float,
     top_k: Optional[int],
     upper_tokens_list: Optional[List[np.ndarray]] = None,
+    second_upper_tokens_list: Optional[List[np.ndarray]] = None,
     use_time_id: bool = False,
 ) -> List[np.ndarray]:
     token_blocks = []
@@ -100,10 +101,16 @@ def _generate_level_tokens(
         if upper_tokens_list is not None:
             upper_indices = torch.from_numpy(upper_tokens_list[chunk]).to(device)
 
+        second_upper_indices = None
+        if second_upper_tokens_list is not None:
+            second_upper_indices = torch.from_numpy(second_upper_tokens_list[chunk]).to(device)
+
+            'second_upper_indices': second_upper_indices,
         generate_kwargs = {
             'batch_size': 1,
             'start_tokens': curr_start_token,
             'upper_indices': upper_indices,
+            'second_upper_indices': second_upper_indices,
             'seq_len': seq_len,
             'temperature': temperature,
             'top_k': top_k,
@@ -139,22 +146,6 @@ def _decode_bottom_blocks(
             decoded_specs = _decode_bottom_indices(vqvae, bottom_tokens_tensor, bottom_grid, device)
         reconstructed_spectrograms.append(decoded_specs)
     return reconstructed_spectrograms
-
-def _save_decoded_spectrograms(specs: np.ndarray, save_dir: str) -> None:
-    spec_dir = os.path.join(save_dir, 'spectrograms')
-    os.makedirs(spec_dir, exist_ok=True)
-
-    np.save(os.path.join(spec_dir, 'bottom_decoded_specs.npy'), specs)
-
-    for i in range(specs.shape[0]):
-        img = specs[i, :, :, 0]
-        plt.figure(figsize=(6, 4))
-        plt.imshow(img, origin='lower', aspect='auto')
-        plt.colorbar()
-        plt.title(f'Decoded Bottom Spectrogram {i}')
-        plt.tight_layout()
-        plt.savefig(os.path.join(spec_dir, f'bottom_spec_{i:03d}.png'), dpi=150)
-        plt.close()
 
 def _decode_bottom_indices(
     vqvae,
@@ -197,11 +188,20 @@ def main():
     parser.add_argument('--bottom_run_root', type=str, default=DEFAULT_BOTTOM_RUN_ROOT, help='Default bottom run root used when --bottom_config is not provided')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature for all priors')
     parser.add_argument('--top_k', type=int, default=None, help='Top-k sampling (None disables top-k)')
+    parser.add_argument('--weights_file', type=str, default='best_model.pth', help='Checkpoint filename for transformer priors (default: best_model.pth)')
     parser.add_argument('--chunks_to_generate', type=int, default=3, help='Number of chunks to generate')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible generation (set to negative to disable)')
     parser.add_argument('--audio_method', type=str, default='griffinlim', choices=['griffinlim', 'istft'], help='Spectrogram inversion method')
     parser.add_argument('--save_root', type=str, default='samples/transformer_hierarchical_generated', help='Root directory for generated outputs')
     args = parser.parse_args()
+
+    if args.temperature <= 0:
+        raise ValueError(f'--temperature must be > 0, got {args.temperature}')
+    if args.top_k is not None and args.top_k < 0:
+        raise ValueError(f'--top_k must be >= 0, got {args.top_k}')
+    args.top_k = args.top_k if (args.top_k is not None and args.top_k > 0) else None
+    if args.chunks_to_generate <= 0:
+        raise ValueError(f'--chunks_to_generate must be > 0, got {args.chunks_to_generate}')
 
     if args.seed is not None and args.seed < 0:
         args.seed = None
@@ -339,7 +339,8 @@ def generate_hierarchical_music(args) -> str:
         temperature=args.temperature,
         top_k=args.top_k,
         upper_tokens_list=middle_tokens_list,
-        use_time_id=False,
+        second_upper_tokens_list=top_tokens_list if bottom_condition_on_top else None,
+        use_time_id=True,
     )
     print('Generation complete. Bottom tokens length:', len(bottom_tokens_list),
           'with each block having shape:', bottom_tokens_list[0].shape if bottom_tokens_list else None)
@@ -400,7 +401,7 @@ def generate_hierarchical_music(args) -> str:
     audio_dir = os.path.join(save_dir, 'audio')
     os.makedirs(audio_dir, exist_ok=True)
     for i, signal in enumerate(audio_signals):
-        sf.write(os.path.join(audio_dir, f'sample_{i}.wav'), signal, SAMPLE_RATE)
+        sf.write(os.path.join(audio_dir, f'sample_{i}.wav'), signal, sample_rate)
 
     return save_dir
 
