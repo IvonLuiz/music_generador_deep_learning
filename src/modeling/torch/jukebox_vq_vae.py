@@ -1,4 +1,4 @@
-from typing import Tuple, Iterable, List
+from typing import Tuple, List
 import sys
 import os
 
