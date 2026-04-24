@@ -3,6 +3,7 @@ from typing import Tuple, Optional
 import os
 import sys
 import argparse
+import re
 from datetime import datetime
 import pickle
 
@@ -16,29 +17,16 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from test_scripts.hierarchical_pixelcnn_common import resolve_model_paths
 from utils import load_config
+from generation.transformer_io_utils import (
+    prepare_min_max_values,
+    resolve_vqvae_config_path,
+    save_decoded_spectrograms,
+)
 
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
 from generation.soundgenerator import SoundGenerator
 from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH, FRAME_SIZE, N_MELS
 from train_scripts.jukebox_utils import load_jukebox_model
-
-
-def _resolve_vqvae_config_path(model_dir_or_file: str) -> str:
-    if os.path.isdir(model_dir_or_file):
-        config_path = os.path.join(model_dir_or_file, 'config.yaml')
-    elif os.path.isfile(model_dir_or_file):
-        filename = os.path.basename(model_dir_or_file).lower()
-        if filename in ('config.yaml', 'config.yml'):
-            config_path = model_dir_or_file
-        else:
-            config_path = os.path.join(os.path.dirname(model_dir_or_file), 'config.yaml')
-    else:
-        raise FileNotFoundError(f'Bottom VQ-VAE reference does not exist: {model_dir_or_file}')
-
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f'Bottom VQ-VAE config.yaml not found at {config_path}')
-
-    return config_path
 
 
 def _extract_num_embeddings(state_dict: dict) -> int:
@@ -70,6 +58,35 @@ def _extract_second_cond_num_embeddings(state_dict: dict) -> Optional[int]:
     for key in ('second_conditioner.token_embedding.weight', 'second_conditioner.token_embedding.weight_orig'):
         if key in state_dict:
             return int(state_dict[key].shape[0])
+    return None
+
+
+def _extract_conditioner_block_count(state_dict: dict, prefix: str = 'conditioner') -> Optional[int]:
+    pattern = re.compile(rf'^{re.escape(prefix)}\.layers\.(\d+)\.conv\.weight$')
+    max_idx = -1
+    for key in state_dict.keys():
+        match = pattern.match(key)
+        if not match:
+            continue
+        idx = int(match.group(1))
+        if idx > max_idx:
+            max_idx = idx
+    if max_idx < 0:
+        return None
+    return max_idx + 1
+
+
+def _extract_conditioner_width(state_dict: dict, prefix: str = 'conditioner') -> Optional[int]:
+    for key in (f'{prefix}.token_embedding.weight', f'{prefix}.token_embedding.weight_orig'):
+        if key in state_dict:
+            return int(state_dict[key].shape[1])
+    return None
+
+
+def _extract_conditioner_kernel_size(state_dict: dict, prefix: str = 'conditioner') -> Optional[int]:
+    for key in (f'{prefix}.layers.0.conv.weight', f'{prefix}.layers.0.conv.weight_orig'):
+        if key in state_dict:
+            return int(state_dict[key].shape[-1])
     return None
 
 
@@ -171,6 +188,34 @@ def load_transformer_prior(
             if second_cond_num_embeddings is not None and second_upsample_stride is not None:
                 condition_on_top = True
 
+    conditioner_width_inferred = _extract_conditioner_width(state_dict, prefix='conditioner')
+    conditioner_blocks_inferred = _extract_conditioner_block_count(state_dict, prefix='conditioner')
+    conditioner_kernel_inferred = _extract_conditioner_kernel_size(state_dict, prefix='conditioner')
+
+    conditioner_residual_block_width = int(
+        prior_cfg.get(
+            'conditioner_residual_block_width',
+            conditioner_width_inferred if conditioner_width_inferred is not None else 1024,
+        )
+    )
+    conditioner_residual_blocks = int(
+        prior_cfg.get(
+            'conditioner_residual_blocks',
+            conditioner_blocks_inferred if conditioner_blocks_inferred is not None else 16,
+        )
+    )
+    conditioner_kernel_size = int(
+        prior_cfg.get(
+            'conditioner_kernel_size',
+            conditioner_kernel_inferred if conditioner_kernel_inferred is not None else 3,
+        )
+    )
+    conditioner_conv_channels = int(
+        prior_cfg.get('conditioner_conv_channels', conditioner_residual_block_width)
+    )
+    conditioner_dilation_growth_rate = int(prior_cfg.get('conditioner_dilation_growth_rate', 3))
+    conditioner_dilation_cycle = int(prior_cfg.get('conditioner_dilation_cycle', 8))
+
     prior_transformer = TransformerPriorConditioned(
         num_embeddings=num_embeddings,
         model_dim=int(prior_cfg['model_dim']),
@@ -185,6 +230,12 @@ def load_transformer_prior(
         upsample_stride=upsample_stride if model_layer != 'top' else None,
         second_cond_num_embeddings=second_cond_num_embeddings if condition_on_top else None,
         second_upsample_stride=second_upsample_stride if condition_on_top else None,
+        conditioner_residual_block_width=conditioner_residual_block_width,
+        conditioner_residual_blocks=conditioner_residual_blocks,
+        conditioner_kernel_size=conditioner_kernel_size,
+        conditioner_conv_channels=conditioner_conv_channels,
+        conditioner_dilation_growth_rate=conditioner_dilation_growth_rate,
+        conditioner_dilation_cycle=conditioner_dilation_cycle,
         use_bos_token=use_bos_token,
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
         dropout=float(prior_cfg.get('dropout', 0.1)),
@@ -217,42 +268,6 @@ def _save_indices(indices: np.ndarray, save_dir: str, name: str, grid: Optional[
             plt.title(f'Generated {name.capitalize()} Codes {i}')
             plt.savefig(os.path.join(vis_dir, f'sample_{i}.png'))
             plt.close()
-
-
-def _save_decoded_spectrograms(specs: np.ndarray, save_dir: str) -> None:
-    spec_dir = os.path.join(save_dir, 'spectrograms')
-    os.makedirs(spec_dir, exist_ok=True)
-
-    np.save(os.path.join(spec_dir, 'bottom_decoded_specs.npy'), specs)
-
-    for i in range(specs.shape[0]):
-        img = specs[i, :, :, 0]
-        plt.figure(figsize=(6, 4))
-        plt.imshow(img, origin='lower', aspect='auto')
-        plt.colorbar()
-        plt.title(f'Decoded Bottom Spectrogram {i}')
-        plt.tight_layout()
-        plt.savefig(os.path.join(spec_dir, f'bottom_spec_{i:03d}.png'), dpi=150)
-        plt.close()
-
-
-def _prepare_min_max_values(min_max_values: object, count: int) -> list:
-    if isinstance(min_max_values, dict):
-        values = list(min_max_values.values())
-    elif isinstance(min_max_values, list):
-        values = min_max_values
-    else:
-        raise ValueError('min_max_values must be a dict or list')
-
-    if not values:
-        raise ValueError('min_max_values is empty')
-
-    if len(values) >= count:
-        return values[:count]
-
-    repeats = (count + len(values) - 1) // len(values)
-    tiled = (values * repeats)[:count]
-    return tiled
 
 
 def _decode_bottom_indices(
@@ -325,7 +340,7 @@ def test_transformer_prior(
     bottom_seq_len = int(bottom_config['model']['inferred_seq_lens']['bottom'])
     bottom_grid = bottom_config['model'].get('inferred_grids', {}).get('bottom')
     bottom_prior_cfg = bottom_config.get('priors', {}).get('bottom_prior', {}) if isinstance(bottom_config, dict) else {}
-    bottom_condition_on_top = bool(bottom_prior_cfg.get('condition_on_top', False))
+    bottom_condition_on_top = bool(bottom_prior_cfg.get('condition_on_top', True))
 
     # Top-level prior generation
     if time_ids is None:
@@ -388,7 +403,7 @@ def test_transformer_prior(
     if not effective_bottom_vqvae:
         raise ValueError('Bottom VQ-VAE path is required. Provide --bottom_vqvae or set vqvae.bottom_model_dir in Transformer config.')
 
-    vqvae_config_path = _resolve_vqvae_config_path(effective_bottom_vqvae)
+    vqvae_config_path = resolve_vqvae_config_path(effective_bottom_vqvae)
     vqvae_config = load_config(vqvae_config_path)
     resolved_dataset_cfg = vqvae_config.get('dataset', {}) if isinstance(vqvae_config, dict) else {}
 
@@ -417,8 +432,8 @@ def test_transformer_prior(
             min_max_values = pickle.load(f)
 
         decoded_specs = _decode_bottom_indices(vqvae, bottom_tokens, bottom_grid)
-        _save_decoded_spectrograms(decoded_specs, save_dir)
-        min_max_list = _prepare_min_max_values(min_max_values, decoded_specs.shape[0])
+        save_decoded_spectrograms(decoded_specs, save_dir)
+        min_max_list = prepare_min_max_values(min_max_values, decoded_specs.shape[0])
 
         sound_generator = SoundGenerator(
             vqvae,
