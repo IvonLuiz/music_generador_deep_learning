@@ -7,6 +7,7 @@ import random
 from datetime import datetime
 from typing import Optional, List
 import numpy as np
+import time
 
 import torch
 import matplotlib.pyplot as plt
@@ -105,7 +106,6 @@ def _generate_level_tokens(
         if second_upper_tokens_list is not None:
             second_upper_indices = torch.from_numpy(second_upper_tokens_list[chunk]).to(device)
 
-            'second_upper_indices': second_upper_indices,
         generate_kwargs = {
             'batch_size': 1,
             'start_tokens': curr_start_token,
@@ -275,9 +275,9 @@ def generate_hierarchical_music(args) -> str:
 
     # Load the three trained priors.
     _debug('Loading transformer priors...')
-    top_prior, top_config, _ = load_transformer_prior('top', top_transformer_prior_config_path, device)
-    middle_prior, middle_config, _ = load_transformer_prior('middle', middle_transformer_prior_config_path, device)
-    bottom_prior, bottom_config, _ = load_transformer_prior('bottom', bottom_transformer_prior_config_path, device)
+    top_prior, top_config, _ = load_transformer_prior('top', top_transformer_prior_config_path, device, weights_file=args.weights_file)
+    middle_prior, middle_config, _ = load_transformer_prior('middle', middle_transformer_prior_config_path, device, weights_file=args.weights_file)
+    bottom_prior, bottom_config, _ = load_transformer_prior('bottom', bottom_transformer_prior_config_path, device, weights_file=args.weights_file)
 
     top_seq_len = int(top_config['model']['inferred_seq_lens']['top'])
     middle_seq_len = int(middle_config['model']['inferred_seq_lens']['middle'])
@@ -287,7 +287,7 @@ def generate_hierarchical_music(args) -> str:
     bottom_condition_on_top = bool(bottom_prior_cfg.get('condition_on_top', False))
 
     _debug('Resolving min_max_values.pkl path...')
-    min_max_values_path = _resolve_min_max_values_path(bottom_config)
+    min_max_values_path = resolve_min_max_values_path(bottom_config, debug_fn=_debug)
 
     _debug('Loading bottom VQ-VAE decoder...')
     bottom_vqvae_ref = bottom_config['vqvae']['bottom_model_dir']
@@ -305,6 +305,7 @@ def generate_hierarchical_music(args) -> str:
 
     # Step 1: Top-Level Unrolling (The Composer)
     # Generate global structure block-by-block, carrying overlap context.
+    start_time = time.time()
     top_tokens_list = _generate_level_tokens(
         prior=top_prior,
         seq_len=top_seq_len,
@@ -327,7 +328,7 @@ def generate_hierarchical_music(args) -> str:
         temperature=args.temperature,
         top_k=args.top_k,
         upper_tokens_list=top_tokens_list,
-        use_time_id=False,
+        use_time_id=True,
     )
     print('Middle-level generation complete. Generated tokens for each block have shape:', middle_tokens_list[0].shape if middle_tokens_list else None)
 
@@ -344,10 +345,12 @@ def generate_hierarchical_music(args) -> str:
     )
     print('Generation complete. Bottom tokens length:', len(bottom_tokens_list),
           'with each block having shape:', bottom_tokens_list[0].shape if bottom_tokens_list else None)
+    print('Generation took: {:.2f} seconds'.format(time.time() - start_time))
     print('Decoding bottom tokens into spectrograms...')
 
     # Step 3: Spectrogram Crossfading (The Audio Engineer)
     # Decode each chunk then crossfade overlaps to remove block boundaries.
+    decode_start_time = time.time()
     reconstructed_spectrograms = _decode_bottom_blocks(
         vqvae=vqvae_bottom_decoder,
         bottom_tokens_list=bottom_tokens_list,
@@ -355,6 +358,7 @@ def generate_hierarchical_music(args) -> str:
         device=device,
     )
     print('Decoded spectrograms for all blocks. Each block has shape:', reconstructed_spectrograms[0].shape if reconstructed_spectrograms else None)
+    print('Decoding took: {:.2f} seconds'.format(time.time() - decode_start_time))
 
     final_spectrogram = reconstructed_spectrograms[0].copy()
     for i in range(1, len(reconstructed_spectrograms)):
