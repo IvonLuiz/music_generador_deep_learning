@@ -66,18 +66,19 @@ priors:
     conditioner_upsample_stride: 4 # Upsampling 1024 tokens to 4096 tokens (4096 / 1024 = 4)
 
 training:
+  seed: 42
   top_prior:
-    batch_size: 16
-    gradient_accumulation_steps: 8
+    batch_size: 32
+    gradient_accumulation_steps: 4
     learning_rate: 0.00005  # Warmup to lr then cosine decay
     weight_decay: 0.002
     epochs: 1000
     retrain: false
     pretrained_weights_path: ""
   middle_prior:
-    batch_size: 8
-    gradient_accumulation_steps: 16
-    learning_rate: 0.0005  # Warmup to lr then cosine decay
+    batch_size: 16
+    gradient_accumulation_steps: 8
+    learning_rate: 0.001  # Warmup to lr then cosine decay
     weight_decay: 0.01
     epochs: 1000
     retrain: false
@@ -85,7 +86,7 @@ training:
   bottom_prior:
     batch_size: 8
     gradient_accumulation_steps: 16
-    learning_rate: 0.0005  # Warmup to lr then cosine decay
+    learning_rate: 0.001  # Warmup to lr then cosine decay
     weight_decay: 0.01
     epochs: 1000
     retrain: false
