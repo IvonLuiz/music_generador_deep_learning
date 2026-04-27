@@ -444,8 +444,13 @@ if __name__ == "__main__":
     #   Top:    8×64 = 512 tokens  (full 2048-frame window)
     #   Middle: 16×32 = 512 tokens (512-frame window), conditioned on 8×16=128 sliced Top tokens
     #   Bottom: 32×16 = 512 tokens (128-frame window),  conditioned on 16×8=128 sliced Middle tokens
+    # Bottom Prior (512) is conditioned on:
+    #   Middle slice (128 tokens) -> Stride 4
+    #   Top slice (32 tokens)     -> Stride 16
     batch_size = 4
-    seq_len = 512          # all levels produce 512 tokens
+    seq_len_bot = seq_len = 512
+    seq_len_mid_slice = 128
+    seq_len_top_slice = 32
     cond_seq_len = 128     # sliced upper-level conditioning (stride-4 conditioner)
     num_embeddings = 2048  # VQ-VAE codebook size
     embedding_dim = 512
@@ -459,8 +464,41 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"Batch Size: {batch_size}")
-    print(f"Target Sequence Length (all levels): {seq_len}")
+    print(f"Target Sequence Length (bottom): {seq_len_bot}")
+    print(f"Target Sequence Length (middle slice): {seq_len_mid_slice}")
+    print(f"Target Sequence Length (top slice): {seq_len_top_slice}")
     print(f"Conditioning Sequence Length (sliced): {cond_seq_len}")
+    print("\n" + "="*40 + "\n")
+
+
+    print("Testing timing Sensitivity (Top Prior)")
+    model_top = TransformerPriorConditioned(
+        num_embeddings=num_embeddings,
+        model_dim=embedding_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        dim_feedforward=dim_feedforward,
+        max_seq_len=seq_len_bot,
+    ).to(device).eval()
+    
+    dummy_tokens = torch.randint(0, num_embeddings, (1, 512)).to(device)
+    
+    # Define two different timing scenarios for the same tokens
+    timing_start = torch.tensor([[0.0, 180.0, 0.0]]).to(device)   # Start of a 3min song
+    timing_end = torch.tensor([[179.0, 180.0, 0.99]]).to(device) # End of a 3min song
+    with torch.no_grad():
+        logits_start = model_top(dummy_tokens, timing=timing_start)
+        logits_end = model_top(dummy_tokens, timing=timing_end)
+
+    # Calculate the difference in predictions
+    diff = (logits_start - logits_end).abs().mean().item()
+    print(f"Logit Mean Absolute Difference (Start vs End): {diff:.6f}")
+    
+    if diff > 1e-7:
+        print("SUCCESS: Model is responsive to timing signal.")
+    else:
+        print("FAILURE: Model is ignoring the timing signal.")
+
     print("\n" + "="*40 + "\n")
 
     print("Testing non-upsampler prior (Top — no conditioning):")
@@ -509,15 +547,15 @@ if __name__ == "__main__":
     print("Output shape (middle upsampler):", output.shape)
     assert output.shape == (batch_size, seq_len, num_embeddings), f"Shape mismatch! Expected {(batch_size, seq_len, num_embeddings)}, got {output.shape}"
     print("Middle upsampler test passed successfully!")
-    
-    print("\n" + "="*40 + "\n")
+
     # loss test
     print("\n" + "="*40 + "\n")
     print("Testing loss and generation for middle upsampler prior:")
     loss = model_upsampler.loss(lower_input_tokens, upper_indices=upper_input_tokens, timing=timing)
     print(f"Loss computed successfully: {loss.item():.4f}")
 
-    print("\nTesting generation for middle upsampler prior:")
+    print("\n" + "="*40 + "\n")
+    print("Testing generation for middle upsampler prior:")
     generated_tokens = model_upsampler.generate(
         batch_size=batch_size,
         start_tokens=None,
@@ -529,4 +567,63 @@ if __name__ == "__main__":
     print("Generated tokens shape:", generated_tokens.shape)
     assert generated_tokens.shape == (batch_size, seq_len), f"Generated shape mismatch: {generated_tokens.shape}"
 
+    print("\n" + "="*40 + "\n")
+    print("Testing Bottom Prior Simulation (Conditioned on Middle + Top)")
+    
+    # Bottom upsampler parameters
+    model_bot = TransformerPriorConditioned(
+        num_embeddings=num_embeddings,
+        model_dim=embedding_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        dim_feedforward=dim_feedforward,
+        max_seq_len=seq_len_bot,
+        is_upsampler=True,
+        cond_num_embeddings=num_embeddings, # Middle level codebook
+        upsample_stride=4,                  # 128 -> 512
+        second_cond_num_embeddings=num_embeddings, # Top level codebook
+        second_upsample_stride=16,          # 32 -> 512
+    ).to(device)
+
+    # Dummy data
+    bot_indices = torch.randint(0, num_embeddings, (batch_size, seq_len_bot)).to(device)
+    mid_cond = torch.randint(0, num_embeddings, (batch_size, seq_len_mid_slice)).to(device)
+    top_cond = torch.randint(0, num_embeddings, (batch_size, seq_len_top_slice)).to(device)
+    timing = torch.tensor([[10.0, 100.0, 0.1]] * batch_size).to(device)
+
+    # Test Forward
+    logits = model_bot(
+        indices=bot_indices, 
+        upper_indices=mid_cond, 
+        second_upper_indices=top_cond, 
+        timing=timing
+    )
+    print(f"Bottom Prior Forward shape: {logits.shape}")
+    assert logits.shape == (batch_size, seq_len_bot, num_embeddings)
+
+    # Test Loss
+    loss_val = model_bot.loss(
+        indices=bot_indices, 
+        upper_indices=mid_cond, 
+        second_upper_indices=top_cond, 
+        timing=timing
+    )
+    print(f"Bottom Prior Loss: {loss_val.item():.4f}")
+    assert not torch.isnan(loss_val)
+
+    # Test Generation
+    print("Testing Bottom Prior Generation...")
+    gen_tokens = model_bot.generate(
+        batch_size=batch_size,
+        upper_indices=mid_cond,
+        second_upper_indices=top_cond,
+        timing=timing,
+        seq_len=16, # Short gen for speed
+        temperature=0.8,
+        top_k=50
+    )
+    print(f"Generated tokens shape: {gen_tokens.shape}")
+    assert gen_tokens.shape == (batch_size, 16)
+
+    print("\n" + "="*40 + "\n")
     print("\nAll tests passed successfully!")
