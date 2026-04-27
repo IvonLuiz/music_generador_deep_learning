@@ -15,7 +15,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from generation.generate import *
-from utils import set_global_seed, load_config, compute_dataset_variance, compute_small_sample_variance
+from utils import list_npy_files, set_global_seed, load_config, compute_dataset_variance, compute_small_sample_variance
+from jukebox_utils import extract_song_prefix
 from train_scripts.train_vqvae_utils import train_vqvae_jukebox
 from datasets.spectrogram_dataset import LazySpectrogramDataset
 from train_scripts.resume_utils import load_resume_artifacts
@@ -82,7 +83,6 @@ if __name__ == "__main__":
     # Dataset and model paths
     dataset_cfg = config['dataset']
     spectrograms_path = dataset_cfg['processed_path']
-    target_time_frames = int(dataset_cfg.get('target_time_frames', 256))
     min_max_values_path = dataset_cfg['min_max_values_path']
     sample_rate = int(dataset_cfg.get('sample_rate', 22050))
     hop_length = int(dataset_cfg.get('hop_length', 256))
@@ -97,13 +97,6 @@ if __name__ == "__main__":
     model_name = model_cfg['name']
     retrain = bool(train_cfg.get('retrain', False))
     pretrained_weights_path = train_cfg.get('pretrained_weights_path')
-
-    print(f"Configuration loaded. Model: {model_name}, Level: {selected_level}, Save Dir: {model_save_dir}")
-    print(f"Training parameters: batch_size={batch_size}, grad_accum_steps={grad_accum_steps}, learning_rate={learning_rate}, epochs={epochs}, early_stopping_patience={early_stopping_patience}")
-    print(f"Reproducibility seed: {seed}")
-    print(f"Data loading parameters: num_workers={num_workers}, pin_memory={pin_memory}, persist_workers={persist_workers}, prefetch_factor={prefetch_factor}")
-    print(f"Dataset target_time_frames={target_time_frames}, validation_split={validation_split}")
-    print(f"Audio inversion settings: spectrogram_type={spectrogram_type}, sample_rate={sample_rate}, hop_length={hop_length}, frame_size={frame_size}, n_mels={n_mels}")
 
     # Individual level parameters
     level_profiles = model_cfg.get('level_profiles')
@@ -120,8 +113,21 @@ if __name__ == "__main__":
     if levels is None:
         raise ValueError(f"Missing 'levels' for profile '{selected_level}' in model.level_profiles")
 
+    # Use the level-specific target_time_frames if defined in level_profiles; otherwise
+    # fall back to the dataset-level default. This ensures Bottom trains on short clips
+    # (≈1.5s), Middle on medium clips (≈6s), and Top on the full long window (≈24s).
+    _profile_tf = (level_profiles.get(selected_level) or {}).get('target_time_frames')
+    target_time_frames = int(_profile_tf if _profile_tf is not None else dataset_cfg.get('target_time_frames', 2048))
+
     current_datetime = datetime.now()
     formatted_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
+
+    print(f"Configuration loaded. Model: {model_name}, Level: {selected_level}, Save Dir: {model_save_dir}")
+    print(f"Training parameters: batch_size={batch_size}, grad_accum_steps={grad_accum_steps}, learning_rate={learning_rate}, epochs={epochs}, early_stopping_patience={early_stopping_patience}")
+    print(f"Reproducibility seed: {seed}")
+    print(f"Data loading parameters: num_workers={num_workers}, pin_memory={pin_memory}, persist_workers={persist_workers}, prefetch_factor={prefetch_factor}")
+    print(f"Dataset target_time_frames={target_time_frames}, validation_split={validation_split}")
+    print(f"Audio inversion settings: spectrogram_type={spectrogram_type}, sample_rate={sample_rate}, hop_length={hop_length}, frame_size={frame_size}, n_mels={n_mels}")
 
     # structure: model_save_dir / formatted_time / model.pth
     run_dir = os.path.join(model_save_dir, f"{model_name}_{selected_level}", formatted_time)
@@ -169,28 +175,36 @@ if __name__ == "__main__":
     print(f"Found {len(all_file_paths)} files. Creating lazy datasets...")
 
     # Data variance calculation
-    data_variance = compute_small_sample_variance(all_file_paths, samples=500)
-    print(f"Computed small sample variance (500 samples): {data_variance:.6f}")
+    samples = 1000
+    data_variance = compute_small_sample_variance(all_file_paths, samples=samples)
+    print(f"Computed small sample variance ({samples} samples): {data_variance:.6f}")
     gc.collect()
 
     # Split into train/val
     split_rng = np.random.default_rng(seed)
     split_rng.shuffle(all_file_paths)
     if validation_split > 0:
+        # Logic to use entire songs in either train or val set, based on filename prefixes,
+        # to prevent data leakage. Assumes files from the same song share a common prefix
+        all_files = list_npy_files(dataset_cfg['processed_path'])
+        song_prefixes = sorted(list(set([extract_song_prefix(f) for f in all_files])))
+
+        # Split prefixes (e.g., 10% validation)
         num_val = int(len(all_file_paths) * validation_split)
         num_train = len(all_file_paths) - num_val
-        
-        train_paths = all_file_paths[:num_train]
-        val_paths = all_file_paths[num_train:]
+        num_val_songs = int(len(song_prefixes) * num_val / len(all_file_paths))
+        val_songs = set(song_prefixes[:num_val_songs])
+
+        # Create the final lists
+        train_file_paths = [f for f in all_files if extract_song_prefix(f) not in val_songs]
+        val_file_paths = [f for f in all_files if extract_song_prefix(f) in val_songs]
         
         # Instantiate Lazy Datasets
-        x_train = LazySpectrogramDataset(train_paths, target_time_frames=target_time_frames)
-        x_val = LazySpectrogramDataset(val_paths, target_time_frames=target_time_frames)
-        
-        train_file_paths = train_paths
-        val_file_paths = val_paths
-        
-        print(f"Data split: {len(x_train)} training, {len(x_val)} validation samples.")
+        x_train = LazySpectrogramDataset(train_file_paths, target_time_frames=target_time_frames)
+        x_val = LazySpectrogramDataset(val_file_paths, target_time_frames=target_time_frames)
+
+        print(f"Songs: {len(song_prefixes) - num_val_songs} train, {num_val_songs} val")
+        print(f"Data split samples: {len(x_train)} training, {len(x_val)} validation.")
     else:
         x_train = LazySpectrogramDataset(all_file_paths, target_time_frames=target_time_frames)
         train_file_paths = all_file_paths

@@ -2,6 +2,7 @@
 import os
 from typing import Optional, Tuple
 
+import re
 import torch
 import torch.nn as nn
 
@@ -12,6 +13,23 @@ from utils import load_config
 LEVEL_TO_INT = {'top': 1, 'middle': 2, 'bottom': 3}
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
 
+
+
+def extract_song_prefix(file_path: str) -> str:
+    """!
+    @brief Extract the song-level prefix (everything before `_segment_NNN.npy`).
+
+    @param file_path Path expected to end with `_segment_<int>.npy`.
+    @return String prefix shared by all segments of the same song.
+    @throws ValueError If the expected naming pattern is not found.
+    """
+    match = re.search(r'^(.+)_segment_\d+\.npy$', str(file_path))
+    if match is None:
+        raise ValueError(
+            f"Could not extract song prefix from file path: {file_path}. "
+            "Expected suffix '_segment_<int>.npy'."
+        )
+    return match.group(1)
 
 def parse_level(level: str) -> str:
     level = str(level).strip().lower()
