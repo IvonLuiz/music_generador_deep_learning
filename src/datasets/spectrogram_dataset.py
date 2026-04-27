@@ -66,9 +66,13 @@ class LazySpectrogramDataset(Dataset):
         if spec.ndim == 3 and spec.shape[-1] == 1:
             spec = spec[:, :, 0]
             
-        # Crop or pad only the time dimension to target_time_frames.
+        # Randomly select a segment of the time dimension with target time frames length.
+        # For example, the bottom vqvae uses mutch shorter time frames than the original spectrograms,
+        # so every epoch is selected a different part of a larger spectrogram.
         if spec.shape[1] > self.target_time_frames:
-            spec = spec[:, :self.target_time_frames] # Crop
+            start_idx = np.random.randint(0, spec.shape[1] - self.target_time_frames)
+            spec = spec[:, start_idx:start_idx + self.target_time_frames] # Crop
+        # If the spectrogram is shorter than target_time_frames, we can pad it with zeros.
         elif spec.shape[1] < self.target_time_frames:
             pad_width = self.target_time_frames - spec.shape[1]
             spec = np.pad(spec, ((0, 0), (0, pad_width)), mode='constant') # Pad
