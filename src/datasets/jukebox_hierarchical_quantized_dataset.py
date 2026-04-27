@@ -3,7 +3,9 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 import numpy as np
 import re
+
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
+from train_scripts.jukebox_utils import extract_song_prefix
 
 
 class JukeboxHierarchicalQuantizedDataset(Dataset):
@@ -16,144 +18,225 @@ class JukeboxHierarchicalQuantizedDataset(Dataset):
         x_train: np.ndarray = None,
         file_paths: list = None,
         batch_size: int = 32,
-        target_time_frames: int = 256,
+        target_time_frames: int = 2048,
+        level_target_time_frames: dict = {},
+        sample_rate: int = 22050,
+        hop_length: int = 256,
+        segment_overlap: float = 0.0,
     ):
         """!
         @brief Build a quantized hierarchical dataset by pre-encoding spectrograms with
-        top/middle/bottom Jukebox VQ-VAE models.
+        top/middle/bottom Jukebox VQ-VAE models using level-specific temporal windows.
 
-        @details This precomputes discrete code indices once, so Transformer prior training
-        can read token tensors directly without running VQ-VAE encoders every epoch.
+        @details Each level encodes a different-length slice of the same spectrogram, so
+        every level produces the same number of tokens while covering different audio durations
+        (Jukebox §5.2 hierarchical context). Timing metadata [start_time_s, total_duration_s,
+        fraction_elapsed] is attached per sample so the Transformer can learn global position.
 
-        @param top_model Trained top-level JukeboxVQVAE used to extract top indices.
-        @param middle_model Trained middle-level JukeboxVQVAE used to extract middle indices.
-        @param bottom_model Trained bottom-level JukeboxVQVAE used to extract bottom indices.
-        @param device Device used for batched VQ-VAE forward passes.
-        @param x_train Optional in-memory spectrogram tensor with shape (N, H, W, C).
-        @param file_paths Optional list of spectrogram .npy files loaded lazily when x_train is None.
-        @param batch_size Initial precompute batch size (auto-reduced on CUDA OOM).
-        @param target_time_frames Target time-axis length used when loading from files.
+        Spectrogram files must follow the naming convention: <prefix>_segment_<int>.npy
+
+        @param top_model Trained top-level JukeboxVQVAE.
+        @param middle_model Trained middle-level JukeboxVQVAE.
+        @param bottom_model Trained bottom-level JukeboxVQVAE.
+        @param device Device for batched VQ-VAE forward passes.
+        @param x_train Optional in-memory spectrogram array (N, H, W, C).
+        @param file_paths Optional list of .npy spectrogram paths (lazy loading).
+        @param batch_size Initial pre-compute batch size (auto-reduced on CUDA OOM).
+        @param target_time_frames Time frames to load from disk (= Top level's window).
+        @param level_target_time_frames Per-level encoding windows, e.g.
+               {'top': 2048, 'middle': 512, 'bottom': 128}. Keys not present fall back
+               to target_time_frames.
+        @param sample_rate Audio sample rate used during preprocessing (default 22050).
+        @param hop_length STFT hop length used during preprocessing (default 256).
+        @param segment_overlap Overlap fraction used during preprocessing (default 0.0).
         """
         if x_train is None and not file_paths:
             raise ValueError("Provide either x_train or file_paths.")
 
-        self.file_paths = list(file_paths) if file_paths is not None else [None] * int(len(x_train))
-        self.top_indices = []
-        self.middle_indices = []
-        self.bottom_indices = []
-        self.time_ids = []
+        self.device = device
         self.target_time_frames = target_time_frames
+        self.file_paths = list(file_paths) if file_paths is not None else [None] * int(len(x_train))
 
-        if x_train is not None:
-            num_samples = int(len(x_train))
-        else:
-            num_samples = int(len(self.file_paths))
+        self.levels = ['top', 'middle', 'bottom']
+        self.models = {
+            'top': top_model,
+            'middle': middle_model,
+            'bottom': bottom_model
+        }
 
+        self.time_frames = {
+            lvl: int(level_target_time_frames.get(lvl, target_time_frames))
+            for lvl in self.levels
+        }
+
+        self.indices = {lvl: [] for lvl in self.levels}
+        num_samples = int(len(x_train)) if x_train is not None else int(len(self.file_paths))
         if num_samples == 0:
             raise ValueError('No samples found for JukeboxHierarchicalQuantizedDataset.')
 
+        for model in self.models.values():
+            model.eval().to(self.device)
+            
+        self._precompute_timing_indices(
+            target_time_frames, sample_rate, hop_length, segment_overlap
+        )
+
+        self._compute_indices_with_auto_batching(
+            x_train, batch_size, num_samples
+        )
+
+    def _precompute_timing_indices(
+        self,
+        target_time_frames,
+        sample_rate,
+        hop_length,
+        segment_overlap
+    ):
+        """!
+        Pre-compute timing indices for each sample.
+        
+        @details Timing is derived from the FULL loaded segment length (target_time_frames)
+        so it represents global song position, independent of which level is being trained.
+        It is calculated based on the segment index extracted from the file name and the
+        total number of segments for that song, which is determined by finding the maximum
+        segment index for each song prefix across all file paths.
+        The timing information is stored as a tensor of shape (N, 3) where each row contains 
+        [start_time_s, total_duration_s, fraction_elapsed] for the corresponding sample.
+        
+        @param target_time_frames Number of time frames in the full segment.
+        @param sample_rate Sample rate of the original audio.
+        @param hop_length Hop length used in the STFT during preprocessing).
+        @param segment_overlap Overlap fraction used during preprocessing.
+        """
+        # Pre-compute per-segment timing [start_time_s, total_duration_s, fraction_elapsed].
+        # Timing is derived from the FULL loaded segment length (target_time_frames) so it
+        # represents global song position, independent of which level is being trained.
+        segment_samples = max(1, (target_time_frames - 1) * hop_length)
+        segment_duration_s = segment_samples / sample_rate
+        hop_samples = max(1, int(segment_samples * (1.0 - float(segment_overlap))))
+        hop_duration_s = hop_samples / sample_rate
+
+        # First pass: group file paths by song prefix to count segments per song and find max segment index
+        song_segment_max: dict = {}   # song_prefix -> max segment index seen
+        file_seg_info: list = []      # (seg_idx, song_prefix_or_None) per sample
+        for fp in self.file_paths:
+            if fp is None:
+                file_seg_info.append((0, None))
+                continue
+            try:
+                seg_idx = self._extract_time_id_from_path(fp)
+                prefix = extract_song_prefix(fp)
+                file_seg_info.append((seg_idx, prefix))
+                song_segment_max[prefix] = max(song_segment_max.get(prefix, -1), seg_idx)
+            except ValueError:
+                file_seg_info.append((0, None))
+
+        # Second pass: build the timing tensor
+        timing_list: list = []      # per-sample timing info [start_time_s, total_song_duration_s, fraction_elapsed]
+        for seg_idx, prefix in file_seg_info:
+            if prefix is None:
+                timing_list.append([0.0, segment_duration_s, 0.0])
+            else:
+                num_segs = song_segment_max[prefix] + 1
+                start_time_s = seg_idx * hop_duration_s
+                total_duration_s = (num_segs - 1) * hop_duration_s + segment_duration_s
+                fraction_elapsed = seg_idx / max(num_segs - 1, 1) if num_segs > 1 else 0.0
+                timing_list.append([start_time_s, total_duration_s, fraction_elapsed])
+
+        self.timing = torch.tensor(timing_list, dtype=torch.float32)
+
+    def _compute_indices_with_auto_batching(
+        self,
+        x_train,
+        batch_size,
+        num_samples
+    ):
+        """!
+        Compute VQ-VAE indices for a batch, automatically reducing batch size on CUDA OOM.
+        
+        @param model JukeboxVQVAE model to use for encoding and quantization.
+        @param batch Input batch tensor (B, C, H, W).
+        @param device Device to perform computations on.
+        @return Quantized indices tensor (B, H, W) on CPU.
+        """
+        current_batch_size = max(1, int(batch_size))
         use_file_loader = x_train is None
-
-
-        for model in (top_model, middle_model, bottom_model):
-            model.eval()
-            model.to(device)
 
         print(
             f"Pre-calculating Jukebox top/middle/bottom indices for prior training "
-            f"(batch_size={batch_size})..."
+            f"(batch_size={batch_size}, frames={[self.time_frames[level] for level in self.levels]})..."
         )
 
         current_batch_size = max(1, int(batch_size))
-
-        def _is_cuda_oom(exc: RuntimeError) -> bool:
-            msg = str(exc).lower()
-            return 'out of memory' in msg and 'cuda' in msg
 
         with torch.no_grad():
             pbar = tqdm(total=num_samples)
             i = 0
             while i < num_samples:
                 end = min(i + current_batch_size, num_samples)
-                if use_file_loader:
-                    batch = self._load_spectrogram_batch(self.file_paths[i:end])
-                else:
-                    batch = x_train[i:end]
-
                 try:
-                    batch_torch = torch.from_numpy(batch).permute(0, 3, 1, 2).float().to(device)
+                    batch_np = self._load_spectrogram_batch(self.file_paths[i:end]) if use_file_loader else x_train[i:end]
 
-                    # Top indices
-                    top_encoded = top_model.encoder(batch_torch)
-                    top_pre_vq = top_model.pre_vq_conv(top_encoded)
-                    _, idx_top, _, _, _ = top_model.vq(top_pre_vq)
+                    # Convert to torch: (B, 1, Freq, Time)
+                    full_torch = torch.from_numpy(batch_np).permute(0, 3, 1, 2).float().to(self.device)
 
-                    # Middle indices
-                    middle_encoded = middle_model.encoder(batch_torch)
-                    middle_pre_vq = middle_model.pre_vq_conv(middle_encoded)
-                    _, idx_middle, _, _, _ = middle_model.vq(middle_pre_vq)
+                    # Unified Encoding Loop
+                    for lvl in self.levels:
+                        # Slice to level window
+                        sliced_batch = full_torch[:, :, :, :self.time_frames[lvl]]
+                        
+                        # Forward pass
+                        model = self.models[lvl]
+                        encoded = model.encoder(sliced_batch)
+                        pre_vq = model.pre_vq_conv(encoded)
+                        _, idx, _, _, _ = model.vq(pre_vq)
 
-                    # Bottom indices
-                    bottom_encoded = bottom_model.encoder(batch_torch)
-                    bottom_pre_vq = bottom_model.pre_vq_conv(bottom_encoded)
-                    _, idx_bottom, _, _, _ = bottom_model.vq(bottom_pre_vq)
-
-                    self.top_indices.append(idx_top.cpu().to(torch.int32))
-                    self.middle_indices.append(idx_middle.cpu().to(torch.int32))
-                    self.bottom_indices.append(idx_bottom.cpu().to(torch.int32))
-
-                    if use_file_loader:
-                        batch_time_ids = [self._extract_time_id_from_path(fp) for fp in self.file_paths[i:end]]
-                    else:
-                        batch_time_ids = list(range(i, end))
-                    self.time_ids.append(torch.tensor(batch_time_ids, dtype=torch.long))
-
-                    # Release transient CUDA tensors before next chunk
-                    del batch_torch
-                    del top_encoded, top_pre_vq, idx_top
-                    del middle_encoded, middle_pre_vq, idx_middle
-                    del bottom_encoded, bottom_pre_vq, idx_bottom
+                        self.indices[lvl].append(idx.cpu().to(torch.int32))
 
                     pbar.update(end - i)
                     i = end
 
+                # Catch CUDA OOM and reduce batch size, retrying the same batch
                 except RuntimeError as exc:
-                    if not _is_cuda_oom(exc):
-                        pbar.close()
-                        raise
+                    if 'out of memory' in str(exc).lower() and current_batch_size > 1:
+                        if self.device.type != 'cuda' or current_batch_size == 1:
+                            print("Reached minimum batch size or not using CUDA, cannot reduce further. Raising exception.")
+                            pbar.close()
+                            raise
+                        
+                        new_batch_size = max(1, current_batch_size // 2)
+                        print(
+                            f"CUDA OOM while precomputing indices at batch_size={current_batch_size}. "
+                            f"Retrying with batch_size={new_batch_size}."
+                        )
+                        current_batch_size = new_batch_size
+                        torch.cuda.empty_cache()
 
-                    if device.type != 'cuda' or current_batch_size == 1:
-                        pbar.close()
-                        raise
-
-                    new_batch_size = max(1, current_batch_size // 2)
-                    print(
-                        f"CUDA OOM while precomputing indices at batch_size={current_batch_size}. "
-                        f"Retrying with batch_size={new_batch_size}."
-                    )
-                    current_batch_size = new_batch_size
-                    torch.cuda.empty_cache()
+                        continue
 
             pbar.close()
 
-        # Transpose dim 1 (Freq) and dim 2 (Time), then make contiguous in memory.
-        # This ensures that when the training script flattens the grid, 
-        # it generates all frequencies for Time 0 before moving to Time 1.
-        self.top_indices = torch.cat(self.top_indices, dim=0).transpose(1, 2).contiguous()
-        self.middle_indices = torch.cat(self.middle_indices, dim=0).transpose(1, 2).contiguous()
-        self.bottom_indices = torch.cat(self.bottom_indices, dim=0).transpose(1, 2).contiguous()
-        self.time_ids = torch.cat(self.time_ids, dim=0).contiguous()
+        # Concatenate and reformat for all levels
+        for lvl in self.levels:
+            # Transpose dim 1 (Freq) and dim 2 (Time) → store as (N, Time, Freq).
+            # When the training script flattens (Time, Freq) row-major, Time is the outer
+            # loop so every block_len consecutive tokens span one time step of the 2D grid.
+            self.indices[lvl] = torch.cat(self.indices[lvl], dim=0).transpose(1, 2).contiguous()
+            print(f"{lvl.capitalize()} indices shape: {tuple(self.indices[lvl].shape)}")
 
-        print(f"Top indices shape:    {tuple(self.top_indices.shape)}")
-        print(f"Middle indices shape: {tuple(self.middle_indices.shape)}")
-        print(f"Bottom indices shape: {tuple(self.bottom_indices.shape)}")
+
+        print(f"Top indices shape:    {tuple(self.indices['top'].shape)}")
+        print(f"Middle indices shape: {tuple(self.indices['middle'].shape)}")
+        print(f"Bottom indices shape: {tuple(self.indices['bottom'].shape)}")
+        print(f"Timing shape:         {tuple(self.timing.shape)}")
 
     def _load_spectrogram_batch(self, paths: list) -> np.ndarray:
         """!
-        @brief Load and normalize a batch of spectrogram files from disk.
+        @brief Load and pad/crop a batch of spectrogram files to target_time_frames.
 
-        @details Each file is padded or cropped to `self.target_time_frames` on the
-        time axis, cast to float32, and stacked into shape (B, H, W, 1).
+        @details Sliding window logic: If a spectrogram has more time frames than 
+        target_time_frames, we randomly select a contiguous slice of length target_time_frames.
+        If it has fewer, we pad with zeros on the right.
 
         @param paths List of .npy spectrogram file paths.
         @return Numpy array of shape (B, H, target_time_frames, 1).
@@ -161,12 +244,18 @@ class JukeboxHierarchicalQuantizedDataset(Dataset):
         specs = []
         for file_path in paths:
             spectrogram = np.load(file_path)
+            
+            # Handling files longer than target
             if spectrogram.shape[1] > self.target_time_frames:
-                spectrogram = spectrogram[:, :self.target_time_frames]
-                print(f"Warning: spectrogram {file_path} has more time frames ({spectrogram.shape[1]}) than target ({self.target_time_frames}). Cropping.")
+                max_start = spectrogram.shape[1] - self.target_time_frames
+                start = np.random.randint(0, max_start)
+                spectrogram = spectrogram[:, start : start + self.target_time_frames]
+            
+            # Handling files shorter than target
             elif spectrogram.shape[1] < self.target_time_frames:
                 pad_width = self.target_time_frames - spectrogram.shape[1]
                 spectrogram = np.pad(spectrogram, ((0, 0), (0, pad_width)), mode='constant')
+
             specs.append(spectrogram.astype(np.float32, copy=False))
 
         batch_np = np.stack(specs, axis=0)[..., np.newaxis]
@@ -190,23 +279,15 @@ class JukeboxHierarchicalQuantizedDataset(Dataset):
         return int(match.group(1))
 
     def __len__(self):
-        """!
-        @brief Return number of precomputed samples.
-
-        @return Dataset length.
-        """
-        return self.top_indices.shape[0]
+        return self.timing.shape[0] # all levels have the same number of samples
 
     def __getitem__(self, idx):
         """!
-        @brief Fetch one training sample with hierarchical token targets and time id.
+        @brief Fetch one training sample.
 
-        @param idx Sample index.
-        @return List containing [top_indices, middle_indices, bottom_indices, time_id].
+        @return [top_indices, middle_indices, bottom_indices, timing] where timing is
+                (3,) float32: [start_time_s, total_duration_s, fraction_elapsed].
         """
-        return [
-            self.top_indices[idx].long(),
-            self.middle_indices[idx].long(),
-            self.bottom_indices[idx].long(),
-            self.time_ids[idx].view(1),
-        ]
+        sample = [self.indices[lvl][idx].long() for lvl in self.levels]
+        sample.append(self.timing[idx])
+        return sample
