@@ -5,12 +5,12 @@ import librosa
 import numpy as np
 import matplotlib.pyplot as plt
 
-TARGET_TIME_FRAMES = 1024
+TARGET_TIME_FRAMES = 2048  # ≈24s at hop_length=256, sr=22050; Top prior uses the full window
 SAMPLE_RATE = 22050    # samples per second
 FRAME_SIZE = 2048       # samples for each STFT window
 HOP_LENGTH = 256       # move amount of samples between windows
 N_MELS = 256          # number of mel bins for LogMelSpectrogramExtractor (used only if use_mel_spectrogram=True)
-MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_mel_spectrograms/min_max_values/"
+MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro/min_max_values/"
 
 
 class Loader:
@@ -454,9 +454,10 @@ if __name__ == "__main__":
     # For 256 time frames: (256 * 256) / 22050 ≈ 2.97 seconds  
     # For 512 time frames: (512 * 256) / 22050 ≈ 5.95 seconds
     # For 1024 time frames: (1024 * 256) / 22050 ≈ 11.9 seconds
+    # For 2048 time frames: (2048 * 256) / 22050 ≈ 23.8 seconds
     
     DURATION = ((TARGET_TIME_FRAMES - 1) * HOP_LENGTH) / SAMPLE_RATE # Duration in seconds for each segment based on target time frames
-    overlapping = 0.0
+    overlapping = 0.5  # 50% overlap lets transformer learn that certain tokens can appear in different contexts, improving generalization.\
     use_mel_spectrogram = True # Set to True to use LogMelSpectrogramExtractor instead of LogSpectrogramExtractor
     
     print(f"Using {TARGET_TIME_FRAMES} time frames = {DURATION:.2f} seconds per segment")
@@ -470,9 +471,9 @@ if __name__ == "__main__":
     # FILES_DIR = "./data/fsdd/audio/"
     
     FILES_DIR = "./data/raw/maestro-v3.0.0"
-    SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro_mel_spectrograms/"
+    SPECTROGRAMS_SAVE_DIR = "./data/processed/maestro/"
     VISUALIZATION_SAVE_DIR = SPECTROGRAMS_SAVE_DIR + "/spectrograms/"
-    MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro_mel_spectrograms/min_max_values/"
+    MIN_MAX_VALUES_SAVE_DIR = "./data/processed/maestro/min_max_values/"
     
     # Enable visualization (set to False to disable)
     ENABLE_VISUALIZATION = False
