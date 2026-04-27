@@ -148,10 +148,12 @@ class TransformerPriorConditioned(nn.Module):
         else:
             self.second_conditioner = None
 
-        # Embedding layers for tokens and positions        
+        # Embedding layers for tokens and positions
         self.token_embedding = nn.Embedding(self.input_vocab_size, model_dim)
         self.pos_embedding = nn.Embedding(max_seq_len, model_dim)
-        self.time_embedding = nn.Embedding(max_time_steps, model_dim)
+        # Continuous timing projection: maps [start_time_s, total_duration_s, fraction_elapsed]
+        # to model_dim and adds a global conditioning signal broadcast over the sequence.
+        self.timing_proj = nn.Linear(3, model_dim)  # jukebox Section 5.2
 
         # Initialize the transformer layers
         self._init_factored_transformer_layers()
@@ -181,7 +183,7 @@ class TransformerPriorConditioned(nn.Module):
         indices: torch.Tensor,
         upper_indices: Optional[torch.Tensor] = None,
         second_upper_indices: Optional[torch.Tensor] = None,
-        time_ids: torch.Tensor = None
+        timing: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass for the TransformerPriorConditioned model.
@@ -193,8 +195,9 @@ class TransformerPriorConditioned(nn.Module):
         @param indices The input token indices for the current level (shape: [batch_size, seq_len]).
         @param upper_indices The input token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
         This is used as conditioning information for upsampler priors. Defaults to None (no conditioning).
-        @param time_ids Optional time step IDs used for temporal conditioning. Temporal conditioning is applied per
-        batch element. Accepts shape [batch_size] or [batch_size, 1].
+        @param timing Optional global timing tensor of shape (batch_size, 3) with float values
+        [start_time_seconds, total_duration_seconds, fraction_elapsed]. Projected to model_dim
+        and broadcast over the full sequence so the model knows where it is inside a song.
         @return Logits over the vocabulary for the next token prediction (shape: [batch_size, seq_len, num_embeddings]).
         """
         if indices.ndim != 2:
@@ -214,36 +217,21 @@ class TransformerPriorConditioned(nn.Module):
         # base embeddings (tokens + position)
         x = self.token_embedding(indices) + self.pos_embedding(pos)
 
-        # Add time embeddings if time_ids are provided
-        if time_ids is not None:
-            time_ids = time_ids.to(device=device, dtype=torch.long)
-
-            if time_ids.ndim == 1:
-                if time_ids.shape[0] != batch_size:
-                    raise ValueError(
-                        f"time_ids with shape {tuple(time_ids.shape)} must match batch_size={batch_size}"
-                    )
-                time_ids = time_ids.unsqueeze(1).expand(-1, seq_len)
-            elif time_ids.ndim == 2:
-                if time_ids.shape == (batch_size, 1):
-                    time_ids = time_ids.expand(-1, seq_len)
-                elif time_ids.shape != (batch_size, seq_len):
-                    raise ValueError(
-                        f"time_ids must have shape (B,), (B,1), or (B,T). Got {tuple(time_ids.shape)}"
-                    )
-                # else case is already (B, seq_len)
-            else:
+        # Add global timing embedding if provided.
+        # timing shape: (B, 3) with [start_time_s, total_duration_s, fraction_elapsed].
+        # Projected to (B, model_dim) then broadcast over seq_len.
+        if timing is not None:
+            timing = timing.to(device=device, dtype=torch.float32)
+            if timing.ndim == 1:
+                timing = timing.unsqueeze(0)
+            if timing.shape[0] == 1 and batch_size > 1:
+                timing = timing.expand(batch_size, -1)
+            if timing.shape != (batch_size, 3):
                 raise ValueError(
-                    f"time_ids must have shape (B,), (B,1), or (B,T). Got {tuple(time_ids.shape)}"
+                    f"timing must have shape (B, 3) or (1, 3), got {tuple(timing.shape)}"
                 )
-
-            if torch.any(time_ids < 0) or torch.any(time_ids >= self.max_time_steps):
-                raise ValueError(
-                    f"time_ids values must be in [0, {self.max_time_steps - 1}]"
-                )
-
-            t_emb = self.time_embedding(time_ids)   # (batch, seq_len, model_dim)
-            x = x + t_emb
+            t_emb = self.timing_proj(timing)    # (B, model_dim)
+            x = x + t_emb.unsqueeze(1)          # broadcast: (B, 1, model_dim) + (B, T, model_dim)
 
         if self.is_upsampler:
             if upper_indices is None:
@@ -318,15 +306,16 @@ class TransformerPriorConditioned(nn.Module):
         indices: torch.Tensor,
         upper_indices: Optional[torch.Tensor] = None,
         second_upper_indices: Optional[torch.Tensor] = None,
-        time_ids: Optional[torch.Tensor] = None
+        timing: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """!
         Next-token cross-entropy on a full sequence tensor (B, T).
-        
+
         @param indices The input token indices for the current level (shape: [batch_size, seq_len]).
         @param upper_indices The input token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
         This is used as conditioning information for upsampler priors. Defaults to None (no conditioning).
-        @param time_ids Optional time step IDs used for temporal conditioning. Accepts shape [batch_size], [batch_size, 1], or [batch_size, seq_len]. Defaults to None.
+        @param timing Optional global timing tensor of shape (batch_size, 3) with float values
+        [start_time_seconds, total_duration_seconds, fraction_elapsed]. Defaults to None.
         @return The computed cross-entropy loss for next-token prediction.
         """
         if indices.ndim != 2:
@@ -346,23 +335,22 @@ class TransformerPriorConditioned(nn.Module):
             input_tokens = indices[:, :-1]  # Length: T - 1
             target = indices[:, 1:]         # Length: T - 1
         
-        # Pass upper_indices through to forward
         logits = self.forward(
             input_tokens,
             upper_indices=upper_indices,
             second_upper_indices=second_upper_indices,
-            time_ids=time_ids,
+            timing=timing,
         )
         return F.cross_entropy(logits.reshape(-1, self.num_embeddings), target.reshape(-1))
 
     @torch.no_grad()
     def generate(
-        self, 
+        self,
         batch_size: int,
         start_tokens: Optional[torch.Tensor] = None,
         upper_indices: Optional[torch.Tensor] = None,
         second_upper_indices: Optional[torch.Tensor] = None,
-        time_id: torch.Tensor = None,
+        timing: Optional[torch.Tensor] = None,
         seq_len: int = 64,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
@@ -371,14 +359,16 @@ class TransformerPriorConditioned(nn.Module):
         """!
         @brief Generates a sequence of token indices autoregressively given an initial input and optional conditioning.
         @param batch_size The number of sequences to generate in parallel.
-        @param start_tokens The initial input token indices (shape: [batch_size, initial_seq_len]). Defaults to None (start with a single token).
-        @param upper_indices The input token indices from the upper level prior for conditioning (shape: [batch_size, upper_seq_len]). Defaults to None (no conditioning).
-        @param time_id The time ID for the current generation step. Defaults to None. This is used for time embeddings and should be provided when generating from an upsampler prior to help the model learn temporal structure.
-        @param seq_len The length of the generated sequence (including the initial input). Defaults to 64.
-        @param top_k The number of top logits to keep for sampling. If None or <= 0, no filtering is applied. Defaults to None.
-        @paramm temperature The sampling temperature. Must be > 0. Defaults to 1.0.
-        @param device The device to perform generation on. If None, uses the same device as the model's parameters. Defaults to None.
-        @return A tensor of generated token indices (shape: [batch_size, generated_seq_len]) where generated_seq_len <= seq_len.
+        @param start_tokens The initial input token indices (shape: [batch_size, initial_seq_len]). Defaults to None.
+        @param upper_indices Conditioning token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
+        @param second_upper_indices Second conditioning indices (bottom prior only). Defaults to None.
+        @param timing Global timing tensor of shape (batch_size, 3) or (1, 3) with float values
+        [start_time_seconds, total_duration_seconds, fraction_elapsed]. Defaults to None (no timing signal).
+        @param seq_len The length of the generated sequence. Defaults to 64.
+        @param top_k Top-k filtering. If None or <= 0, no filtering is applied. Defaults to None.
+        @param temperature Sampling temperature. Must be > 0. Defaults to 1.0.
+        @param device Device to perform generation on. Defaults to model's device.
+        @return Generated token indices (shape: [batch_size, seq_len]).
         """
         if temperature <= 0:
             raise ValueError(f"temperature must be > 0, got {temperature}")
@@ -413,12 +403,11 @@ class TransformerPriorConditioned(nn.Module):
         target_len = seq_len + bos_prefix_len
 
         while tokens.shape[1] < target_len:
-            # Pass upper_indices during generation
             logits = self.forward(
                 tokens,
                 upper_indices=upper_indices,
                 second_upper_indices=second_upper_indices,
-                time_ids=time_id,
+                timing=timing,
             )
             
             next_logits = logits[:, -1, :] / temperature
@@ -449,26 +438,32 @@ class TransformerPriorConditioned(nn.Module):
 
 if __name__ == "__main__":
     torch.manual_seed(42)
-        
-    # Example usage
+
+    # Example usage — reflects the new level-specific window architecture.
+    # All three levels produce 512 tokens; conditioners use sliced upper sequences.
+    #   Top:    8×64 = 512 tokens  (full 2048-frame window)
+    #   Middle: 16×32 = 512 tokens (512-frame window), conditioned on 8×16=128 sliced Top tokens
+    #   Bottom: 32×16 = 512 tokens (128-frame window),  conditioned on 16×8=128 sliced Middle tokens
     batch_size = 4
-    seq_len = 16
-    num_embeddings = 2048 # VQ-VAE codebook size
-    embedding_dim = 1920
+    seq_len = 512          # all levels produce 512 tokens
+    cond_seq_len = 128     # sliced upper-level conditioning (stride-4 conditioner)
+    num_embeddings = 2048  # VQ-VAE codebook size
+    embedding_dim = 512
     num_heads = 8
     num_layers = 6
     dim_feedforward = 2048
-    max_seq_len = 64
-    upsample_stride = 4  # Ratio between the upper and lower sequence lengths
+    max_seq_len = 512
+    upsample_stride = 4    # 128 upper tokens → 512 lower tokens
     padding = 0
     kernel_size = 3
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"Batch Size: {batch_size}")
-    print(f"Top Sequence Length: {seq_len}")
-    print(f"Bottom Sequence Length: {seq_len * upsample_stride}")
+    print(f"Target Sequence Length (all levels): {seq_len}")
+    print(f"Conditioning Sequence Length (sliced): {cond_seq_len}")
     print("\n" + "="*40 + "\n")
 
-    print("Testing non-upsampler prior (no conditioning):")
+    print("Testing non-upsampler prior (Top — no conditioning):")
     model = TransformerPriorConditioned(
         num_embeddings=num_embeddings,
         model_dim=embedding_dim,
@@ -476,25 +471,22 @@ if __name__ == "__main__":
         num_layers=num_layers,
         dim_feedforward=dim_feedforward,
         max_seq_len=max_seq_len,
+        block_len=8,   # Top grid: 8 freq × 64 time
         is_upsampler=False,
         dropout=0.1,
-    )
-    #print("Model architecture:\n", model)
+    ).to(device)
 
-    # dummy input tokens for the non-upsampler prior
-    input_tokens = torch.randint(0, num_embeddings, (batch_size, seq_len))
-    print("Input tokens shape (non-upsampler):", input_tokens.shape)  # Expected shape: (batch_size, seq_len)
-    output = model(input_tokens)
-    print("Output shape (non-upsampler):", output.shape)  # Expected shape: (batch_size, seq_len, num_embeddings)
-    
+    input_tokens = torch.randint(0, num_embeddings, (batch_size, seq_len)).to(device)
+    print("Input tokens shape (top):", input_tokens.shape)
+    timing = torch.tensor([[0.0, 23.8, 0.0]] * batch_size)
+    output = model(input_tokens, timing=timing)
+    print("Output shape (top):", output.shape)
     assert output.shape == (batch_size, seq_len, num_embeddings), f"Shape mismatch! Expected {(batch_size, seq_len, num_embeddings)}, got {output.shape}"
-    print("Non-upsampler test passed successfully!")
+    print("Top prior test passed successfully!")
 
     print("\n" + "="*40 + "\n")
-    
-    # Upsampler Prior (Transformer + WaveNet Conditioner)
-    print("Testing upsampler prior (with conditioning):")
-    
+
+    print("Testing upsampler prior (Middle — conditioned on 128 sliced Top tokens):")
     model_upsampler = TransformerPriorConditioned(
         num_embeddings=num_embeddings,
         model_dim=embedding_dim,
@@ -502,37 +494,39 @@ if __name__ == "__main__":
         num_layers=num_layers,
         dim_feedforward=dim_feedforward,
         max_seq_len=max_seq_len,
+        block_len=16,  # Middle grid: 16 freq × 32 time
         is_upsampler=True,
         cond_num_embeddings=num_embeddings,
-        upsample_stride=upsample_stride,
+        upsample_stride=upsample_stride,  # 128 → 512, stride=4
         dropout=0.1,
-    )
-    #print("Upsampler Model architecture:\n", model_upsampler)
-    
-    # dummy input tokens for the upsampler prior
-    lower_input_tokens = torch.randint(0, num_embeddings, (batch_size, seq_len))
-    upper_input_tokens = torch.randint(0, num_embeddings, (batch_size, seq_len // upsample_stride))  # shorter sequence for the upper level
-    print("Input tokens shape (upsampler):", lower_input_tokens.shape)  # Expected shape: (batch_size, seq_len)
-    print("Upper input tokens shape (conditioning):", upper_input_tokens.shape)  # Expected shape: (batch_size, seq_len // upsample_stride)
-    output = model(indices=lower_input_tokens, upper_indices=upper_input_tokens)
-    print("Output shape (upsampler):", output.shape)  # Expected shape: (batch_size, seq_len, num_embeddings)
-    
+    ).to(device)
+
+    lower_input_tokens = torch.randint(0, num_embeddings, (batch_size, seq_len)).to(device)
+    upper_input_tokens = torch.randint(0, num_embeddings, (batch_size, cond_seq_len)).to(device)  # 128 sliced Top tokens
+    print("Input tokens shape (middle):", lower_input_tokens.shape)
+    print("Conditioning tokens shape (sliced Top):", upper_input_tokens.shape)
+    output = model_upsampler(indices=lower_input_tokens, upper_indices=upper_input_tokens, timing=timing)
+    print("Output shape (middle upsampler):", output.shape)
     assert output.shape == (batch_size, seq_len, num_embeddings), f"Shape mismatch! Expected {(batch_size, seq_len, num_embeddings)}, got {output.shape}"
-    print("Upsampler test passed successfully!")
+    print("Middle upsampler test passed successfully!")
     
     print("\n" + "="*40 + "\n")
     # loss test
-    print("Testing loss computation for upsampler prior:")
-    loss = model.loss(lower_input_tokens, upper_indices=upper_input_tokens)
-    print(f"Loss computed successfully: {loss.item()}")
-    
-    # test generation
-    print("\nTesting generation for upsampler prior:")
-    
-    generated_tokens = model.generate(batch_size=batch_size, 
-                                      start_tokens=lower_input_tokens,
-                                      upper_indices=upper_input_tokens,
-                                      seq_len=seq_len, top_k=10)
-    print("Generated tokens shape:", generated_tokens.shape)  # Expected shape: (batch_size
-    
+    print("\n" + "="*40 + "\n")
+    print("Testing loss and generation for middle upsampler prior:")
+    loss = model_upsampler.loss(lower_input_tokens, upper_indices=upper_input_tokens, timing=timing)
+    print(f"Loss computed successfully: {loss.item():.4f}")
+
+    print("\nTesting generation for middle upsampler prior:")
+    generated_tokens = model_upsampler.generate(
+        batch_size=batch_size,
+        start_tokens=None,
+        upper_indices=upper_input_tokens,
+        seq_len=seq_len,
+        top_k=50,
+        timing=timing,
+    )
+    print("Generated tokens shape:", generated_tokens.shape)
+    assert generated_tokens.shape == (batch_size, seq_len), f"Generated shape mismatch: {generated_tokens.shape}"
+
     print("\nAll tests passed successfully!")
