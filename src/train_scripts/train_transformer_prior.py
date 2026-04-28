@@ -7,7 +7,6 @@ import numpy as np
 from datetime import datetime
 from typing import Optional
 import math
-import re
 
 import torch
 import torch.nn as nn
@@ -66,20 +65,6 @@ def _compute_stride(lower_len: int, upper_len: int, level_name: str) -> int:
     return lower_len // upper_len
 
 
-def _extract_max_segment_time_id(file_paths) -> Optional[int]:
-    max_time_id = None
-    pattern = re.compile(r'_segment_(\d+)\.npy$')
-    for path in file_paths:
-        s = str(path)
-        match = pattern.search(s)
-        if not match:
-            continue
-        tid = int(match.group(1))
-        if max_time_id is None or tid > max_time_id:
-            max_time_id = tid
-    return max_time_id
-
-
 def _resolve_vqvae_config_path(model_dir_or_file: Optional[str]) -> Optional[str]:
     if not model_dir_or_file:
         return None
@@ -126,13 +111,19 @@ def train_transformer_prior(
     middle_model = load_jukebox_model(effective_middle_model_dir, 'middle', device, effective_weights_file)
     bottom_model = load_jukebox_model(effective_bottom_model_dir, 'bottom', device, effective_weights_file)
 
-    target_time_frames = int(dataset_cfg.get('target_time_frames', 256))
+    target_time_frames = int(dataset_cfg.get('target_time_frames', 2048))
+    level_target_time_frames = dataset_cfg.get('level_target_time_frames') or {}
+    sample_rate = int(dataset_cfg.get('sample_rate', 22050))
+    hop_length = int(dataset_cfg.get('hop_length', 256))
+    segment_overlap = float(dataset_cfg.get('segment_overlap', 0.0))
+
     file_paths = list_npy_files(dataset_cfg['processed_path'])
     if len(file_paths) == 0:
         raise ValueError(f"No .npy files found under dataset path: {dataset_cfg['processed_path']}")
     print(f'Found {len(file_paths)} spectrogram files for quantization.')
+    print(f'Level target time frames: {level_target_time_frames}')
 
-    quant_batch_size = train_cfg.get('quantization_batch_size', 32)
+    quant_batch_size = train_cfg.get('quantization_batch_size', 8)
     dataset = JukeboxHierarchicalQuantizedDataset(
         file_paths=file_paths,
         top_model=top_model,
@@ -141,6 +132,10 @@ def train_transformer_prior(
         device=device,
         batch_size=quant_batch_size,
         target_time_frames=target_time_frames,
+        level_target_time_frames=level_target_time_frames,
+        sample_rate=sample_rate,
+        hop_length=hop_length,
+        segment_overlap=segment_overlap,
     )
 
     num_embeddings_map = {
@@ -153,7 +148,8 @@ def train_transformer_prior(
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
-    top_h, top_w = dataset.top_indices.shape[-2], dataset.top_indices.shape[-1]
+    # Grid dims: stored as (N, Time, Freq) after the transpose in the dataset.
+    top_h, top_w = dataset.top_indices.shape[-2], dataset.top_indices.shape[-1]       # Time, Freq
     middle_h, middle_w = dataset.middle_indices.shape[-2], dataset.middle_indices.shape[-1]
     bottom_h, bottom_w = dataset.bottom_indices.shape[-2], dataset.bottom_indices.shape[-1]
     seq_lens = {
@@ -170,6 +166,57 @@ def train_transformer_prior(
     print(
         f"Bottom indices shape: {tuple(dataset.bottom_indices.shape)} -> seq_len={seq_lens['bottom']}"
     )
+
+    # --- Temporal alignment for conditioning ---
+    # Each upsampler trains on a SHORT window of the target level, conditioned on the
+    # corresponding SLICE of the upper level that covers exactly the same audio.
+    # The slice is always the first cond_time_cols time-columns of the upper grid.
+    #
+    #   Middle conditioned on Top slice:
+    #     cond_time_cols = top_h * (mid_tf / top_tf)    e.g. 64 * (512/2048) = 16
+    #     cond_seq_len   = cond_time_cols * top_w        e.g. 16 * 8 = 128 → stride 512/128 = 4
+    #
+    #   Bottom conditioned on Middle slice (primary):
+    #     cond_time_cols = mid_h * (bot_tf / mid_tf)    e.g. 32 * (128/512) = 8
+    #     cond_seq_len   = cond_time_cols * mid_w        e.g. 8 * 16 = 128 → stride 512/128 = 4
+    #
+    #   Bottom conditioned on Top slice (secondary):
+    #     second_cond_time_cols = top_h * (bot_tf / top_tf)  e.g. 64 * (128/2048) = 4
+    #     second_cond_seq_len   = second_cond_time_cols * top_w  e.g. 4 * 8 = 32 → stride 512/32 = 16
+    #
+    # Note: because ConvTranspose1d(kernel_size=stride) maps input token i to output
+    # tokens [i*stride, (i+1)*stride), the WaveNetConditioner's existing
+    # cond_emb[:, :seq_len, :] slice in forward() produces the SAME result as if we had
+    # passed only cond_seq_len tokens — but we slice EXPLICITLY here during training so
+    # the model never receives out-of-alignment conditioning.
+
+    _top_tf = int(level_target_time_frames.get('top', target_time_frames))
+    _mid_tf = int(level_target_time_frames.get('middle', target_time_frames))
+    _bot_tf = int(level_target_time_frames.get('bottom', target_time_frames))
+
+    cond_time_cols: int = 0
+    second_cond_time_cols: int = 0
+    cond_seq_len: int = 0
+    second_cond_seq_len: int = 0
+    cond_grid_h: int = 0
+    cond_grid_w: int = 0
+
+    if selected_level == 'middle':
+        cond_time_cols = round(top_h * _mid_tf / _top_tf)
+        cond_grid_h, cond_grid_w = top_h, top_w
+        cond_seq_len = cond_time_cols * top_w
+    elif selected_level == 'bottom':
+        cond_time_cols = round(middle_h * _bot_tf / _mid_tf)
+        cond_grid_h, cond_grid_w = middle_h, middle_w
+        cond_seq_len = cond_time_cols * middle_w
+        if condition_on_top:
+            second_cond_time_cols = round(top_h * _bot_tf / _top_tf)
+            second_cond_seq_len = second_cond_time_cols * top_w
+
+    if cond_seq_len > 0:
+        print(f"Conditioning slice for {selected_level}: {cond_time_cols} time-cols × {cond_grid_w} freq = {cond_seq_len} tokens")
+    if second_cond_seq_len > 0:
+        print(f"Second conditioning slice (Top→Bottom): {second_cond_time_cols} time-cols × {top_w} freq = {second_cond_seq_len} tokens")
 
     # Split into train/val
     split_rng = np.random.default_rng(seed)
@@ -194,18 +241,14 @@ def train_transformer_prior(
     second_cond_num_embeddings = None
     if is_upsampler:
         cond_num_embeddings = num_embeddings_map[cond_level]
-        upsample_stride = _compute_stride(seq_lens[selected_level], seq_lens[cond_level], selected_level)
+        # Stride is computed from the SLICED conditioning length, not the full upper seq_len.
+        # With equal seq_lens (all 512) the old full-seq computation would yield stride=1.
+        upsample_stride = _compute_stride(seq_lens[selected_level], cond_seq_len, selected_level)
     if condition_on_top and second_cond_level is not None:
         second_cond_num_embeddings = num_embeddings_map[second_cond_level]
-        second_upsample_stride = _compute_stride(seq_lens[selected_level], seq_lens[second_cond_level], selected_level)
+        second_upsample_stride = _compute_stride(seq_lens[selected_level], second_cond_seq_len, selected_level)
 
-    max_time_steps_cfg = int(prior_cfg.get('max_time_steps', 500))
-    max_time_id = _extract_max_segment_time_id(file_paths)
-    if max_time_id is not None:
-        required_time_steps = int(max_time_id) + 1
-        max_time_steps = max(max_time_steps_cfg, required_time_steps)
-    else:
-        max_time_steps = max_time_steps_cfg
+    max_time_steps = int(prior_cfg.get('max_time_steps', 500))
 
     prior = TransformerPriorConditioned(
         num_embeddings=num_embeddings_map[selected_level],
@@ -364,6 +407,15 @@ def train_transformer_prior(
         config_to_save['model']['inferred_upsample_stride'] = int(upsample_stride)
     if second_upsample_stride is not None:
         config_to_save['model']['inferred_second_upsample_stride'] = int(second_upsample_stride)
+    # Persist conditioning slice info for diagnostics and potential future use.
+    if cond_seq_len > 0:
+        config_to_save['model']['inferred_cond_seq_len'] = int(cond_seq_len)
+        config_to_save['model']['inferred_cond_time_cols'] = int(cond_time_cols)
+    if second_cond_seq_len > 0:
+        config_to_save['model']['inferred_second_cond_seq_len'] = int(second_cond_seq_len)
+        config_to_save['model']['inferred_second_cond_time_cols'] = int(second_cond_time_cols)
+    config_to_save['dataset'] = dict(config_to_save.get('dataset', {}))
+    config_to_save['dataset']['level_target_time_frames'] = dict(level_target_time_frames)
 
     config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['retrain'] = retrain
     config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['pretrained_weights_path'] = pretrained_weights_path
@@ -390,7 +442,7 @@ def train_transformer_prior(
             top_indices = batch[0].to(device)
             mid_indices = batch[1].to(device)
             bot_indices = batch[2].to(device)
-            time_id = batch[3].to(device)
+            timing = batch[3].to(device)  # (B, 3): [start_time_s, total_duration_s, fraction_elapsed]
 
             if selected_level == 'top':
                 target_indices = top_indices
@@ -406,16 +458,28 @@ def train_transformer_prior(
                 second_cond_indices = top_indices if condition_on_top else None
 
             target_seq = target_indices.view(target_indices.shape[0], -1)
-            cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
-            second_cond_seq = second_cond_indices.view(second_cond_indices.shape[0], -1) if second_cond_indices is not None else None
+
+            # Slice upper-level conditioning to the temporally-aligned window.
+            # Stored grids are (B, Time, Freq); we keep the first cond_time_cols time-steps.
+            if cond_indices is not None:
+                B = cond_indices.shape[0]
+                cond_seq = cond_indices.view(B, cond_grid_h, cond_grid_w)[:, :cond_time_cols, :].reshape(B, -1)
+            else:
+                cond_seq = None
+
+            if second_cond_indices is not None:
+                B = second_cond_indices.shape[0]
+                second_cond_seq = second_cond_indices.view(B, top_h, top_w)[:, :second_cond_time_cols, :].reshape(B, -1)
+            else:
+                second_cond_seq = None
 
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                    loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, time_ids=time_id)
+                    loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, timing=timing)
                 loss_to_backward = loss / grad_accum_steps
                 scaler.scale(loss_to_backward).backward()
             else:
-                loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, time_ids=time_id)
+                loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, timing=timing)
                 loss_to_backward = loss / grad_accum_steps
                 loss_to_backward.backward()
 
@@ -446,7 +510,7 @@ def train_transformer_prior(
                 top_indices = batch[0].to(device)
                 mid_indices = batch[1].to(device)
                 bot_indices = batch[2].to(device)
-                time_id = batch[3].to(device)
+                timing = batch[3].to(device)
 
                 if selected_level == 'top':
                     target_indices = top_indices
@@ -462,13 +526,24 @@ def train_transformer_prior(
                     second_cond_indices = top_indices if condition_on_top else None
 
                 target_seq = target_indices.view(target_indices.shape[0], -1)
-                cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
-                second_cond_seq = second_cond_indices.view(second_cond_indices.shape[0], -1) if second_cond_indices is not None else None
+
+                if cond_indices is not None:
+                    B = cond_indices.shape[0]
+                    cond_seq = cond_indices.view(B, cond_grid_h, cond_grid_w)[:, :cond_time_cols, :].reshape(B, -1)
+                else:
+                    cond_seq = None
+
+                if second_cond_indices is not None:
+                    B = second_cond_indices.shape[0]
+                    second_cond_seq = second_cond_indices.view(B, top_h, top_w)[:, :second_cond_time_cols, :].reshape(B, -1)
+                else:
+                    second_cond_seq = None
+
                 if use_amp:
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                        loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, time_ids=time_id)
+                        loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, timing=timing)
                 else:
-                    loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, time_ids=time_id)
+                    loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, timing=timing)
                 val_running_loss += loss.item()
 
         epoch_val_loss = val_running_loss / max(len(val_loader), 1)
