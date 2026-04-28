@@ -1,16 +1,16 @@
 dataset:
   raw_path: "./data/raw/maestro-v3.0.0/"
-  processed_path: "./data/processed/maestro_mel_spectrograms/"
+  processed_path: "/home/ivon/code/datasets/processed/maestro/"
   spectrogram_type: "mel"
   n_mels: 256
-  min_max_values_path: "./data/processed/maestro_mel_spectrograms/min_max_values/min_max_values.pkl"
+  min_max_values_path: "./data/processed/maestro/min_max_values/min_max_values.pkl"
   sample_rate: 22050
   hop_length: 256
   frame_size: 2048
-  target_time_frames: 1024
+  target_time_frames: 2048  # ≈24s; each preprocessed segment covers the full Top-level window
 
 model:
-  name: "jukebox_vqvae_full-maestro_log-mel"
+  name: "jukebox_vqvae_maestro"
   selected_level: "bottom"  # options: "bottom", "middle", "top"
   input_channels: 1
   num_embeddings: 2048 # codebook size (K)
@@ -21,63 +21,74 @@ model:
   ema_decay: 0.99           # Jukebox/VQ-VAE EMA decay usually is 0.99
   restart_threshold: 0.5    # Threshold for the EMAVectorQuantizer restart mechanism
   epsilon: 1e-5             # Small constant for numerical stability in EMA updates
-  
+
   conv_type: 2
-  dilation_growth_rate: 3
+  dilation_growth_rate: 3   # Dilation increases by a factor of 3 in each successive residual block, creating an exponentially growing receptive field
   channel_growth: 1
   activation: "sigmoid"
 
   level_profiles:
+    # encoder/decoder channel width (hidden_dim) is affected by channel_growth, but not dilation_growth_rate
+    # levels are downsampling blocks
     bottom:
-      hidden_dim: 128 # encoder/decoder channel width. Is affected by channel_growth, but not dilation_growth_rate.
-      levels: 3 # downsampling blocks -> 32x32 grid
+      # Bottom trains on short 1.5s windows to learn local texture/timbre.
+      # Grid: 256/2^3=32 freq × 128/2^3=16 time = 512 tokens; block_len=32 (freq dim).
+      target_time_frames: 128
+      hidden_dim: 64
+      levels: 3
       num_residual_layers: 8
     middle:
-      hidden_dim: 128 # encoder/decoder channel width. Is affected by channel_growth, but not dilation_growth_rate.
-      levels: 4 # downsampling blocks -> 16x16 grid
+      # Middle trains on 6s windows to capture mid-range musical structure.
+      # Grid: 256/2^4=16 freq × 512/2^4=32 time = 512 tokens; block_len=16.
+      target_time_frames: 512
+      hidden_dim: 64
+      levels: 4
       num_residual_layers: 4
     top:
-      hidden_dim: 64 # encoder/decoder channel width. Is affected by channel_growth, but not dilation_growth_rate.
-      levels: 5 # downsampling blocks -> 8x8 grid
+      # Top trains on full 24s windows to learn global song-level structure.
+      # Grid: 256/2^5=8 freq × 2048/2^5=64 time = 512 tokens; block_len=8.
+      target_time_frames: 2048
+      hidden_dim: 64
+      levels: 5
       num_residual_layers: 4
 
+# Jukebox insight: equal context length (512 tokens) at every level, but each level
+# "sees" a different duration of audio. Top compresses more → broader temporal context;
+# Bottom compresses less → finer local resolution.
+# Compression ratios: Bottom 2^3=8x, Middle 2^4=16x, Top 2^5=32x (per axis, so 2D: 64x/256x/1024x).
 # Jukebox paper user levels 3, 5, 7. Here we keep levels: 3, 4, 5 because
 # Jukebox compresses a massive 1D line of audio (e.g., 65,536 samples), while
-# we are compressing a 2D image ($256 * 1024$). If we were to apply 7 downsampling
-# steps to our grid, our Top level latent space would be a 2 * 8 grid (256 / 2^7) x (1024 / 2^7).
-# That is only 64 tokens, the Transformer prior wouldn't have enough sequential
-# length to learn anything meaningful. So, 3, 4, 5 correctly yields sequence lengths
-# of 4096 (32x128), 1024 (16x64), and 256 (8x32) tokens, which better matches
-# the intended Jukebox-scale sequence lengths for 2D data.
+# we compress a 2D spectrogram grid (e.g., 256×2048). So we need slightly less
+# compression to get down to 512 tokens.
 
 training:
   seed: 42
   bottom:
-    batch_size: 4
-    gradient_accumulation_steps: 32 # Effective batch size = batch_size * gradient_accumulation_steps
+    batch_size: 64
+    gradient_accumulation_steps: 4 # Effective batch size = batch_size * gradient_accumulation_steps
     learning_rate: 0.0002 # jukebox uses 0.0003
-    epochs: 50
+    epochs: 100
     validation_split: 0.1
     early_stopping_patience: 10
     retrain: false
     pretrained_weights_path: ""
   middle:
-    batch_size: 8
+    batch_size: 16
     gradient_accumulation_steps: 16 # Effective batch size = batch_size * gradient_accumulation_steps
     learning_rate: 0.0002
-    epochs: 50
+    epochs: 100
     validation_split: 0.1
     early_stopping_patience: 10
     retrain: false
     pretrained_weights_path: ""
   top:
-    batch_size: 16
-    gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
+    batch_size: 8
+    gradient_accumulation_steps: 32 # Effective batch size = batch_size * gradient_accumulation_steps
     learning_rate: 0.0002
-    epochs: 50
+    epochs: 100
     validation_split: 0.1
     early_stopping_patience: 10
-    retrain: false 
+    retrain: false
     pretrained_weights_path: ""
   save_dir: "./models/jukebox_vq_vae/"
   num_workers: 12
@@ -88,16 +99,3 @@ training:
 testing:
   specific_run_dir: null
   weights_file_choice: "best_model.pth"
-
-# Jukebox paper uses:
-# bottom: 3 downsampling blocks
-# middle: 5 downsampling blocks
-# top: 7 downsampling blocks
-# residual blocks per block: 8, 4, 4
-# dilation growth rate: 3
-# codebook size: 2048
-# commit weight: 0.02
-# EMA gamma: 0.99
-# conv channels: 32
-# residual block width: 64, 32, 32
-# raw audio 1D, not spectrogram 2D
