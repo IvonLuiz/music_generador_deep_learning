@@ -15,10 +15,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from generation.generate import *
-from utils import list_npy_files, set_global_seed, load_config, compute_dataset_variance, compute_small_sample_variance
-from jukebox_utils import extract_song_prefix
-from train_scripts.train_vqvae_utils import train_vqvae_jukebox
+from utils import set_global_seed, load_config, compute_dataset_variance, compute_small_sample_variance
 from datasets.spectrogram_dataset import LazySpectrogramDataset
+from train_scripts.train_vqvae_utils import train_vqvae_jukebox, split_train_val_paths
 from train_scripts.resume_utils import load_resume_artifacts
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -68,7 +67,7 @@ if __name__ == "__main__":
 
     # Extract parameters
     batch_size = train_cfg.get('batch_size')
-    grad_accum_steps = train_cfg.get('gradient_accumulation_steps', 1)  # Default to 1
+    grad_accum_steps = train_cfg.get('gradient_accumulation_steps', 1)
     learning_rate = train_cfg.get('learning_rate')
     epochs = train_cfg.get('epochs')
     validation_split = train_cfg.get('validation_split', 0.2)
@@ -180,36 +179,16 @@ if __name__ == "__main__":
     print(f"Computed small sample variance ({samples} samples): {data_variance:.6f}")
     gc.collect()
 
-    # Split into train/val
-    split_rng = np.random.default_rng(seed)
-    split_rng.shuffle(all_file_paths)
-    if validation_split > 0:
-        # Logic to use entire songs in either train or val set, based on filename prefixes,
-        # to prevent data leakage. Assumes files from the same song share a common prefix
-        all_files = list_npy_files(dataset_cfg['processed_path'])
-        song_prefixes = sorted(list(set([extract_song_prefix(f) for f in all_files])))
-
-        # Split prefixes (e.g., 10% validation)
-        num_val = int(len(all_file_paths) * validation_split)
-        num_train = len(all_file_paths) - num_val
-        num_val_songs = int(len(song_prefixes) * num_val / len(all_file_paths))
-        val_songs = set(song_prefixes[:num_val_songs])
-
-        # Create the final lists
-        train_file_paths = [f for f in all_files if extract_song_prefix(f) not in val_songs]
-        val_file_paths = [f for f in all_files if extract_song_prefix(f) in val_songs]
-        
-        # Instantiate Lazy Datasets
-        x_train = LazySpectrogramDataset(train_file_paths, target_time_frames=target_time_frames)
-        x_val = LazySpectrogramDataset(val_file_paths, target_time_frames=target_time_frames)
-
-        print(f"Songs: {len(song_prefixes) - num_val_songs} train, {num_val_songs} val")
-        print(f"Data split samples: {len(x_train)} training, {len(x_val)} validation.")
-    else:
-        x_train = LazySpectrogramDataset(all_file_paths, target_time_frames=target_time_frames)
-        train_file_paths = all_file_paths
-        x_val = None
-        val_file_paths = None
+    train_file_paths, val_file_paths = split_train_val_paths(
+        all_file_paths=all_file_paths,
+        dataset_cfg=dataset_cfg,
+        validation_split=validation_split,
+        target_time_frames=target_time_frames,
+        seed=seed,
+    )
+    x_train = LazySpectrogramDataset(train_file_paths, target_time_frames=target_time_frames)
+    x_val = LazySpectrogramDataset(val_file_paths, target_time_frames=target_time_frames)
+    print(f"Data split samples: {len(x_train)} training, {len(x_val)} validation.")
 
     # Load min_max_values
     with open(min_max_values_path, "rb") as f:

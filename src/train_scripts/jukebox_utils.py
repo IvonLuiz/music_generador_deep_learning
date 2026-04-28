@@ -1,5 +1,6 @@
 
 import os
+import numpy as np
 from typing import Optional, Tuple
 
 import re
@@ -8,7 +9,7 @@ import torch.nn as nn
 
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from modeling.torch.pixel_cnn_jukebox_levels import JukeboxLevelPixelCNN
-from utils import load_config
+from utils import load_config, list_npy_files
 
 LEVEL_TO_INT = {'top': 1, 'middle': 2, 'bottom': 3}
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
@@ -205,3 +206,37 @@ def load_jukebox_model(model_dir_or_file: str, level_name: str, device: torch.de
 
     model.eval()
     return model
+
+def split_train_val_paths(
+    all_file_paths: list,
+    dataset_cfg: dict,
+    validation_split: float,
+    seed: Optional[int] = None,
+):
+
+    split_rng = np.random.default_rng(seed)
+    split_rng.shuffle(all_file_paths)
+
+    if validation_split < 0 or validation_split >= 1:
+        raise ValueError(f"validation_split must be in the range [0, 1), got {validation_split}")
+    if validation_split == 0:
+        return all_file_paths, None # all data in training
+
+    # Logic to use entire songs in either train or val set, based on filename prefixes,
+    # to prevent data leakage. Assumes files from the same song share a common prefix
+    all_files = list_npy_files(dataset_cfg['processed_path'])
+    song_prefixes = sorted(list(set([extract_song_prefix(f) for f in all_files])))
+
+    # Split prefixes (e.g., 10% validation)
+    num_val = int(len(all_file_paths) * validation_split)
+    num_val_songs = int(len(song_prefixes) * num_val / len(all_file_paths))
+    val_songs = set(song_prefixes[:num_val_songs])
+
+    # Create the final lists
+    train_file_paths = [f for f in all_files if extract_song_prefix(f) not in val_songs]
+    val_file_paths = [f for f in all_files if extract_song_prefix(f) in val_songs]
+    
+    print(f"Songs: {len(song_prefixes) - num_val_songs} train, {num_val_songs} val")
+
+    return train_file_paths, val_file_paths
+

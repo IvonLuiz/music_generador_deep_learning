@@ -22,7 +22,7 @@ from datasets.jukebox_hierarchical_quantized_dataset import JukeboxHierarchicalQ
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
 from utils import set_global_seed, list_npy_files, load_config
 from callbacks import EarlyStopping
-from train_scripts.jukebox_utils import load_jukebox_model, parse_level
+from train_scripts.jukebox_utils import load_jukebox_model, parse_level, split_train_val_paths
 from train_scripts.resume_utils import load_resume_artifacts
 
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
@@ -100,6 +100,7 @@ def train_transformer_prior(
     train_cfg = {**train_general_cfg, **train_prior_cfg}  # Prior-specific settings override general settings
     transformer_cfg['selected_level'] = selected_level
     seed = int(train_cfg.get('seed', 42))
+    quant_batch_size = train_cfg.get('quantization_batch_size', 8)
     set_global_seed(seed)
 
     effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
@@ -117,25 +118,41 @@ def train_transformer_prior(
     hop_length = int(dataset_cfg.get('hop_length', 256))
     segment_overlap = float(dataset_cfg.get('segment_overlap', 0.0))
 
-    file_paths = list_npy_files(dataset_cfg['processed_path'])
-    if len(file_paths) == 0:
+    all_file_paths = list_npy_files(dataset_cfg['processed_path'])
+    if len(all_file_paths) == 0:
         raise ValueError(f"No .npy files found under dataset path: {dataset_cfg['processed_path']}")
-    print(f'Found {len(file_paths)} spectrogram files for quantization.')
+    print(f'Found {len(all_file_paths)} spectrogram files for quantization.')
     print(f'Level target time frames: {level_target_time_frames}')
 
-    quant_batch_size = train_cfg.get('quantization_batch_size', 8)
-    dataset = JukeboxHierarchicalQuantizedDataset(
-        file_paths=file_paths,
-        top_model=top_model,
-        middle_model=middle_model,
-        bottom_model=bottom_model,
-        device=device,
-        batch_size=quant_batch_size,
-        target_time_frames=target_time_frames,
-        level_target_time_frames=level_target_time_frames,
-        sample_rate=sample_rate,
-        hop_length=hop_length,
-        segment_overlap=segment_overlap,
+    train_file_paths, val_file_paths = split_train_val_paths(
+        all_file_paths=all_file_paths,
+        dataset_cfg=dataset_cfg,
+        validation_split=train_cfg.get('validation_split', 0.1),
+        seed=seed,
+    )
+
+    dataset_kwargs = {
+        "top_model": top_model,
+        "middle_model": middle_model,
+        "bottom_model": bottom_model,
+        "device": device,
+        "batch_size": quant_batch_size,
+        "target_time_frames": target_time_frames,
+        "level_target_time_frames": level_target_time_frames,
+        "sample_rate": sample_rate,
+        "hop_length": hop_length,
+        "segment_overlap": segment_overlap,
+        "target_level": selected_level, # If using the optimization we discussed
+    }
+    print(f"--- Initializing Training Dataset for {selected_level} ---")
+    train_dataset = JukeboxHierarchicalQuantizedDataset(
+        file_paths=train_file_paths,
+        **dataset_kwargs
+    )
+    print(f"--- Initializing Validation Dataset for {selected_level} ---")
+    val_dataset = JukeboxHierarchicalQuantizedDataset(
+        file_paths=val_file_paths,
+        **dataset_kwargs
     )
 
     num_embeddings_map = {
@@ -149,22 +166,22 @@ def train_transformer_prior(
         torch.cuda.empty_cache()
 
     # Grid dims: stored as (N, Time, Freq) after the transpose in the dataset.
-    top_h, top_w = dataset.top_indices.shape[-2], dataset.top_indices.shape[-1]       # Time, Freq
-    middle_h, middle_w = dataset.middle_indices.shape[-2], dataset.middle_indices.shape[-1]
-    bottom_h, bottom_w = dataset.bottom_indices.shape[-2], dataset.bottom_indices.shape[-1]
+    top_h, top_w = train_dataset.top_indices.shape[-2], train_dataset.top_indices.shape[-1]       # Time, Freq
+    middle_h, middle_w = train_dataset.middle_indices.shape[-2], train_dataset.middle_indices.shape[-1]
+    bottom_h, bottom_w = train_dataset.bottom_indices.shape[-2], train_dataset.bottom_indices.shape[-1]
     seq_lens = {
         'top': int(top_h * top_w),
         'middle': int(middle_h * middle_w),
         'bottom': int(bottom_h * bottom_w),
     }
     print(
-        f"Top indices shape: {tuple(dataset.top_indices.shape)} -> seq_len={seq_lens['top']}"
+        f"Top indices shape: {tuple(train_dataset.top_indices.shape)} -> seq_len={seq_lens['top']}"
     )
     print(
-        f"Middle indices shape: {tuple(dataset.middle_indices.shape)} -> seq_len={seq_lens['middle']}"
+        f"Middle indices shape: {tuple(train_dataset.middle_indices.shape)} -> seq_len={seq_lens['middle']}"
     )
     print(
-        f"Bottom indices shape: {tuple(dataset.bottom_indices.shape)} -> seq_len={seq_lens['bottom']}"
+        f"Bottom indices shape: {tuple(train_dataset.bottom_indices.shape)} -> seq_len={seq_lens['bottom']}"
     )
 
     # --- Temporal alignment for conditioning ---
@@ -189,6 +206,11 @@ def train_transformer_prior(
     # cond_emb[:, :seq_len, :] slice in forward() produces the SAME result as if we had
     # passed only cond_seq_len tokens — but we slice EXPLICITLY here during training so
     # the model never receives out-of-alignment conditioning.
+
+    prior_cfg = _get_prior_cfg(config, LEVEL_TO_PRIOR_CFG[selected_level])
+    cond_level = COND_LEVEL[selected_level]
+    second_cond_level = SECOND_COND_LEVEL[selected_level]
+    condition_on_top = bool(prior_cfg.get('condition_on_top', False)) and selected_level == 'bottom'
 
     _top_tf = int(level_target_time_frames.get('top', target_time_frames))
     _mid_tf = int(level_target_time_frames.get('middle', target_time_frames))
@@ -218,21 +240,8 @@ def train_transformer_prior(
     if second_cond_seq_len > 0:
         print(f"Second conditioning slice (Top→Bottom): {second_cond_time_cols} time-cols × {top_w} freq = {second_cond_seq_len} tokens")
 
-    # Split into train/val
-    split_rng = np.random.default_rng(seed)
-    split_rng.shuffle(dataset.file_paths)
-    val_split = train_cfg.get('validation_split', 0.1)
-    train_size = int((1 - val_split) * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
     train_loader = DataLoader(train_dataset, batch_size=train_cfg['batch_size'], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=train_cfg['batch_size'], shuffle=False)
-
-    prior_cfg = _get_prior_cfg(config, LEVEL_TO_PRIOR_CFG[selected_level])
-    cond_level = COND_LEVEL[selected_level]
-    second_cond_level = SECOND_COND_LEVEL[selected_level]
-    condition_on_top = bool(prior_cfg.get('condition_on_top', False)) and selected_level == 'bottom'
 
     is_upsampler = cond_level is not None
     upsample_stride = None
@@ -324,7 +333,13 @@ def train_transformer_prior(
         counter=historical_counter
     )
 
-    optimizer = optim.AdamW(prior.parameters(), lr=float(train_cfg['learning_rate']), weight_decay=float(train_cfg.get('weight_decay', 0.01)))
+    adam_beta2 = float(prior_cfg.get('adam_beta2', 0.95))
+    optimizer = optim.AdamW(
+        prior.parameters(), 
+        lr=float(train_cfg['learning_rate']), 
+        weight_decay=float(train_cfg.get('weight_decay', 0.01)),
+        betas=(0.9, adam_beta2) # jukebox paper uses default beta1 (0.9) but modified beta2
+    )
 
     if retrain and 'optimizer_state' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state'])
