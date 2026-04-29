@@ -37,7 +37,7 @@ def test_vqvae_hierarchical(model_path, n_samples=5):
     # Load Data
     min_max_values_file_path = os.path.join(MIN_MAX_VALUES_SAVE_DIR, "min_max_values.pkl")
     if not os.path.exists(min_max_values_file_path):
-        # Fallback location?
+        # Fallback location
         min_max_values_file_path = "./data/min_max_values.pkl"
         
     print(f"Loading data from {spectrograms_path}")

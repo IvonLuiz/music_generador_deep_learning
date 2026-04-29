@@ -203,8 +203,6 @@ def train_vqvae_hierarchical(
             n_mels=n_mels,
         )
 
-    best_val_loss = float('inf')
-
     for epoch in range(epochs):
         model.train()
 
