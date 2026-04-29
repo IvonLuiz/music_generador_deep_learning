@@ -1,8 +1,14 @@
+import os
+import re
+import sys
+
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
-import numpy as np
-import re
+
+# Add 'src' to sys.path so the script can be run directly from the project root.
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from train_scripts.jukebox_utils import extract_song_prefix
@@ -17,12 +23,13 @@ class JukeboxHierarchicalQuantizedDataset(Dataset):
         device: torch.device,
         x_train: np.ndarray = None,
         file_paths: list = None,
-        batch_size: int = 32,
+        batch_size: int = 1,
         target_time_frames: int = 2048,
         level_target_time_frames: dict = {},
         sample_rate: int = 22050,
         hop_length: int = 256,
         segment_overlap: float = 0.0,
+        target_level: str = 'top',
     ):
         """!
         @brief Build a quantized hierarchical dataset by pre-encoding spectrograms with
@@ -286,3 +293,58 @@ class JukeboxHierarchicalQuantizedDataset(Dataset):
         sample = [self.indices[lvl][idx].long() for lvl in self.levels]
         sample.append(self.timing[idx])
         return sample
+
+    @property
+    def top_indices(self):
+        return self.indices.get('top')
+
+    @property
+    def middle_indices(self):
+        return self.indices.get('middle')
+
+    @property
+    def bottom_indices(self):
+        return self.indices.get('bottom')
+
+
+if __name__ == "__main__":
+    # Example usage (requires actual VQ-VAE models and spectrogram files):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    top_model = JukeboxVQVAE(hidden_dim=1024, levels=3, input_channels=1)
+    middle_model = JukeboxVQVAE(hidden_dim=1024, levels=2, input_channels=1)
+    bottom_model = JukeboxVQVAE(hidden_dim=1024, levels=1, input_channels=1)
+    dataset = JukeboxHierarchicalQuantizedDataset(
+        top_model=top_model,
+        middle_model=middle_model,
+        bottom_model=bottom_model,
+        device=device,
+        file_paths=[
+            'data/processed/maestro/MIDI-Unprocessed_01_R1_2006_01-09_ORIG_MID--AUDIO_01_R1_2006_01_Track01_wav.wav_segment_000.npy',
+            'data/processed/maestro/MIDI-Unprocessed_01_R1_2006_01-09_ORIG_MID--AUDIO_01_R1_2006_01_Track01_wav.wav_segment_005.npy',
+            'data/processed/maestro/MIDI-Unprocessed_01_R1_2006_01-09_ORIG_MID--AUDIO_01_R1_2006_01_Track01_wav.wav_segment_006.npy',
+        ],
+        target_time_frames=2048,
+        level_target_time_frames={'top': 2048, 'middle': 512, 'bottom': 128},
+        sample_rate=22050,
+        hop_length=256,
+        segment_overlap=0.5,
+        target_level='top'
+    )
+
+    print(f"Dataset length: {len(dataset)}")
+    sample_1 = dataset[0]
+    sample_2 = dataset[1]
+    sample_3 = dataset[2]
+    print(f"Sample shapes: {[s.shape for s in sample_1[:-1]]}, Timing shape: {sample_1[-1].shape}")
+    
+    # Test timing
+    print(f"Timing info sample 1 (start_time_s, total_duration_s, fraction_elapsed): {sample_1[-1].tolist()}")
+    print(f"Timing info sample 2  (start_time_s, total_duration_s, fraction_elapsed): {sample_2[-1].tolist()}")
+    print(f"Timing info sample 3 (start_time_s, total_duration_s, fraction_elapsed): {sample_3[-1].tolist()}")
+    assert sample_1[-1].shape == (3,), "Timing info should have shape (3,)"
+    assert sample_2[-1][1] == sample_1[-1][1], "Total durations should match for samples from the same song"
+    assert sample_1[-1][0] == 0.0, "First sample should start at 0s"
+    assert sample_2[-1][0] > 0.0, "Second sample should have a positive start time"
+    assert sample_1[-1][2] == 0.0, "First sample should have fraction_elapsed 0.0"
+    assert sample_2[-1][2] > 0.0, "Second sample should have fraction_elapsed > 0.0"
+    assert sample_3[-1][2] == 1.0, "Third sample should have fraction_elapsed 1.0 (last segment of the song)"
