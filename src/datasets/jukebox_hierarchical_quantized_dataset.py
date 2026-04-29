@@ -116,34 +116,35 @@ class JukeboxHierarchicalQuantizedDataset(Dataset):
         hop_samples = max(1, int(segment_samples * (1.0 - float(segment_overlap))))
         hop_duration_s = hop_samples / sample_rate
 
-        # First pass: group file paths by song prefix to count segments per song and find max segment index
-        song_segment_max: dict = {}   # song_prefix -> max segment index seen
-        file_seg_info: list = []      # (seg_idx, song_prefix_or_None) per sample
-        for fp in self.file_paths:
-            if fp is None:
-                file_seg_info.append((0, None))
-                continue
-            try:
-                seg_idx = self._extract_time_id_from_path(fp)
-                prefix = extract_song_prefix(fp)
-                file_seg_info.append((seg_idx, prefix))
-                song_segment_max[prefix] = max(song_segment_max.get(prefix, -1), seg_idx)
-            except ValueError:
-                file_seg_info.append((0, None))
+        raw_timing_info = [
+            (self._extract_time_id_from_path(fp), extract_song_prefix(fp)) 
+            if fp is not None else (0, "__none__") 
+            for fp in self.file_paths
+        ]
+        seg_indices = np.array([x[0] for x in raw_timing_info])
+        prefixes = np.array([x[1] for x in raw_timing_info])
 
-        # Second pass: build the timing tensor
-        timing_list: list = []      # per-sample timing info [start_time_s, total_song_duration_s, fraction_elapsed]
-        for seg_idx, prefix in file_seg_info:
-            if prefix is None:
-                timing_list.append([0.0, segment_duration_s, 0.0])
-            else:
-                num_segs = song_segment_max[prefix] + 1
-                start_time_s = seg_idx * hop_duration_s
-                total_duration_s = (num_segs - 1) * hop_duration_s + segment_duration_s
-                fraction_elapsed = seg_idx / max(num_segs - 1, 1) if num_segs > 1 else 0.0
-                timing_list.append([start_time_s, total_duration_s, fraction_elapsed])
+        # Map each unique prefix to its max segment index
+        unique_prefixes, inverse_indices = np.unique(prefixes, return_inverse=True)
+        max_indices_per_prefix = np.zeros_like(unique_prefixes, dtype=int)
+        np.maximum.at(max_indices_per_prefix, inverse_indices, seg_indices)
+        num_segs_per_sample = max_indices_per_prefix[inverse_indices] + 1
+        
+        # Calculate timing matrix
+        start_times = seg_indices * hop_duration_s
+        total_durations = (num_segs_per_sample - 1) * hop_duration_s + segment_duration_s
+        denominators = np.maximum(num_segs_per_sample - 1, 1)   # avoiding div by zero
+        fractions = seg_indices / denominators
 
-        self.timing = torch.tensor(timing_list, dtype=torch.float32)
+        # Handle the "__none__" special case
+        none_mask = (prefixes == "__none__")
+        start_times[none_mask] = 0.0
+        total_durations[none_mask] = segment_duration_s
+        fractions[none_mask] = 0.0
+        
+        # Combine into (N, 3) tensor
+        timing_np = np.stack([start_times, total_durations, fractions], axis=1)
+        self.timing = torch.from_numpy(timing_np).float()
 
     def _compute_indices_with_auto_batching(
         self,
@@ -223,12 +224,6 @@ class JukeboxHierarchicalQuantizedDataset(Dataset):
             # loop so every block_len consecutive tokens span one time step of the 2D grid.
             self.indices[lvl] = torch.cat(self.indices[lvl], dim=0).transpose(1, 2).contiguous()
             print(f"{lvl.capitalize()} indices shape: {tuple(self.indices[lvl].shape)}")
-
-
-        print(f"Top indices shape:    {tuple(self.indices['top'].shape)}")
-        print(f"Middle indices shape: {tuple(self.indices['middle'].shape)}")
-        print(f"Bottom indices shape: {tuple(self.indices['bottom'].shape)}")
-        print(f"Timing shape:         {tuple(self.timing.shape)}")
 
     def _load_spectrogram_batch(self, paths: list) -> np.ndarray:
         """!
