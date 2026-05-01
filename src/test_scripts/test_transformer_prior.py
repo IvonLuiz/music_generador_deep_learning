@@ -40,13 +40,6 @@ def _extract_num_embeddings(state_dict: dict) -> int:
     raise KeyError('Could not infer num_embeddings from checkpoint state_dict')
 
 
-def _extract_time_embedding_steps(state_dict: dict) -> Optional[int]:
-    for key in ('time_embedding.weight', 'time_embedding.weight_orig'):
-        if key in state_dict:
-            return int(state_dict[key].shape[0])
-    return None
-
-
 def _extract_cond_num_embeddings(state_dict: dict) -> Optional[int]:
     for key in ('conditioner.token_embedding.weight', 'conditioner.token_embedding.weight_orig'):
         if key in state_dict:
@@ -149,10 +142,10 @@ def load_transformer_prior(
         elif token_vocab == output_vocab:
             use_bos_token = False
 
-    inferred_time_steps = _extract_time_embedding_steps(state_dict)
     max_time_steps_cfg = int(prior_cfg.get('max_time_steps', 0))
-    max_time_steps = inferred_time_steps if inferred_time_steps is not None else (max_time_steps_cfg if max_time_steps_cfg > 0 else 100)
-    
+    max_time_steps = max_time_steps_cfg if max_time_steps_cfg > 0 else 100
+
+
     cond_num_embeddings = None
     upsample_stride = None
     second_cond_num_embeddings = None
@@ -270,17 +263,17 @@ def _save_indices(indices: np.ndarray, save_dir: str, name: str, grid: Optional[
             plt.close()
 
 
-def _decode_bottom_indices(
+def _decode_indices(
     vqvae,
     indices: torch.Tensor,
     grid: Optional[list],
 ) -> np.ndarray:
     """
-    Decode bottom-level VQ-VAE indices into spectrograms.
+    Decode VQ-VAE indices into spectrograms.
 
     @param vqvae: Loaded JukeboxVQVAE model.
     @param indices: numpy array of shape (B, T) with integer token indices.
-    @param grid: [time_steps, freq_bins] matching the bottom level grid.
+    @param grid: [time_steps, freq_bins] matching the selected level grid.
     @return: numpy array of shape (B, H, W, 1) decoded spectrograms.
     """
     if indices.ndim != 2:
@@ -320,7 +313,8 @@ def test_transformer_prior(
     temperature: float,
     top_k: int,
     weights_file: str,
-    time_ids: Optional[torch.Tensor] = None,
+    decode_level: str = 'bottom',
+    timing: Optional[torch.Tensor] = None,
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     top_k_value = top_k if (top_k is not None and top_k > 0) else None
@@ -342,9 +336,30 @@ def test_transformer_prior(
     bottom_prior_cfg = bottom_config.get('priors', {}).get('bottom_prior', {}) if isinstance(bottom_config, dict) else {}
     bottom_condition_on_top = bool(bottom_prior_cfg.get('condition_on_top', True))
 
-    # Top-level prior generation
-    if time_ids is None:
-        time_ids=torch.zeros((num_samples, 1), dtype=torch.long, device=device)
+    vqvae_cfg = bottom_config.get('vqvae', {}) if isinstance(bottom_config, dict) else {}
+    effective_bottom_vqvae = bottom_vqvae_path or vqvae_cfg.get('bottom_model_dir')
+    effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
+
+    # Default timing: start of a segment-length clip (fraction_elapsed=0, start_time=0).
+    # total_duration is estimated from the bottom level's VQ-VAE segment length.
+    if timing is None:
+        dataset_cfg = bottom_config.get('dataset', {}) if isinstance(bottom_config, dict) else {}
+        if effective_bottom_vqvae:
+            vqvae_config_path = resolve_vqvae_config_path(effective_bottom_vqvae)
+            vqvae_config = load_config(vqvae_config_path)
+            dataset_cfg = vqvae_config.get('dataset', dataset_cfg) if isinstance(vqvae_config, dict) else dataset_cfg
+
+        target_time_frames = int(dataset_cfg.get('target_time_frames', 2048))
+        hop_length = int(dataset_cfg.get('hop_length', 256))
+        sample_rate = int(dataset_cfg.get('sample_rate', 22050))
+        segment_overlap = float(dataset_cfg.get('segment_overlap', 0.0))
+
+        segment_samples = max(1, (target_time_frames - 1) * hop_length)
+        segment_duration_s = segment_samples / sample_rate
+        hop_samples = max(1, int(segment_samples * (1.0 - segment_overlap)))
+        total_duration_s = segment_duration_s
+        timing = torch.zeros((num_samples, 3), dtype=torch.float32, device=device)
+        timing[:, 1] = total_duration_s
 
     print(f'Generating top-level indices...')
     with torch.no_grad():
@@ -355,7 +370,7 @@ def test_transformer_prior(
             temperature=temperature,
             top_k=top_k_value,
             device=device,
-            time_id=time_ids,
+            timing=timing,
         )
 
     print(f'Generating middle-level indices...')
@@ -368,7 +383,7 @@ def test_transformer_prior(
             temperature=temperature,
             top_k=top_k_value,
             device=device,
-            time_id=time_ids,
+            timing=timing,
         )
 
     print(f'Generating bottom-level indices...')
@@ -382,11 +397,11 @@ def test_transformer_prior(
             temperature=temperature,
             top_k=top_k_value,
             device=device,
-            time_id=time_ids,
+            timing=timing,
         )
 
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    save_dir = os.path.join('samples', 'transformer_prior_backing_tracks', current_time)
+    save_dir = os.path.join('samples', 'transformer_prior_maestro', current_time)
     os.makedirs(save_dir, exist_ok=True)
 
     _save_indices(top_tokens.cpu().numpy().astype(np.int64), save_dir, 'top', top_grid)
@@ -397,13 +412,29 @@ def test_transformer_prior(
     del top_prior, middle_prior, bottom_prior
     torch.cuda.empty_cache()
 
-    vqvae_cfg = bottom_config.get('vqvae', {}) if isinstance(bottom_config, dict) else {}
-    effective_bottom_vqvae = bottom_vqvae_path or vqvae_cfg.get('bottom_model_dir')
-    effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
-    if not effective_bottom_vqvae:
-        raise ValueError('Bottom VQ-VAE path is required. Provide --bottom_vqvae or set vqvae.bottom_model_dir in Transformer config.')
+    decode_level = str(decode_level).strip().lower()
+    if decode_level not in ('bottom', 'middle', 'top'):
+        raise ValueError(f'--decode_level must be one of "bottom", "middle", "top", got {decode_level}')
 
-    vqvae_config_path = resolve_vqvae_config_path(effective_bottom_vqvae)
+    if decode_level == 'bottom':
+        decode_tokens = bottom_tokens
+        decode_grid = bottom_grid
+        effective_decode_vqvae = effective_bottom_vqvae
+    elif decode_level == 'middle':
+        decode_tokens = middle_tokens
+        decode_grid = middle_grid
+        effective_decode_vqvae = vqvae_cfg.get('middle_model_dir')
+    else:
+        decode_tokens = top_tokens
+        decode_grid = top_grid
+        effective_decode_vqvae = vqvae_cfg.get('top_model_dir')
+
+    if not effective_decode_vqvae:
+        raise ValueError(
+            f'{decode_level} VQ-VAE path is required. Update vqvae.{decode_level}_model_dir in Transformer config.'
+        )
+
+    vqvae_config_path = resolve_vqvae_config_path(effective_decode_vqvae)
     vqvae_config = load_config(vqvae_config_path)
     resolved_dataset_cfg = vqvae_config.get('dataset', {}) if isinstance(vqvae_config, dict) else {}
 
@@ -421,9 +452,9 @@ def test_transformer_prior(
     )
     n_mels = int(resolved_dataset_cfg.get('n_mels', N_MELS))
 
-    if effective_bottom_vqvae is not None:
-        print(f'Loading bottom VQ-VAE from {effective_bottom_vqvae}')
-        vqvae = load_jukebox_model(effective_bottom_vqvae, 'bottom', device, effective_weights_file)
+    if effective_decode_vqvae is not None:
+        print(f'Loading {decode_level} VQ-VAE from {effective_decode_vqvae}')
+        vqvae = load_jukebox_model(effective_decode_vqvae, decode_level, device, effective_weights_file)
 
         if not os.path.exists(min_max_values_path):
             raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
@@ -431,7 +462,7 @@ def test_transformer_prior(
         with open(min_max_values_path, 'rb') as f:
             min_max_values = pickle.load(f)
 
-        decoded_specs = _decode_bottom_indices(vqvae, bottom_tokens, bottom_grid)
+        decoded_specs = _decode_indices(vqvae, decode_tokens, decode_grid)
         save_decoded_spectrograms(decoded_specs, save_dir)
         min_max_list = prepare_min_max_values(min_max_values, decoded_specs.shape[0])
 
@@ -467,6 +498,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_samples', type=int, default=6, help='Number of samples to generate (default: 6)')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (default: 1.0)')
     parser.add_argument('--top_k', type=int, default=None, help='Top-k filtering for sampling (0 or negative for no filtering)')
+    parser.add_argument('--decode_level', type=str, default='bottom', choices=['bottom', 'middle', 'top'], help='Which level to decode to audio (default: bottom)')
     args = parser.parse_args()
 
     if args.temperature <= 0:
@@ -487,4 +519,5 @@ if __name__ == '__main__':
         temperature=args.temperature,
         top_k=args.top_k,
         weights_file=args.weights_file,
+        decode_level=args.decode_level,
     )
