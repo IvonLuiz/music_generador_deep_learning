@@ -18,11 +18,11 @@ import matplotlib.pyplot as plt
 # Add 'src' to sys.path to allow imports from sibling directories
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from datasets.jukebox_hierarchical_quantized_dataset import JukeboxHierarchicalQuantizedDataset
+from datasets.jukebox_precomputed_hierarchical_dataset import JukeboxQuantizedDataset
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
 from utils import set_global_seed, list_npy_files, load_config
 from callbacks import EarlyStopping
-from train_scripts.jukebox_utils import load_jukebox_model, parse_level, split_train_val_paths
+from train_scripts.jukebox_utils import parse_level, split_train_val_paths
 from train_scripts.resume_utils import load_resume_artifacts
 
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
@@ -65,27 +65,9 @@ def _compute_stride(lower_len: int, upper_len: int, level_name: str) -> int:
     return lower_len // upper_len
 
 
-def _resolve_vqvae_config_path(model_dir_or_file: Optional[str]) -> Optional[str]:
-    if not model_dir_or_file:
-        return None
-    if os.path.isdir(model_dir_or_file):
-        cfg = os.path.join(model_dir_or_file, 'config.yaml')
-        return cfg if os.path.exists(cfg) else None
-    if os.path.isfile(model_dir_or_file):
-        name = os.path.basename(model_dir_or_file).lower()
-        if name in ('config.yaml', 'config.yml'):
-            return model_dir_or_file
-        cfg = os.path.join(os.path.dirname(model_dir_or_file), 'config.yaml')
-        return cfg if os.path.exists(cfg) else None
-    return None
-
 def train_transformer_prior(
     config_path: str,
     level_override: Optional[str] = None,
-    top_model_dir: Optional[str] = None,
-    middle_model_dir: Optional[str] = None,
-    bottom_model_dir: Optional[str] = None,
-    weights_file: Optional[str] = None,
 ):
     config = load_config(config_path)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -100,23 +82,17 @@ def train_transformer_prior(
     train_cfg = {**train_general_cfg, **train_prior_cfg}  # Prior-specific settings override general settings
     transformer_cfg['selected_level'] = selected_level
     seed = int(train_cfg.get('seed', 42))
-    quant_batch_size = train_cfg.get('quantization_batch_size', 8)
     set_global_seed(seed)
-
-    effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
-    effective_top_model_dir = top_model_dir or vqvae_cfg['top_model_dir']
-    effective_middle_model_dir = middle_model_dir or vqvae_cfg['middle_model_dir']
-    effective_bottom_model_dir = bottom_model_dir or vqvae_cfg['bottom_model_dir']
-
-    top_model = load_jukebox_model(effective_top_model_dir, 'top', device, effective_weights_file)
-    middle_model = load_jukebox_model(effective_middle_model_dir, 'middle', device, effective_weights_file)
-    bottom_model = load_jukebox_model(effective_bottom_model_dir, 'bottom', device, effective_weights_file)
 
     target_time_frames = int(dataset_cfg.get('target_time_frames', 2048))
     level_target_time_frames = dataset_cfg.get('level_target_time_frames') or {}
+    quantized_data_path = dataset_cfg.get('quantized_data_path', './data/processed/maestro_quantized/')
     sample_rate = int(dataset_cfg.get('sample_rate', 22050))
     hop_length = int(dataset_cfg.get('hop_length', 256))
     segment_overlap = float(dataset_cfg.get('segment_overlap', 0.0))
+    
+    # Codebook size: use explicit config value or sensible default (Jukebox uses 2048)
+    vqvae_codebook_size = int(vqvae_cfg.get('codebook_size', 2048))
 
     all_file_paths = list_npy_files(dataset_cfg['processed_path'])
     if len(all_file_paths) == 0:
@@ -130,88 +106,52 @@ def train_transformer_prior(
         validation_split=train_cfg.get('validation_split', 0.1),
         seed=seed,
     )
+    train_file_paths=train_file_paths[:64]  # --- TEMPORARY LIMIT FOR TESTING ---
+    val_file_paths=val_file_paths[:]       # --- TEMPORARY LIMIT FOR
 
-    dataset_kwargs = {
-        "top_model": top_model,
-        "middle_model": middle_model,
-        "bottom_model": bottom_model,
-        "device": device,
-        "batch_size": quant_batch_size,
-        "target_time_frames": target_time_frames,
-        "level_target_time_frames": level_target_time_frames,
-        "sample_rate": sample_rate,
-        "hop_length": hop_length,
-        "segment_overlap": segment_overlap,
-        "target_level": selected_level, # If using the optimization we discussed
-    }
-    print(f"--- Initializing Training Dataset for {selected_level} ---")
-    train_dataset = JukeboxHierarchicalQuantizedDataset(
+    # Load precomputed quantized dataset
+    print(f"--- Loading Precomputed Quantized Dataset for {selected_level} ---")
+    train_dataset = JukeboxQuantizedDataset(
+        quantized_path=quantized_data_path,
         file_paths=train_file_paths,
-        **dataset_kwargs
+        target_time_frames=target_time_frames,
     )
     train_loader = DataLoader(train_dataset, batch_size=train_cfg['batch_size'], shuffle=True)
     val_loader = None
     if val_file_paths:
-        print(f"--- Initializing Validation Dataset for {selected_level} ---")
-        val_dataset = JukeboxHierarchicalQuantizedDataset(
+        print(f"--- Loading Precomputed Validation Dataset for {selected_level} ---")
+        val_dataset = JukeboxQuantizedDataset(
+            quantized_path=quantized_data_path,
             file_paths=val_file_paths,
-            **dataset_kwargs
+            target_time_frames=target_time_frames,
         )
         val_loader = DataLoader(val_dataset, batch_size=train_cfg['batch_size'], shuffle=False)
 
-
+    # Use explicit codebook size (not inferred from data, which may have smaller max token)
     num_embeddings_map = {
-        'top': int(top_model.vq.num_embeddings),
-        'middle': int(middle_model.vq.num_embeddings),
-        'bottom': int(bottom_model.vq.num_embeddings),
+        'top': vqvae_codebook_size,
+        'middle': vqvae_codebook_size,
+        'bottom': vqvae_codebook_size,
     }
+    print(f"Using codebook size: {vqvae_codebook_size}")
 
-    del top_model, middle_model, bottom_model
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
+    sample = train_dataset[0]
+    top_indices, middle_indices, bottom_indices, timing, sample_meta = sample
+    top_rows, top_cols = top_indices.shape
+    middle_rows, middle_cols = (middle_indices.shape if middle_indices.numel() > 0 else (0, 0))
+    bottom_rows, bottom_cols = (bottom_indices.shape if bottom_indices.numel() > 0 else (0, 0))
 
-    # Grid dims: stored as (N, Time, Freq) after the transpose in the dataset.
-    top_h, top_w = train_dataset.top_indices.shape[-2], train_dataset.top_indices.shape[-1]       # Time, Freq
-    middle_h, middle_w = train_dataset.middle_indices.shape[-2], train_dataset.middle_indices.shape[-1]
-    bottom_h, bottom_w = train_dataset.bottom_indices.shape[-2], train_dataset.bottom_indices.shape[-1]
-    seq_lens = {
-        'top': int(top_h * top_w),
-        'middle': int(middle_h * middle_w),
-        'bottom': int(bottom_h * bottom_w),
-    }
-    print(
-        f"Top indices shape: {tuple(train_dataset.top_indices.shape)} -> seq_len={seq_lens['top']}"
-    )
-    print(
-        f"Middle indices shape: {tuple(train_dataset.middle_indices.shape)} -> seq_len={seq_lens['middle']}"
-    )
-    print(
-        f"Bottom indices shape: {tuple(train_dataset.bottom_indices.shape)} -> seq_len={seq_lens['bottom']}"
-    )
+    target_tensor = top_indices if selected_level == 'top' else middle_indices if selected_level == 'middle' else bottom_indices
+    target_seq_len = int(target_tensor.numel())
+    seq_lens = {'top': target_seq_len, 'middle': target_seq_len, 'bottom': target_seq_len}
+
+    print(f"Top grid shape: {tuple(top_indices.shape)}")
+    print(f"Middle grid shape: {tuple(middle_indices.shape)}")
+    print(f"Bottom grid shape: {tuple(bottom_indices.shape)}")
 
     # --- Temporal alignment for conditioning ---
-    # Each upsampler trains on a SHORT window of the target level, conditioned on the
-    # corresponding SLICE of the upper level that covers exactly the same audio.
-    # The slice is always the first cond_time_cols time-columns of the upper grid.
-    #
-    #   Middle conditioned on Top slice:
-    #     cond_time_cols = top_h * (mid_tf / top_tf)    e.g. 64 * (512/2048) = 16
-    #     cond_seq_len   = cond_time_cols * top_w        e.g. 16 * 8 = 128 → stride 512/128 = 4
-    #
-    #   Bottom conditioned on Middle slice (primary):
-    #     cond_time_cols = mid_h * (bot_tf / mid_tf)    e.g. 32 * (128/512) = 8
-    #     cond_seq_len   = cond_time_cols * mid_w        e.g. 8 * 16 = 128 → stride 512/128 = 4
-    #
-    #   Bottom conditioned on Top slice (secondary):
-    #     second_cond_time_cols = top_h * (bot_tf / top_tf)  e.g. 64 * (128/2048) = 4
-    #     second_cond_seq_len   = second_cond_time_cols * top_w  e.g. 4 * 8 = 32 → stride 512/32 = 16
-    #
-    # Note: because ConvTranspose1d(kernel_size=stride) maps input token i to output
-    # tokens [i*stride, (i+1)*stride), the WaveNetConditioner's existing
-    # cond_emb[:, :seq_len, :] slice in forward() produces the SAME result as if we had
-    # passed only cond_seq_len tokens — but we slice EXPLICITLY here during training so
-    # the model never receives out-of-alignment conditioning.
-
+    # Each upsampler trains on a window of the target level, conditioned on the
+    # matching slice of the upper level that covers the same audio span.
     prior_cfg = _get_prior_cfg(config, LEVEL_TO_PRIOR_CFG[selected_level])
     cond_level = COND_LEVEL[selected_level]
     second_cond_level = SECOND_COND_LEVEL[selected_level]
@@ -221,29 +161,29 @@ def train_transformer_prior(
     _mid_tf = int(level_target_time_frames.get('middle', target_time_frames))
     _bot_tf = int(level_target_time_frames.get('bottom', target_time_frames))
 
-    cond_time_cols: int = 0
-    second_cond_time_cols: int = 0
-    cond_seq_len: int = 0
-    second_cond_seq_len: int = 0
-    cond_grid_h: int = 0
-    cond_grid_w: int = 0
+    cond_time_cols = 0
+    second_cond_time_cols = 0
+    cond_seq_len = 0
+    second_cond_seq_len = 0
+    cond_grid_h = 0
+    cond_grid_w = 0
 
     if selected_level == 'middle':
-        cond_time_cols = round(top_h * _mid_tf / _top_tf)
-        cond_grid_h, cond_grid_w = top_h, top_w
-        cond_seq_len = cond_time_cols * top_w
+        cond_time_cols = max(1, round(top_rows * _mid_tf / _top_tf))
+        cond_grid_h, cond_grid_w = top_rows, top_cols
+        cond_seq_len = cond_time_cols * top_cols
     elif selected_level == 'bottom':
-        cond_time_cols = round(middle_h * _bot_tf / _mid_tf)
-        cond_grid_h, cond_grid_w = middle_h, middle_w
-        cond_seq_len = cond_time_cols * middle_w
+        cond_time_cols = max(1, round(middle_rows * _bot_tf / _mid_tf))
+        cond_grid_h, cond_grid_w = middle_rows, middle_cols
+        cond_seq_len = cond_time_cols * middle_cols
         if condition_on_top:
-            second_cond_time_cols = round(top_h * _bot_tf / _top_tf)
-            second_cond_seq_len = second_cond_time_cols * top_w
+            second_cond_time_cols = max(1, round(top_rows * _bot_tf / _top_tf))
+            second_cond_seq_len = second_cond_time_cols * top_cols
 
     if cond_seq_len > 0:
         print(f"Conditioning slice for {selected_level}: {cond_time_cols} time-cols × {cond_grid_w} freq = {cond_seq_len} tokens")
     if second_cond_seq_len > 0:
-        print(f"Second conditioning slice (Top→Bottom): {second_cond_time_cols} time-cols × {top_w} freq = {second_cond_seq_len} tokens")
+        print(f"Second conditioning slice (Top→Bottom): {second_cond_time_cols} time-cols × {top_cols} freq = {second_cond_seq_len} tokens")
 
     is_upsampler = cond_level is not None
     upsample_stride = None
@@ -252,12 +192,10 @@ def train_transformer_prior(
     second_cond_num_embeddings = None
     if is_upsampler:
         cond_num_embeddings = num_embeddings_map[cond_level]
-        # Stride is computed from the SLICED conditioning length, not the full upper seq_len.
-        # With equal seq_lens (all 512) the old full-seq computation would yield stride=1.
-        upsample_stride = _compute_stride(seq_lens[selected_level], cond_seq_len, selected_level)
+        upsample_stride = _compute_stride(target_seq_len, cond_seq_len, selected_level)
     if condition_on_top and second_cond_level is not None:
         second_cond_num_embeddings = num_embeddings_map[second_cond_level]
-        second_upsample_stride = _compute_stride(seq_lens[selected_level], second_cond_seq_len, selected_level)
+        second_upsample_stride = _compute_stride(target_seq_len, second_cond_seq_len, selected_level)
 
     max_time_steps = int(prior_cfg.get('max_time_steps', 500))
 
@@ -267,7 +205,7 @@ def train_transformer_prior(
         num_heads=int(prior_cfg['num_heads']),
         num_layers=int(prior_cfg['num_layers']),
         dim_feedforward=int(prior_cfg['dim_feedforward']),
-        max_seq_len=seq_lens[selected_level],
+        max_seq_len=target_seq_len,
         block_len=int(prior_cfg.get('block_len', 16)),
         max_time_steps=max_time_steps,
         is_upsampler=is_upsampler,
@@ -297,7 +235,11 @@ def train_transformer_prior(
     if retrain:
         if not pretrained_weights_path:
             raise ValueError("training.retrain is true but training.pretrained_weights_path is empty.")
-        resume_history, initial_best_metric, checkpoint = load_resume_artifacts(pretrained_weights_path, val_key='val_loss', train_key='train_loss')
+        resume_history, initial_best_metric, checkpoint = load_resume_artifacts(
+            pretrained_weights_path,
+            val_key='val_loss',
+            train_key='train_loss',
+        )
         print(f"Retraining enabled from checkpoint: {pretrained_weights_path}")
         if initial_best_metric is not None:
             print(f"Baseline best metric from previous training: {initial_best_metric:.6f}")
@@ -389,25 +331,9 @@ def train_transformer_prior(
     os.makedirs(run_dir, exist_ok=True)
 
     config_to_save = dict(config)
-    config_to_save['vqvae'] = dict(config['vqvae'])
-    config_to_save['vqvae']['top_model_dir'] = effective_top_model_dir
-    config_to_save['vqvae']['middle_model_dir'] = effective_middle_model_dir
-    config_to_save['vqvae']['bottom_model_dir'] = effective_bottom_model_dir
-    config_to_save['vqvae']['weights_file'] = effective_weights_file
+    config_to_save['vqvae'] = dict(config.get('vqvae', {}))
 
-    bottom_vqvae_cfg_path = _resolve_vqvae_config_path(effective_bottom_model_dir)
     bottom_vqvae_dataset_cfg = {}
-    if bottom_vqvae_cfg_path is not None:
-        try:
-            bottom_vqvae_cfg = load_config(bottom_vqvae_cfg_path)
-            if isinstance(bottom_vqvae_cfg, dict):
-                bottom_vqvae_dataset_cfg = dict(bottom_vqvae_cfg.get('dataset', {}))
-        except (FileNotFoundError, OSError, yaml.YAMLError, ValueError) as exc:
-            print(
-                f"Warning: failed to load bottom VQ-VAE config from {bottom_vqvae_cfg_path}: {exc}",
-                file=sys.stderr,
-            )
-
     existing_dataset_cfg = dict(config.get('dataset', {}))
     merged_dataset_cfg = dict(bottom_vqvae_dataset_cfg)
     merged_dataset_cfg.update(existing_dataset_cfg)
@@ -417,9 +343,9 @@ def train_transformer_prior(
     config_to_save['model']['selected_level'] = selected_level
     config_to_save['model']['inferred_seq_lens'] = dict(seq_lens)
     config_to_save['model']['inferred_grids'] = {
-        'top': [int(top_h), int(top_w)],
-        'middle': [int(middle_h), int(middle_w)],
-        'bottom': [int(bottom_h), int(bottom_w)],
+        'top': [int(top_rows), int(top_cols)],
+        'middle': [int(middle_rows), int(middle_cols)],
+        'bottom': [int(bottom_rows), int(bottom_cols)],
     }
     config_to_save['model']['use_bos_token'] = bool(prior_cfg.get('use_bos_token', False))
     config_to_save['model']['max_time_steps'] = int(max_time_steps)
@@ -464,35 +390,21 @@ def train_transformer_prior(
             mid_indices = batch[1].to(device)
             bot_indices = batch[2].to(device)
             timing = batch[3].to(device)  # (B, 3): [start_time_s, total_duration_s, fraction_elapsed]
+            meta = batch[4].to(device) if len(batch) > 4 else torch.zeros((top_indices.shape[0], 2), device=device, dtype=torch.long)
 
+            cond_seq = None
+            second_cond_seq = None
             if selected_level == 'top':
                 target_indices = top_indices
-                cond_indices = None
-                second_cond_indices = None
             elif selected_level == 'middle':
                 target_indices = mid_indices
-                cond_indices = top_indices
-                second_cond_indices = None
-            else:
+                cond_seq = top_indices.view(top_indices.shape[0], -1) # condition on the aligned slice of Top (already handled by Dataset)
+            else: # bottom
                 target_indices = bot_indices
-                cond_indices = mid_indices
-                second_cond_indices = top_indices if condition_on_top else None
+                cond_seq = mid_indices.view(mid_indices.shape[0], -1)
+                second_cond_seq = top_indices.view(top_indices.shape[0], -1)
 
-            target_seq = target_indices.view(target_indices.shape[0], -1)
-
-            # Slice upper-level conditioning to the temporally-aligned window.
-            # Stored grids are (B, Time, Freq); we keep the first cond_time_cols time-steps.
-            if cond_indices is not None:
-                B = cond_indices.shape[0]
-                cond_seq = cond_indices.view(B, cond_grid_h, cond_grid_w)[:, :cond_time_cols, :].reshape(B, -1)
-            else:
-                cond_seq = None
-
-            if second_cond_indices is not None:
-                B = second_cond_indices.shape[0]
-                second_cond_seq = second_cond_indices.view(B, top_h, top_w)[:, :second_cond_time_cols, :].reshape(B, -1)
-            else:
-                second_cond_seq = None
+            target_seq = target_indices.view(target_indices.shape[0], -1)   # flatten the target grid for loss
 
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
@@ -534,33 +446,26 @@ def train_transformer_prior(
                     mid_indices = batch[1].to(device)
                     bot_indices = batch[2].to(device)
                     timing = batch[3].to(device)
+                    meta = batch[4].to(device) if len(batch) > 4 else torch.zeros((top_indices.shape[0], 2), device=device, dtype=torch.long)
 
+                    # Flatten 2D grids (Time, Freq) into 1D sequences (Time*Freq = 512)
+                    top_seq = top_indices.view(top_indices.shape[0], -1)
+                    mid_seq = mid_indices.view(mid_indices.shape[0], -1)
+                    bot_seq = bot_indices.view(bot_indices.shape[0], -1)
+
+                    cond_seq = None
+                    second_cond_seq = None
                     if selected_level == 'top':
-                        target_indices = top_indices
-                        cond_indices = None
-                        second_cond_indices = None
+                        target_seq = top_seq
                     elif selected_level == 'middle':
-                        target_indices = mid_indices
-                        cond_indices = top_indices
-                        second_cond_indices = None
-                    else:
-                        target_indices = bot_indices
-                        cond_indices = mid_indices
-                        second_cond_indices = top_indices if condition_on_top else None
-
-                    target_seq = target_indices.view(target_indices.shape[0], -1)
-
-                    if cond_indices is not None:
-                        B = cond_indices.shape[0]
-                        cond_seq = cond_indices.view(B, cond_grid_h, cond_grid_w)[:, :cond_time_cols, :].reshape(B, -1)
-                    else:
-                        cond_seq = None
-
-                    if second_cond_indices is not None:
-                        B = second_cond_indices.shape[0]
-                        second_cond_seq = second_cond_indices.view(B, top_h, top_w)[:, :second_cond_time_cols, :].reshape(B, -1)
-                    else:
-                        second_cond_seq = None
+                        target_seq = mid_seq
+                        # Condition on the aligned slice of Top
+                        cond_seq = top_seq 
+                    else: # bottom
+                        target_seq = bot_seq
+                        # Primary conditioning (Middle) and Secondary (Top)
+                        cond_seq = mid_seq
+                        second_cond_seq = top_seq
 
                     if use_amp:
                         with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
@@ -639,17 +544,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train Jukebox Transformer priors (top/middle/bottom).')
     parser.add_argument('--config', type=str, default='./config/config_transformer_prior.yaml')
     parser.add_argument('--level', type=str, default=None, help='Override model.selected_level in config')
-    parser.add_argument('--top_model_dir', type=str, default=None, help='Override vqvae.top_model_dir from config')
-    parser.add_argument('--middle_model_dir', type=str, default=None, help='Override vqvae.middle_model_dir from config')
-    parser.add_argument('--bottom_model_dir', type=str, default=None, help='Override vqvae.bottom_model_dir from config')
-    parser.add_argument('--weights_file', type=str, default=None, help='Override vqvae.weights_file from config')
     args = parser.parse_args()
 
     train_transformer_prior(
         args.config,
         level_override=args.level,
-        top_model_dir=args.top_model_dir,
-        middle_model_dir=args.middle_model_dir,
-        bottom_model_dir=args.bottom_model_dir,
-        weights_file=args.weights_file,
     )
