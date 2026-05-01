@@ -34,7 +34,7 @@ def plot_losses(train_losses, val_losses, save_dir, best_epoch=None, best_val_lo
     plt.figure(figsize=(10, 5))
     epochs = range(1, len(train_losses) + 1)
     plt.plot(epochs, train_losses, label='Training Loss')
-    plt.plot(epochs, val_losses, label='Validation Loss')
+    plt.plot(epochs, val_losses, label='Validation Loss') if val_losses else None
 
     if best_epoch is not None and best_val_loss is not None:
         plt.scatter(best_epoch, best_val_loss, c='red', marker='*', s=120, label=f'Best (Loss: {best_val_loss:.4f})', zorder=5)
@@ -149,11 +149,16 @@ def train_transformer_prior(
         file_paths=train_file_paths,
         **dataset_kwargs
     )
-    print(f"--- Initializing Validation Dataset for {selected_level} ---")
-    val_dataset = JukeboxHierarchicalQuantizedDataset(
-        file_paths=val_file_paths,
-        **dataset_kwargs
-    )
+    train_loader = DataLoader(train_dataset, batch_size=train_cfg['batch_size'], shuffle=True)
+    val_loader = None
+    if val_file_paths:
+        print(f"--- Initializing Validation Dataset for {selected_level} ---")
+        val_dataset = JukeboxHierarchicalQuantizedDataset(
+            file_paths=val_file_paths,
+            **dataset_kwargs
+        )
+        val_loader = DataLoader(val_dataset, batch_size=train_cfg['batch_size'], shuffle=False)
+
 
     num_embeddings_map = {
         'top': int(top_model.vq.num_embeddings),
@@ -240,9 +245,6 @@ def train_transformer_prior(
     if second_cond_seq_len > 0:
         print(f"Second conditioning slice (Top→Bottom): {second_cond_time_cols} time-cols × {top_w} freq = {second_cond_seq_len} tokens")
 
-    train_loader = DataLoader(train_dataset, batch_size=train_cfg['batch_size'], shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=train_cfg['batch_size'], shuffle=False)
-
     is_upsampler = cond_level is not None
     upsample_stride = None
     cond_num_embeddings = None
@@ -325,13 +327,16 @@ def train_transformer_prior(
     initial_best_score = None
     if retrain and initial_best_metric is not None:
         initial_best_score = -initial_best_metric  # Note: EarlyStopping score represents -loss
-        
-    early_stopping = EarlyStopping(
-        patience=int(train_cfg.get('early_stopping_patience', 10)), 
-        verbose=True,
-        best_score=initial_best_score,
-        counter=historical_counter
-    )
+
+    # Only use early stopping if we have a validation set and a valid initial best score (from previous training or current checkpoint)
+    early_stopping = None
+    if val_loader is not None and initial_best_score is not None:
+        early_stopping = EarlyStopping(
+            patience=int(train_cfg.get('early_stopping_patience', 10)), 
+            verbose=True,
+            best_score=initial_best_score,
+            counter=historical_counter
+        )
 
     adam_beta2 = float(prior_cfg.get('adam_beta2', 0.95))
     optimizer = optim.AdamW(
@@ -443,9 +448,10 @@ def train_transformer_prior(
     best_val_loss = initial_best_metric if initial_best_metric is not None else float('inf')
     best_epoch = start_epoch if start_epoch > 0 else 0
 
-    if start_epoch >= epochs or early_stopping.counter >= early_stopping.patience:
-        print(f"Checkpoint epoch ({start_epoch}) is already >= configured epochs ({epochs}) or patience ({early_stopping.patience}) has been exhausted (counter: {early_stopping.counter}). Nothing to train.")
-        return
+    if early_stopping is not None :
+        if (start_epoch >= epochs) or (early_stopping.counter >= early_stopping.patience):
+            print(f"Checkpoint epoch ({start_epoch}) is already >= configured epochs ({epochs}) or patience ({early_stopping.patience}) has been exhausted (counter: {early_stopping.counter}). Nothing to train.")
+            return
 
     for epoch in range(start_epoch, epochs):
         prior.train()
@@ -518,74 +524,80 @@ def train_transformer_prior(
         epoch_train_loss = running_loss / max(len(train_loader), 1)
         train_losses.append(epoch_train_loss)
 
-        prior.eval()
-        val_running_loss = 0.0
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f'Epoch {epoch + 1}/{epochs} [Val:{selected_level}]'):
-                top_indices = batch[0].to(device)
-                mid_indices = batch[1].to(device)
-                bot_indices = batch[2].to(device)
-                timing = batch[3].to(device)
+        epoch_val_loss = None
+        if val_loader is not None:
+            prior.eval()
+            val_running_loss = 0.0
+            with torch.no_grad():
+                for batch in tqdm(val_loader, desc=f'Epoch {epoch + 1}/{epochs} [Val:{selected_level}]'):
+                    top_indices = batch[0].to(device)
+                    mid_indices = batch[1].to(device)
+                    bot_indices = batch[2].to(device)
+                    timing = batch[3].to(device)
 
-                if selected_level == 'top':
-                    target_indices = top_indices
-                    cond_indices = None
-                    second_cond_indices = None
-                elif selected_level == 'middle':
-                    target_indices = mid_indices
-                    cond_indices = top_indices
-                    second_cond_indices = None
-                else:
-                    target_indices = bot_indices
-                    cond_indices = mid_indices
-                    second_cond_indices = top_indices if condition_on_top else None
+                    if selected_level == 'top':
+                        target_indices = top_indices
+                        cond_indices = None
+                        second_cond_indices = None
+                    elif selected_level == 'middle':
+                        target_indices = mid_indices
+                        cond_indices = top_indices
+                        second_cond_indices = None
+                    else:
+                        target_indices = bot_indices
+                        cond_indices = mid_indices
+                        second_cond_indices = top_indices if condition_on_top else None
 
-                target_seq = target_indices.view(target_indices.shape[0], -1)
+                    target_seq = target_indices.view(target_indices.shape[0], -1)
 
-                if cond_indices is not None:
-                    B = cond_indices.shape[0]
-                    cond_seq = cond_indices.view(B, cond_grid_h, cond_grid_w)[:, :cond_time_cols, :].reshape(B, -1)
-                else:
-                    cond_seq = None
+                    if cond_indices is not None:
+                        B = cond_indices.shape[0]
+                        cond_seq = cond_indices.view(B, cond_grid_h, cond_grid_w)[:, :cond_time_cols, :].reshape(B, -1)
+                    else:
+                        cond_seq = None
 
-                if second_cond_indices is not None:
-                    B = second_cond_indices.shape[0]
-                    second_cond_seq = second_cond_indices.view(B, top_h, top_w)[:, :second_cond_time_cols, :].reshape(B, -1)
-                else:
-                    second_cond_seq = None
+                    if second_cond_indices is not None:
+                        B = second_cond_indices.shape[0]
+                        second_cond_seq = second_cond_indices.view(B, top_h, top_w)[:, :second_cond_time_cols, :].reshape(B, -1)
+                    else:
+                        second_cond_seq = None
 
-                if use_amp:
-                    with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
+                    if use_amp:
+                        with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
+                            loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, timing=timing)
+                    else:
                         loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, timing=timing)
-                else:
-                    loss = prior.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, timing=timing)
-                val_running_loss += loss.item()
+                    val_running_loss += loss.item()
 
-        epoch_val_loss = val_running_loss / max(len(val_loader), 1)
-        val_losses.append(epoch_val_loss)
+            epoch_val_loss = val_running_loss / max(len(val_loader), 1)
+            val_losses.append(epoch_val_loss)
 
         with open(os.path.join(run_dir, 'loss_history.json'), 'w', encoding='utf-8') as f:
             json.dump({'train_loss': train_losses, 'val_loss': val_losses}, f)
 
-        print(f'Epoch {epoch + 1}: Train Loss={epoch_train_loss:.4f}, Val Loss={epoch_val_loss:.4f}')
-
-        # Save models
-        ## Save best model based on validation loss
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
-            best_epoch = len(val_losses)
-            torch.save(
-                {
-                    'model_state': prior.state_dict(),
-                    'config': config_to_save,
-                    'epoch': epoch + 1,
-                    'train_loss': epoch_train_loss,
-                    'val_loss': epoch_val_loss,
-                    'history': {'train_loss': train_losses, 'val_loss': val_losses},
-                },
-                os.path.join(run_dir, 'best_model.pth')
-            )
-            print('Saved best model.')
+        print(
+            f"Epoch {epoch + 1}: Train Loss={epoch_train_loss:.4f}"
+            + (f" Val Loss={epoch_val_loss:.4f}" if epoch_val_loss is not None else "")
+        )
+    
+        if epoch_val_loss:
+            # Save models
+            ## Save best model based on validation loss
+            if epoch_val_loss < best_val_loss:
+                best_val_loss = epoch_val_loss
+                best_epoch = len(val_losses)
+                torch.save(
+                    {
+                        'model_state': prior.state_dict(),
+                        'config': config_to_save,
+                        'epoch': epoch + 1,
+                        'train_loss': epoch_train_loss,
+                        'val_loss': epoch_val_loss,
+                        'history': {'train_loss': train_losses, 'val_loss': val_losses},
+                    },
+                    os.path.join(run_dir, 'best_model.pth')
+                )
+                print('Saved best model.')
 
         ## Periodic checkpointing every 10 epochs
         if (epoch + 1) % 10 == 0:
@@ -612,10 +624,11 @@ def train_transformer_prior(
             os.path.join(run_dir, f'latest_model.pth')
         )
 
-        early_stopping(epoch_val_loss)
-        if early_stopping.early_stop:
-            print(f'Early stopping at epoch {epoch + 1}.')
-            break
+        if early_stopping is not None:
+            early_stopping(epoch_val_loss)
+            if early_stopping.early_stop:
+                print(f'Early stopping at epoch {epoch + 1}.')
+                break
 
         plot_losses(train_losses, val_losses, run_dir, best_epoch, best_val_loss, level_name=selected_level)
 
