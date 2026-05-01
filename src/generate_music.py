@@ -4,6 +4,7 @@ import sys
 import soundfile as sf
 import argparse
 import random
+import math
 from datetime import datetime
 from typing import Optional, List
 import numpy as np
@@ -91,11 +92,10 @@ def _generate_level_tokens(
     top_k: Optional[int],
     upper_tokens_list: Optional[List[np.ndarray]] = None,
     second_upper_tokens_list: Optional[List[np.ndarray]] = None,
-    use_time_id: bool = False,
+    timing_list: Optional[List[np.ndarray]] = None,
 ) -> List[np.ndarray]:
     token_blocks = []
     curr_start_token = None
-    max_time_steps = getattr(prior, 'max_time_steps', None) if use_time_id else None
 
     for chunk in range(chunks_to_generate):
         upper_indices = None
@@ -116,12 +116,9 @@ def _generate_level_tokens(
             'top_k': top_k,
             'device': device,
         }
-        if use_time_id:
-            time_id_value = chunk
-            if isinstance(max_time_steps, int) and max_time_steps > 0:
-                time_id_value = chunk % max_time_steps
-            current_time_id = torch.tensor([time_id_value], dtype=torch.long, device=device)
-            generate_kwargs['time_id'] = current_time_id
+        if timing_list is not None:
+            timing = torch.from_numpy(timing_list[chunk]).to(device)
+            generate_kwargs['timing'] = timing
 
         with torch.no_grad():
             tokens = prior.generate(**generate_kwargs).cpu().numpy()
@@ -132,6 +129,58 @@ def _generate_level_tokens(
 
     return token_blocks
 
+def stitch_tokens(tokens_list: List[np.ndarray], seq_len: int) -> np.ndarray:
+    """Stitches overlapping generated blocks into one continuous sequence (50% overlap)."""
+    if not tokens_list:
+        return np.array([])
+    if len(tokens_list) == 1:
+        return tokens_list[0]
+    
+    overlap_len = seq_len // 2
+    # Keep the full first chunk, but only the SECOND half of every subsequent chunk
+    chunks = [tokens_list[0]] + [t[:, overlap_len:] for t in tokens_list[1:]]
+    return np.concatenate(chunks, axis=1)
+
+def get_token_slice(full_tokens: np.ndarray, chunk_idx: int, slice_len: int) -> np.ndarray:
+    """
+    Extracts a conditioning slice that advances by half its length per chunk
+    to match the 50% windowed overlap of the generator.
+    """
+    # Advance is half the slice length because of 50% overlap
+    advance = slice_len // 2 
+    start = chunk_idx * advance
+    end = start + slice_len
+    
+    # Boundary check to prevent empty slices
+    if start >= full_tokens.shape[1]:
+        print(f'Warning: Requested slice for chunk {chunk_idx} is out of bounds (start={start}, total_len={full_tokens.shape[1]}). Returning zeros.')
+        return np.zeros((full_tokens.shape[0], slice_len), dtype=full_tokens.dtype)
+        
+    actual_slice = full_tokens[:, start:end]
+    
+    # If the slice is too short (at the end of the stitched sequence), pad it
+    if actual_slice.shape[1] < slice_len:
+        print(f'Info: Slice for chunk {chunk_idx} is shorter than expected (got {actual_slice.shape[1]}, expected {slice_len}). Padding with zeros.')
+        pad_width = slice_len - actual_slice.shape[1]
+        actual_slice = np.pad(actual_slice, ((0, 0), (0, pad_width)), mode='constant')
+        
+    return actual_slice
+    
+def _build_timing_schedule(
+    chunks: int,
+    tf_advance: int,
+    hop_length: int,
+    sample_rate: int,
+    total_song_duration_s: float
+) -> List[np.ndarray]:
+    """Builds timing metadata based on the specific chunk start times of a level."""
+    timing_list = []
+    for i in range(chunks):
+        start_time_s = (i * tf_advance * hop_length) / sample_rate
+        # fraction_elapsed represents the start of the window relative to song end
+        fraction = start_time_s / total_song_duration_s if total_song_duration_s > 0 else 0.0
+        timing_list.append(np.array([[start_time_s, total_song_duration_s, fraction]], dtype=np.float32))
+    return timing_list
 
 def _decode_bottom_blocks(
     vqvae,
@@ -189,7 +238,12 @@ def main():
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature for all priors')
     parser.add_argument('--top_k', type=int, default=None, help='Top-k sampling (None disables top-k)')
     parser.add_argument('--weights_file', type=str, default='best_model.pth', help='Checkpoint filename for transformer priors (default: best_model.pth)')
-    parser.add_argument('--chunks_to_generate', type=int, default=3, help='Number of chunks to generate')
+    parser.add_argument(
+        '--chunks_to_generate',
+        type=int,
+        default=None,
+        help='Number of bottom-level chunks to generate (default: enough to cover one top window)',
+    )
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible generation (set to negative to disable)')
     parser.add_argument('--audio_method', type=str, default='griffinlim', choices=['griffinlim', 'istft'], help='Spectrogram inversion method')
     parser.add_argument('--save_root', type=str, default='samples/transformer_hierarchical_generated', help='Root directory for generated outputs')
@@ -200,7 +254,7 @@ def main():
     if args.top_k is not None and args.top_k < 0:
         raise ValueError(f'--top_k must be >= 0, got {args.top_k}')
     args.top_k = args.top_k if (args.top_k is not None and args.top_k > 0) else None
-    if args.chunks_to_generate <= 0:
+    if args.chunks_to_generate is not None and args.chunks_to_generate <= 0:
         raise ValueError(f'--chunks_to_generate must be > 0, got {args.chunks_to_generate}')
 
     if args.seed is not None and args.seed < 0:
@@ -286,6 +340,12 @@ def generate_hierarchical_music(args) -> str:
     bottom_prior_cfg = bottom_config.get('priors', {}).get('bottom_prior', {}) if isinstance(bottom_config, dict) else {}
     bottom_condition_on_top = bool(bottom_prior_cfg.get('condition_on_top', False))
 
+    dataset_cfg = bottom_config.get('dataset', {}) if isinstance(bottom_config, dict) else {}
+    level_target_time_frames = dataset_cfg.get('level_target_time_frames') or {}
+    top_tf = int(level_target_time_frames.get('top', dataset_cfg.get('target_time_frames', 2048)))
+    mid_tf = int(level_target_time_frames.get('middle', dataset_cfg.get('target_time_frames', 2048)))
+    bot_tf = int(level_target_time_frames.get('bottom', dataset_cfg.get('target_time_frames', 2048)))
+
     _debug('Resolving min_max_values.pkl path...')
     min_max_values_path = resolve_min_max_values_path(bottom_config, debug_fn=_debug)
 
@@ -293,7 +353,18 @@ def generate_hierarchical_music(args) -> str:
     bottom_vqvae_ref = bottom_config['vqvae']['bottom_model_dir']
     bottom_vqvae_config_path = resolve_vqvae_config_path(bottom_vqvae_ref)
     bottom_vqvae_config = load_config(bottom_vqvae_config_path)
-    bottom_vqvae_dataset_cfg = bottom_vqvae_config.get('dataset', {}) if isinstance(bottom_vqvae_config, dict) else {}
+    dataset_cfg = bottom_vqvae_config.get('dataset', {}) if isinstance(bottom_vqvae_config, dict) else {}
+
+    sample_rate = int(dataset_cfg.get('sample_rate', SAMPLE_RATE))
+    hop_length = int(dataset_cfg.get('hop_length', HOP_LENGTH))
+    target_time_frames = int(dataset_cfg.get('target_time_frames', 2048))
+    frame_size = int(dataset_cfg.get('frame_size', FRAME_SIZE))
+    spectrograms_path = dataset_cfg.get('processed_path', '')
+    spectrogram_type_cfg = dataset_cfg.get('spectrogram_type')
+    spectrogram_type = str(spectrogram_type_cfg).strip().lower() if spectrogram_type_cfg else (
+        'mel' if 'mel' in str(spectrograms_path).lower() else 'linear'
+    )
+    n_mels = int(dataset_cfg.get('n_mels', 256))
 
     vqvae_bottom_decoder = load_jukebox_model(
         bottom_vqvae_ref,
@@ -303,45 +374,98 @@ def generate_hierarchical_music(args) -> str:
     )
     vqvae_bottom_decoder.eval()
 
+    # Step 0: Prepare data
+    ## Temporal math (50% Overlap Logic)
+    
+    ## Middle (512) upsamples Top slice (128) -> stride 4
+    ## Bottom (512) upsamples Middle slice (128) -> stride 4
+    ## Bottom (512) upsamples Top slice (32) -> stride 16
+    mid_upsample_stride = 4
+    bot_primary_stride = 4
+    bot_secondary_stride = 16
+
+    mid_slice_len = middle_seq_len // mid_upsample_stride    # 512 / 4 = 128
+    bot_mid_slice_len = bottom_seq_len // bot_primary_stride  # 512 / 4 = 128
+    bot_top_slice_len = bottom_seq_len // bot_secondary_stride # 512 / 16 = 32
+    
+    ## The song duration is determined by the Bottom level's total reach
+    bot_advance = bot_tf // 2
+    mid_advance = mid_tf // 2
+    top_advance = top_tf // 2
+
+    ## If we generate N chunks with 50% overlap, total duration is:
+    ## tf + (N-1) * (tf/2)
+    bottom_chunks = int(args.chunks_to_generate)
+    total_song_frames = bot_tf + (bottom_chunks - 1) * bot_advance
+    total_song_duration_s = ((total_song_frames - 1) * hop_length) / sample_rate
+
+    ## Calculate how many chunks Middle and Top need to cover that same duration
+    middle_chunks = max(1, math.ceil((total_song_frames - mid_tf) / mid_advance) + 1)
+    top_chunks = max(1, math.ceil((total_song_frames - top_tf) / top_advance) + 1)
+
+    print(f"--- Generation Plan ---")
+    print(f"Total Song Duration: {total_song_duration_s:.2f}s ({total_song_frames} frames)")
+    print(f"Chunks needed: Top={top_chunks}, Mid={middle_chunks}, Bot={bottom_chunks}")
+
+    top_timing = _build_timing_schedule(top_chunks, top_advance, hop_length, sample_rate, total_song_duration_s)
+    mid_timing = _build_timing_schedule(middle_chunks, mid_advance, hop_length, sample_rate, total_song_duration_s)
+    bot_timing = _build_timing_schedule(bottom_chunks, bot_advance, hop_length, sample_rate, total_song_duration_s)
+
     # Step 1: Top-Level Unrolling (The Composer)
-    # Generate global structure block-by-block, carrying overlap context.
+    ## Generate global structure block-by-block, carrying overlap context.
     start_time = time.time()
     top_tokens_list = _generate_level_tokens(
         prior=top_prior,
         seq_len=top_seq_len,
-        chunks_to_generate=args.chunks_to_generate,
+        chunks_to_generate=top_chunks,
         device=device,
         temperature=args.temperature,
         top_k=args.top_k,
         upper_tokens_list=None,
-        use_time_id=True,
+        timing_list=top_timing,
     )
+    full_top_tokens = stitch_tokens(top_tokens_list, top_seq_len)
     print('Top-level generation complete. Generated tokens for each block have shape:', top_tokens_list[0].shape if top_tokens_list else None)
 
     # Step 2: Hierarchical Upsampling (The Performers)
-    # Middle prior conditions on top tokens, then bottom prior on middle tokens.
+    ## conditioning middle level on the chunk of from the top level codes corresponding to the same segment
+    top_slices_for_middle = [
+        get_token_slice(full_top_tokens, i, mid_slice_len) for i in range(middle_chunks)
+    ]
     middle_tokens_list = _generate_level_tokens(
         prior=middle_prior,
         seq_len=middle_seq_len,
-        chunks_to_generate=args.chunks_to_generate,
+        chunks_to_generate=middle_chunks,
         device=device,
         temperature=args.temperature,
         top_k=args.top_k,
-        upper_tokens_list=top_tokens_list,
-        use_time_id=True,
+        upper_tokens_list=top_slices_for_middle,
+        timing_list=mid_timing,
     )
+    full_middle_tokens = stitch_tokens(middle_tokens_list, middle_seq_len)
     print('Middle-level generation complete. Generated tokens for each block have shape:', middle_tokens_list[0].shape if middle_tokens_list else None)
+    print('Stitched full middle tokens shape:', full_middle_tokens.shape)
+    print('Middle-level generation took: {:.2f} seconds'.format(time.time() - start_time))
 
+    ## conditioning bottom level on the chunk of from the top and middle levels codes corresponding to the same segment
+    middle_slices_for_bottom = [
+        get_token_slice(full_middle_tokens, i, bot_mid_slice_len) for i in range(bottom_chunks)
+    ]
+    top_slices_for_bottom = None
+    if bottom_condition_on_top:
+        top_slices_for_bottom = [
+            get_token_slice(full_top_tokens, i, bot_top_slice_len) for i in range(bottom_chunks)
+        ]
     bottom_tokens_list = _generate_level_tokens(
         prior=bottom_prior,
         seq_len=bottom_seq_len,
-        chunks_to_generate=args.chunks_to_generate,
+        chunks_to_generate=bottom_chunks,
         device=device,
         temperature=args.temperature,
         top_k=args.top_k,
-        upper_tokens_list=middle_tokens_list,
-        second_upper_tokens_list=top_tokens_list if bottom_condition_on_top else None,
-        use_time_id=True,
+        upper_tokens_list=middle_slices_for_bottom,
+        second_upper_tokens_list=top_slices_for_bottom,
+        timing_list=bot_timing,
     )
     print('Generation complete. Bottom tokens length:', len(bottom_tokens_list),
           'with each block having shape:', bottom_tokens_list[0].shape if bottom_tokens_list else None)
@@ -349,7 +473,7 @@ def generate_hierarchical_music(args) -> str:
     print('Decoding bottom tokens into spectrograms...')
 
     # Step 3: Spectrogram Crossfading (The Audio Engineer)
-    # Decode each chunk then crossfade overlaps to remove block boundaries.
+    ## decode each chunk then crossfade overlaps to remove block boundaries.
     decode_start_time = time.time()
     reconstructed_spectrograms = _decode_bottom_blocks(
         vqvae=vqvae_bottom_decoder,
@@ -368,27 +492,18 @@ def generate_hierarchical_music(args) -> str:
     print('Spectrogram reconstruction and crossfading complete. Final spectrogram shape:', final_spectrogram.shape)
 
     # Step 4: Spectrogram Inversion (The Mastering Engineer)
-    # Convert final spectrograms back to audio and save all artifacts.
+    ## convert final spectrograms back to audio and save
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     save_dir = os.path.join(args.save_root, current_time)
+    os.makedirs(save_dir, exist_ok=True)
 
     _debug(f'Loading min/max values from: {min_max_values_path}')
     with open(min_max_values_path, 'rb') as f:
         min_max_values = pickle.load(f)
 
-    dataset_cfg = bottom_vqvae_dataset_cfg
-    sample_rate = int(dataset_cfg.get('sample_rate', SAMPLE_RATE))
-    hop_length = int(dataset_cfg.get('hop_length', HOP_LENGTH))
-    frame_size = int(dataset_cfg.get('frame_size', FRAME_SIZE))
-    spectrograms_path = dataset_cfg.get('processed_path', '')
-    spectrogram_type_cfg = dataset_cfg.get('spectrogram_type')
-    spectrogram_type = str(spectrogram_type_cfg).strip().lower() if spectrogram_type_cfg else (
-        'mel' if 'mel' in str(spectrograms_path).lower() else 'linear'
-    )
-    n_mels = int(dataset_cfg.get('n_mels', 256))
-
     save_decoded_spectrograms(final_spectrogram, save_dir)
     min_max_list = prepare_min_max_values(min_max_values, final_spectrogram.shape[0])
+
 
     sound_generator = SoundGenerator(
         vqvae_bottom_decoder,
@@ -401,11 +516,12 @@ def generate_hierarchical_music(args) -> str:
     audio_signals = sound_generator.convert_spectrograms_to_audio(
         final_spectrogram, min_max_list, method=args.audio_method
     )
-
+    final_audio = audio_signals[0]
+    
+    # Save the final crossfaded waveform
     audio_dir = os.path.join(save_dir, 'audio')
     os.makedirs(audio_dir, exist_ok=True)
-    for i, signal in enumerate(audio_signals):
-        sf.write(os.path.join(audio_dir, f'sample_{i}.wav'), signal, sample_rate)
+    sf.write(os.path.join(audio_dir, 'sample.wav'), final_audio, sample_rate)
 
     return save_dir
 
