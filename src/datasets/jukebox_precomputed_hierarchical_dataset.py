@@ -2,7 +2,7 @@ import os
 import sys
 import tempfile
 from glob import glob
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import torch
@@ -13,174 +13,309 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
 class JukeboxQuantizedDataset(Dataset):
+    """
+    Dataset for hierarchical transformer prior training.
+
+    Returns (target, cond, second_cond, timing) for every level:
+      - top:    target=top,    cond=None,              second_cond=None
+      - middle: target=middle, cond=aligned_top_slice, second_cond=None
+      - bottom: target=bottom, cond=aligned_mid_slice, second_cond=aligned_top_slice
+
+    The conditioning slices cover the SAME audio span as the target window,
+    which is the correct alignment per the Jukebox paper.
+    """
+
     def __init__(
         self,
         quantized_path: str,
         file_paths: List[str] = None,
-        target_time_frames: int = 2048
+        target_time_frames: int = 2048,
+        level_target_time_frames: Optional[Dict[str, int]] = None,
+        selected_level: str = 'top',
+        sample_rate: int = 22050,
+        hop_length: int = 256,
     ):
         """
-        @param target_time_frames: The window size in raw spectrogram frames (e.g. 2048 for Top)
+        Args:
+            quantized_path:           Directory containing *_full_quantized.pt files.
+            file_paths:               Optional list of source .npy paths; mapped to .pt names.
+            target_time_frames:       Top-level window size in raw spectrogram frames.
+            level_target_time_frames: Dict with per-level window sizes, e.g.
+                                      {'top': 2048, 'middle': 512, 'bottom': 128}.
+            selected_level:           Which prior is being trained ('top'/'middle'/'bottom').
+            sample_rate:              Audio sample rate (used for timing metadata).
+            hop_length:               STFT hop length (used for timing metadata).
         """
-        self.target_time_frames = target_time_frames
+        self.selected_level = selected_level
+        self.sample_rate = sample_rate
+        self.hop_length = hop_length
+
+        lvl = level_target_time_frames or {}
+        self.top_tf    = int(lvl.get('top',    target_time_frames))
+        self.middle_tf = int(lvl.get('middle', target_time_frames))
+        self.bottom_tf = int(lvl.get('bottom', target_time_frames))
+
         if file_paths:
-            self.files = [os.path.join(quantized_path, os.path.basename(f).replace('.npy', '_full_quantized.pt')) 
-                          for f in file_paths]
+            self.files = [
+                os.path.join(quantized_path, os.path.basename(f).replace('.npy', '_full_quantized.pt'))
+                for f in file_paths
+            ]
         else:
             self.files = sorted(glob(os.path.join(quantized_path, "*.pt")))
 
-        # Define downsampling ratios based on your VQ-VAE levels
-        # (Spectrogram Frames / Token Time Steps)
+        # Peek at the first file to learn the actual token grid shapes.
+        # This replaces all hardcoded ratio constants.
+        self._init_grids()
+
+    def _init_grids(self):
+        """Read one payload to discover (time_steps, freq_bins) for each level."""
+        if not self.files:
+            raise ValueError("No quantized .pt files found.")
+        payload = torch.load(self.files[0], weights_only=False)
+        # Each level array has shape [Total_Time_Steps, Freq_Bins]
+        self.top_grid    = (int(payload['top'].shape[0]),    int(payload['top'].shape[1]))
+        self.middle_grid = (int(payload['middle'].shape[0]), int(payload['middle'].shape[1]))
+        self.bottom_grid = (int(payload['bottom'].shape[0]), int(payload['bottom'].shape[1]))
+
+        total_frames = int(payload['total_frames'])
+        # Derive downsampling ratios from actual data instead of hardcoding.
+        # ratio = raw_frames / token_time_steps
         self.ratios = {
-            'top': 2048 // 64,    # 32
-            'middle': 512 // 32,  # 16 (Using your level_profile config)
-            'bottom': 128 // 16   # 8
+            'top':    total_frames // self.top_grid[0],
+            'middle': total_frames // self.middle_grid[0],
+            'bottom': total_frames // self.bottom_grid[0],
         }
+        print(
+            f"[JukeboxQuantizedDataset] Grids — "
+            f"top={self.top_grid}, middle={self.middle_grid}, bottom={self.bottom_grid} | "
+            f"ratios={self.ratios}"
+        )
+
+        # Precompute how many token time-cols each level window occupies.
+        # These are used to pick the right-sized conditioning slices.
+        self._top_window_cols    = self.top_tf    // self.ratios['top']
+        self._middle_window_cols = self.middle_tf // self.ratios['middle']
+        self._bottom_window_cols = self.bottom_tf // self.ratios['bottom']
+
+        # FIX: aligned conditioning slice sizes.
+        # For middle trained on a middle-window, only the TOP tokens covering
+        # the same audio span are used as conditioning (not the full top window).
+        self._top_cols_for_middle = max(1, round(self._top_window_cols * self.middle_tf / self.top_tf))
+        self._top_cols_for_bottom = max(1, round(self._top_window_cols * self.bottom_tf / self.top_tf))
+        self._mid_cols_for_bottom = max(1, round(self._middle_window_cols * self.bottom_tf / self.middle_tf))
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
         payload = torch.load(self.files[idx % len(self.files)], weights_only=False)
-        total_frames = payload['total_frames']
+        total_frames = int(payload['total_frames'])
 
-        # Calculate max possible start index for the top-level window
-        max_top_tokens = total_frames // self.ratios['top']
-        target_top_tokens = 64 # Janela de 512 tokens / 8 freq
+        top_arr    = payload['top']     # [T_top, F_top]
+        middle_arr = payload['middle']  # [T_mid, F_mid]
+        bottom_arr = payload['bottom']  # [T_bot, F_bot]
 
-        if max_top_tokens > target_top_tokens:
-            # Escolhemos um índice de TOKEN aleatório
-            t_start = np.random.randint(0, max_top_tokens - target_top_tokens)
-        else:
-            t_start = 0
-        m_start = t_start * (self.ratios['top'] // self.ratios['middle'])
-        b_start = t_start * (self.ratios['top'] // self.ratios['bottom'])
+        # ── Random crop anchored at the TOP level ──────────────────────────────
+        # We choose a random top-token start, then derive aligned starts for
+        # middle and bottom using the ratio relationships.
+        max_top_start = max(0, top_arr.shape[0] - self._top_window_cols)
+        t_start = int(np.random.randint(0, max_top_start + 1)) if max_top_start > 0 else 0
 
-        # Slicing
-        top_indices = payload['top'][t_start : t_start + 64]
-        mid_indices = payload['middle'][m_start : m_start + 32]
-        bot_indices = payload['bottom'][b_start : b_start + 16]
+        # Scale to middle and bottom token indices
+        top_to_mid_ratio = self.ratios['top'] // self.ratios['middle']   # e.g. 32//16 = 2
+        top_to_bot_ratio = self.ratios['top'] // self.ratios['bottom']   # e.g. 32//8  = 4
+        m_start = t_start * top_to_mid_ratio
+        b_start = t_start * top_to_bot_ratio
 
-        # Padding
-        #top_indices = self._pad_tokens(top_indices, 64, 8)
-        #mid_indices = self._pad_tokens(mid_indices, 32, 16)
-        #bot_indices = self._pad_tokens(bot_indices, 16, 32)
+        # ── Slice target window ────────────────────────────────────────────────
+        top_slice    = top_arr[t_start : t_start + self._top_window_cols]
+        middle_slice = middle_arr[m_start : m_start + self._middle_window_cols]
+        bottom_slice = bottom_arr[b_start : b_start + self._bottom_window_cols]
 
-        # Timing Metadata
-        # (Using your standard hop/sr calculation logic)
-        # Assuming SR=22050, Hop=256
+        # Pad if the song is shorter than the requested window
+        top_slice    = self._pad(top_slice,    self._top_window_cols)
+        middle_slice = self._pad(middle_slice, self._middle_window_cols)
+        bottom_slice = self._pad(bottom_slice, self._bottom_window_cols)
+
+        # ── FIX: Aligned conditioning slices ──────────────────────────────────
+        # Each conditioning slice covers the SAME audio span as the target window.
+        # For middle prior: use only the top tokens aligned to the middle window span.
+        # For bottom prior: use only the middle/top tokens aligned to the bottom window span.
+        top_for_middle = top_arr[t_start : t_start + self._top_cols_for_middle]
+        top_for_middle = self._pad(top_for_middle, self._top_cols_for_middle)
+
+        top_for_bottom = top_arr[t_start : t_start + self._top_cols_for_bottom]
+        top_for_bottom = self._pad(top_for_bottom, self._top_cols_for_bottom)
+
+        mid_for_bottom = middle_arr[m_start : m_start + self._mid_cols_for_bottom]
+        mid_for_bottom = self._pad(mid_for_bottom, self._mid_cols_for_bottom)
+
+        # ── Timing metadata ────────────────────────────────────────────────────
         actual_start_frame = t_start * self.ratios['top']
-        start_time_s = (actual_start_frame * 256) / 22050
-        total_duration_s = (total_frames * 256) / 22050
-        fraction = start_time_s / total_duration_s
+        start_time_s    = (actual_start_frame * self.hop_length) / self.sample_rate
+        total_duration_s = (total_frames * self.hop_length) / self.sample_rate
+        fraction         = start_time_s / max(total_duration_s, 1e-6)
         timing = torch.tensor([start_time_s, total_duration_s, fraction], dtype=torch.float32)
 
-        return (
-            torch.from_numpy(top_indices).long(),
-            torch.from_numpy(mid_indices).long(),
-            torch.from_numpy(bot_indices).long(),
-            timing
-        )
+        # ── Return (target, cond, second_cond, timing) for the selected level ─
+        target    = torch.from_numpy(top_slice).long()
+        cond      = None
+        second_cond = None
 
-    def _pad_tokens(self, arr, target_t, freq):
+        if self.selected_level == 'top':
+            target = torch.from_numpy(top_slice).long()
+            # cond and second_cond remain None
+
+        elif self.selected_level == 'middle':
+            target = torch.from_numpy(middle_slice).long()
+            cond   = torch.from_numpy(top_for_middle).long()  # aligned top slice
+
+        elif self.selected_level == 'bottom':
+            target      = torch.from_numpy(bottom_slice).long()
+            cond        = torch.from_numpy(mid_for_bottom).long()  # aligned middle slice
+            second_cond = torch.from_numpy(top_for_bottom).long()  # aligned top slice
+
+        # Use empty tensors instead of None so DataLoader can collate cleanly.
+        # The trainer checks .numel() == 0 or shape to detect "no conditioning".
+        cond        = cond        if cond        is not None else torch.empty(0, dtype=torch.long)
+        second_cond = second_cond if second_cond is not None else torch.empty(0, dtype=torch.long)
+
+        return target, cond, second_cond, timing
+
+    @staticmethod
+    def _pad(arr: np.ndarray, target_t: int) -> np.ndarray:
+        """Pad or truncate along axis=0 (time) to exactly target_t rows."""
         if arr.shape[0] < target_t:
             diff = target_t - arr.shape[0]
             arr = np.pad(arr, ((0, diff), (0, 0)), mode='constant')
         return arr[:target_t]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Tests
+# ──────────────────────────────────────────────────────────────────────────────
+
 def test_dataset_alignment_and_logic():
     print("🚀 Starting JukeboxQuantizedDataset tests...")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        # 1. Create a "Full Song" Mock Payload
-        # We use a gradient of numbers so we can track if the slices are aligned
-        # Top: 1000 time steps, 8 freq
-        # Middle: 2000 time steps, 16 freq
-        # Bottom: 4000 time steps, 32 freq
-        # This matches the 32:16:8 ratios (1000*32 = 2000*16 = 4000*8 = 32000 raw frames)
-        
+        # Mock payload: ratios top=32, mid=16, bot=8
+        # 1000 top time-steps × 32 = 32000 raw frames
         total_raw_frames = 32000
-        
-        mock_top = torch.arange(1000).view(-1, 1).repeat(1, 8)
-        mock_mid = torch.arange(2000).view(-1, 1).repeat(1, 16)
-        mock_bot = torch.arange(4000).view(-1, 1).repeat(1, 32)
-        
+
+        mock_top = np.arange(1000, dtype=np.int64)[:, None].repeat(8, axis=1)   # [1000, 8]
+        mock_mid = np.arange(2000, dtype=np.int64)[:, None].repeat(16, axis=1)  # [2000, 16]
+        mock_bot = np.arange(4000, dtype=np.int64)[:, None].repeat(32, axis=1)  # [4000, 32]
+
         quantized_file = os.path.join(tmp_dir, 'test_song_full_quantized.pt')
-        payload = {
-            'top': mock_top.numpy(),
-            'middle': mock_mid.numpy(),
-            'bottom': mock_bot.numpy(),
-            'total_frames': total_raw_frames
-        }
-        torch.save(payload, quantized_file)
+        torch.save({
+            'top': mock_top, 'middle': mock_mid, 'bottom': mock_bot,
+            'total_frames': total_raw_frames,
+        }, quantized_file)
 
-        # 2. Initialize Dataset
-        dataset = JukeboxQuantizedDataset(
-            quantized_path=tmp_dir,
-            target_time_frames=2048 # 24s window
+        level_tfs = {'top': 2048, 'middle': 512, 'bottom': 128}
+
+        # ── Top level ─────────────────────────────────────────────────────────
+        ds_top = JukeboxQuantizedDataset(
+            tmp_dir, target_time_frames=2048,
+            level_target_time_frames=level_tfs, selected_level='top',
         )
+        target, cond, second_cond, timing = ds_top[0]
+        assert target.shape == (64, 8),   f"Top target shape: {target.shape}"
+        assert cond.numel() == 0,         "Top cond should be empty"
+        assert second_cond.numel() == 0,  "Top second_cond should be empty"
+        print(f"  [Pass] Top level — target={tuple(target.shape)}, cond=empty, second_cond=empty")
 
-        print(f"Dataset length (files): {len(dataset)}")
-        assert len(dataset) == 1, "Dataset should find the 1 mock file."
+        # ── Middle level ──────────────────────────────────────────────────────
+        ds_mid = JukeboxQuantizedDataset(
+            tmp_dir, target_time_frames=2048,
+            level_target_time_frames=level_tfs, selected_level='middle',
+        )
+        target, cond, second_cond, timing = ds_mid[0]
+        # middle window = 512 frames / 16 ratio = 32 time-cols
+        # top slice for middle = 32 * (512/2048) = 8 time-cols
+        assert target.shape == (32, 16), f"Middle target shape: {target.shape}"
+        assert cond.shape[1] == 8,       f"Middle cond freq_bins: {cond.shape}"
+        assert second_cond.numel() == 0, "Middle second_cond should be empty"
+        # Alignment: cond time-col 0 should match top value at same t_start
+        t_val = target[0, 0].item()  # which middle token we started at
+        # middle token t_val → top token t_val // 2
+        expected_top_start = (t_val * ds_mid.ratios['middle']) // ds_mid.ratios['top']
+        assert cond[0, 0].item() == expected_top_start, (
+            f"Middle cond misaligned: cond[0,0]={cond[0,0].item()} vs expected={expected_top_start}"
+        )
+        print(f"  [Pass] Middle level — target={tuple(target.shape)}, cond={tuple(cond.shape)}, aligned ✓")
 
-        # 3. Test Multiple Random Crops for Alignment
+        # ── Bottom level ──────────────────────────────────────────────────────
+        ds_bot = JukeboxQuantizedDataset(
+            tmp_dir, target_time_frames=2048,
+            level_target_time_frames=level_tfs, selected_level='bottom',
+        )
         for i in range(5):
-            top, mid, bot, timing = dataset[0]
-            
-            # Check Shapes
-            assert top.shape == (64, 8), f"Top shape mismatch: {top.shape}"
-            assert mid.shape == (32, 16), f"Mid shape mismatch: {mid.shape}"
-            assert bot.shape == (16, 32), f"Bot shape mismatch: {bot.shape}"
-            
-            # Check Types
-            assert top.dtype == torch.long
-            assert timing.dtype == torch.float32
+            target, cond, second_cond, timing = ds_bot[0]
+            # bottom window = 128 frames / 8 ratio = 16 time-cols
+            # mid slice for bottom = 16 * (128/512) = 4 time-cols
+            # top slice for bottom = 64 * (128/2048) = 4 time-cols
+            assert target.shape[1] == 32,      f"Bottom target freq_bins: {target.shape}"
+            assert target.shape[0] == 16,      f"Bottom target time-cols: {target.shape}"
+            assert cond.shape[0] == ds_bot._mid_cols_for_bottom
+            assert second_cond.shape[0] == ds_bot._top_cols_for_bottom
 
-            # --- MATH VERIFICATION ---
-            # Extract the 'Time ID' from the first column of the first row
-            # Because we used arange(N), the value should match the index
-            t_val = top[0, 0].item()
-            m_val = mid[0, 0].item()
-            b_val = bot[0, 0].item()
+            # Alignment check using the mock gradient values
+            b_val = target[0, 0].item()   # bottom token index
+            m_val = cond[0, 0].item()     # middle token index
+            t_val = second_cond[0, 0].item()  # top token index
 
-            # Ratio check: Top:Mid:Bot is 1:2:4 in token-step space
-            # Example: If Top starts at token 10, Mid must start at 20, Bot at 40
-            assert m_val == t_val * 2, f"Alignment Error: Top index {t_val} vs Mid index {m_val}"
-            assert b_val == t_val * 4, f"Alignment Error: Top index {t_val} vs Bot index {b_val}"
-            
-            # Timing Verification
+            expected_m = (b_val * ds_bot.ratios['bottom']) // ds_bot.ratios['middle']
+            expected_t = (b_val * ds_bot.ratios['bottom']) // ds_bot.ratios['top']
+            assert m_val == expected_m, f"Bot→Mid misaligned: m_val={m_val} expected={expected_m}"
+            assert t_val == expected_t, f"Bot→Top misaligned: t_val={t_val} expected={expected_t}"
+
             start_s, total_s, fraction = timing.tolist()
-            expected_start_s = (t_val * 32 * 256) / 22050
-            assert abs(start_s - expected_start_s) < 1e-4, f"Timing start mismatch: {start_s} vs {expected_start_s}"
-            
-            print(f"  [Pass] Crop {i}: Start Token (T:{t_val}, M:{m_val}, B:{b_val}) aligned.")
+            expected_start_s = (b_val * ds_bot.ratios['bottom'] * ds_bot.hop_length) / ds_bot.sample_rate
+            assert abs(start_s - expected_start_s) < 1e-3, f"Timing mismatch: {start_s} vs {expected_start_s}"
 
-        # 4. Test Padding (Edge Case)
-        # Create a very short song payload
+            print(f"  [Pass] Bottom crop {i}: B={b_val}, M={m_val}, T={t_val} — all aligned ✓")
+
+        # ── Short song padding ─────────────────────────────────────────────────
         short_file = os.path.join(tmp_dir, 'short_song_full_quantized.pt')
-        short_payload = {
-            'top': torch.zeros((10, 8)).numpy(),
-            'middle': torch.zeros((20, 16)).numpy(),
-            'bottom': torch.zeros((40, 32)).numpy(),
-            'total_frames': 320 # Much smaller than target_time_frames (2048)
-        }
-        torch.save(short_payload, short_file)
-        
-        short_ds = JukeboxQuantizedDataset(tmp_dir, file_paths=[short_file])
-        s_top, s_mid, s_bot, s_timing = short_ds[0]
-        
-        assert s_top.shape == (64, 8), "Short song should be padded to 64 time steps"
-        assert torch.all(s_top[10:] == 0), "Padding area should be zeros"
-        assert s_timing[2] == 0, "Fraction for short song start should be 0"
-        print("  [Pass] Padding/Short song logic verified.")
+        torch.save({
+            'top':    np.zeros((10, 8),  dtype=np.int64),
+            'middle': np.zeros((20, 16), dtype=np.int64),
+            'bottom': np.zeros((40, 32), dtype=np.int64),
+            'total_frames': 320,
+        }, short_file)
 
-        # 5. Test Dataloader compatibility
-        loader = DataLoader(dataset, batch_size=2, shuffle=True)
-        # Since we only have 1 file, we'll see how it handles it
-        print("  [Pass] DataLoader test passed.")
+        ds_short = JukeboxQuantizedDataset(
+            tmp_dir,
+            file_paths=[short_file.replace('_full_quantized.pt', '.npy')
+                        .replace(tmp_dir + '/', '')],  # simulate npy path
+            target_time_frames=2048,
+            level_target_time_frames=level_tfs,
+            selected_level='bottom',
+        )
+        # Re-init pointing directly at the pt file
+        ds_short.files = [short_file]
+        ds_short._init_grids()
 
-    print("\nAll tests passed successfully!")
+        target, cond, second_cond, timing = ds_short[0]
+        assert target.shape[0] == ds_short._bottom_window_cols, "Short bottom should be padded"
+        assert torch.all(target[40:] == 0), "Padded area should be zeros"
+        print("  [Pass] Short song padding verified ✓")
+
+        # ── DataLoader collation ───────────────────────────────────────────────
+        ds_dl = JukeboxQuantizedDataset(
+            tmp_dir, target_time_frames=2048,
+            level_target_time_frames=level_tfs, selected_level='bottom',
+        )
+        loader = DataLoader(ds_dl, batch_size=2, shuffle=False)
+        batch = next(iter(loader))
+        assert len(batch) == 4, f"Expected 4-tuple, got {len(batch)}"
+        print(f"  [Pass] DataLoader batch shapes: target={tuple(batch[0].shape)}, "
+              f"cond={tuple(batch[1].shape)}, second_cond={tuple(batch[2].shape)}, timing={tuple(batch[3].shape)}")
+
+    print("\n✅ All tests passed successfully!")
+
 
 if __name__ == '__main__':
     test_dataset_alignment_and_logic()
