@@ -65,6 +65,18 @@ def _compute_stride(lower_len: int, upper_len: int, level_name: str) -> int:
     return lower_len // upper_len
 
 
+def _loader_kwargs(num_workers: int, pin_memory: bool, persist_workers: bool, prefetch_factor: Optional[int]) -> dict:
+    kwargs = {
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+    }
+    if num_workers > 0:
+        kwargs['persistent_workers'] = persist_workers
+        if prefetch_factor is not None:
+            kwargs['prefetch_factor'] = prefetch_factor
+    return kwargs
+
+
 def train_transformer_prior(
     config_path: str,
     level_override: Optional[str] = None,
@@ -83,6 +95,12 @@ def train_transformer_prior(
     transformer_cfg['selected_level'] = selected_level
     seed = int(train_cfg.get('seed', 42))
     set_global_seed(seed)
+    num_workers = int(train_cfg.get('num_workers', 4))
+    pin_memory = bool(train_cfg.get('pin_memory', True))
+    persist_workers_cfg = train_cfg.get('persist_workers', True)
+    persist_workers = bool(persist_workers_cfg) if persist_workers_cfg is not None else True
+    prefetch_factor_cfg = train_cfg.get('prefetch_factor', 4)
+    prefetch_factor = int(prefetch_factor_cfg) if prefetch_factor_cfg is not None else None
 
     target_time_frames = int(dataset_cfg.get('target_time_frames', 2048))
     level_target_time_frames = dataset_cfg.get('level_target_time_frames') or {}
@@ -90,7 +108,7 @@ def train_transformer_prior(
     sample_rate = int(dataset_cfg.get('sample_rate', 22050))
     hop_length = int(dataset_cfg.get('hop_length', 256))
     segment_overlap = float(dataset_cfg.get('segment_overlap', 0.0))
-    
+
     # Codebook size: use explicit config value or sensible default (Jukebox uses 2048)
     vqvae_codebook_size = int(vqvae_cfg.get('codebook_size', 2048))
 
@@ -106,8 +124,6 @@ def train_transformer_prior(
         validation_split=train_cfg.get('validation_split', 0.1),
         seed=seed,
     )
-    train_file_paths=train_file_paths[:64]  # --- TEMPORARY LIMIT FOR TESTING ---
-    val_file_paths=val_file_paths[:]       # --- TEMPORARY LIMIT FOR
 
     # Load precomputed quantized dataset
     print(f"--- Loading Precomputed Quantized Dataset for {selected_level} ---")
@@ -115,8 +131,20 @@ def train_transformer_prior(
         quantized_path=quantized_data_path,
         file_paths=train_file_paths,
         target_time_frames=target_time_frames,
+        level_target_time_frames=level_target_time_frames,
+        selected_level=selected_level,
     )
-    train_loader = DataLoader(train_dataset, batch_size=train_cfg['batch_size'], shuffle=True)
+    print(
+        f"Train dataset examples for {selected_level}: {len(train_dataset)} "
+        f"(loader workers={num_workers}, pin_memory={pin_memory}, "
+        f"persistent_workers={persist_workers if num_workers > 0 else False}, prefetch_factor={prefetch_factor})"
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_cfg['batch_size'],
+        shuffle=True,
+        **_loader_kwargs(num_workers, pin_memory, persist_workers, prefetch_factor),
+    )
     val_loader = None
     if val_file_paths:
         print(f"--- Loading Precomputed Validation Dataset for {selected_level} ---")
@@ -124,8 +152,18 @@ def train_transformer_prior(
             quantized_path=quantized_data_path,
             file_paths=val_file_paths,
             target_time_frames=target_time_frames,
+            level_target_time_frames=level_target_time_frames,
+            selected_level=selected_level,
         )
-        val_loader = DataLoader(val_dataset, batch_size=train_cfg['batch_size'], shuffle=False)
+        print(f"Validation dataset examples for {selected_level}: {len(val_dataset)}")
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=train_cfg['batch_size'],
+            shuffle=False,
+            **_loader_kwargs(num_workers, pin_memory, persist_workers, prefetch_factor),
+        )
+    else:
+        print(f"No validation dataset configured for {selected_level}; training will use {len(train_dataset)} examples only.")
 
     # Use explicit codebook size (not inferred from data, which may have smaller max token)
     num_embeddings_map = {
@@ -136,22 +174,25 @@ def train_transformer_prior(
     print(f"Using codebook size: {vqvae_codebook_size}")
 
     sample = train_dataset[0]
-    top_indices, middle_indices, bottom_indices, timing, sample_meta = sample
-    top_rows, top_cols = top_indices.shape
-    middle_rows, middle_cols = (middle_indices.shape if middle_indices.numel() > 0 else (0, 0))
-    bottom_rows, bottom_cols = (bottom_indices.shape if bottom_indices.numel() > 0 else (0, 0))
+    # Dataset returns fixed-size window tensors; use those shapes directly rather than
+    # inferring conditioner lengths from full-song latent grids.
+    target_indices, cond_indices_sample, second_cond_indices_sample, timing_sample = sample
 
-    target_tensor = top_indices if selected_level == 'top' else middle_indices if selected_level == 'middle' else bottom_indices
-    target_seq_len = int(target_tensor.numel())
+    # Infer grid shapes from the dataset's reported grid info
+    top_rows, top_cols = train_dataset.top_grid
+    middle_rows, middle_cols = train_dataset.middle_grid
+    bottom_rows, bottom_cols = train_dataset.bottom_grid
+
+    target_seq_len = int(target_indices.numel())
     seq_lens = {'top': target_seq_len, 'middle': target_seq_len, 'bottom': target_seq_len}
 
-    print(f"Top grid shape: {tuple(top_indices.shape)}")
-    print(f"Middle grid shape: {tuple(middle_indices.shape)}")
-    print(f"Bottom grid shape: {tuple(bottom_indices.shape)}")
+    print(f"Top grid shape: ({top_rows}, {top_cols})")
+    print(f"Middle grid shape: ({middle_rows}, {middle_cols})")
+    print(f"Bottom grid shape: ({bottom_rows}, {bottom_cols})")
 
     # --- Temporal alignment for conditioning ---
     # Each upsampler trains on a window of the target level, conditioned on the
-    # matching slice of the upper level that covers the same audio span.
+    # matching ALIGNED slice of the upper level that covers the same audio span.
     prior_cfg = _get_prior_cfg(config, LEVEL_TO_PRIOR_CFG[selected_level])
     cond_level = COND_LEVEL[selected_level]
     second_cond_level = SECOND_COND_LEVEL[selected_level]
@@ -161,27 +202,17 @@ def train_transformer_prior(
     _mid_tf = int(level_target_time_frames.get('middle', target_time_frames))
     _bot_tf = int(level_target_time_frames.get('bottom', target_time_frames))
 
-    cond_time_cols = 0
-    second_cond_time_cols = 0
-    cond_seq_len = 0
-    second_cond_seq_len = 0
-    cond_grid_h = 0
-    cond_grid_w = 0
-
-    if selected_level == 'middle':
-        cond_time_cols = max(1, round(top_rows * _mid_tf / _top_tf))
-        cond_grid_h, cond_grid_w = top_rows, top_cols
-        cond_seq_len = cond_time_cols * top_cols
-    elif selected_level == 'bottom':
-        cond_time_cols = max(1, round(middle_rows * _bot_tf / _mid_tf))
-        cond_grid_h, cond_grid_w = middle_rows, middle_cols
-        cond_seq_len = cond_time_cols * middle_cols
-        if condition_on_top:
-            second_cond_time_cols = max(1, round(top_rows * _bot_tf / _top_tf))
-            second_cond_seq_len = second_cond_time_cols * top_cols
+    cond_seq_len = int(cond_indices_sample.numel()) if cond_indices_sample.numel() > 0 else 0
+    second_cond_seq_len = int(second_cond_indices_sample.numel()) if second_cond_indices_sample.numel() > 0 else 0
+    cond_time_cols = int(cond_indices_sample.shape[0]) if cond_indices_sample.ndim == 2 and cond_indices_sample.numel() > 0 else 0
+    second_cond_time_cols = (
+        int(second_cond_indices_sample.shape[0])
+        if second_cond_indices_sample.ndim == 2 and second_cond_indices_sample.numel() > 0
+        else 0
+    )
 
     if cond_seq_len > 0:
-        print(f"Conditioning slice for {selected_level}: {cond_time_cols} time-cols × {cond_grid_w} freq = {cond_seq_len} tokens")
+        print(f"Conditioning slice for {selected_level}: {cond_time_cols} time-cols × {top_cols if selected_level == 'middle' else middle_cols} freq = {cond_seq_len} tokens")
     if second_cond_seq_len > 0:
         print(f"Second conditioning slice (Top→Bottom): {second_cond_time_cols} time-cols × {top_cols} freq = {second_cond_seq_len} tokens")
 
@@ -264,7 +295,7 @@ def train_transformer_prior(
                     break
 
     epochs = int(train_cfg['epochs'])
-    
+
     # Initialize EarlyStopping with initial best score
     initial_best_score = None
     if retrain and initial_best_metric is not None:
@@ -272,9 +303,9 @@ def train_transformer_prior(
 
     # Only use early stopping if we have a validation set and a valid initial best score (from previous training or current checkpoint)
     early_stopping = None
-    if val_loader is not None and initial_best_score is not None:
+    if val_loader is not None:
         early_stopping = EarlyStopping(
-            patience=int(train_cfg.get('early_stopping_patience', 10)), 
+            patience=int(train_cfg.get('early_stopping_patience', 10)),
             verbose=True,
             best_score=initial_best_score,
             counter=historical_counter
@@ -282,10 +313,10 @@ def train_transformer_prior(
 
     adam_beta2 = float(prior_cfg.get('adam_beta2', 0.95))
     optimizer = optim.AdamW(
-        prior.parameters(), 
-        lr=float(train_cfg['learning_rate']), 
+        prior.parameters(),
+        lr=float(train_cfg['learning_rate']),
         weight_decay=float(train_cfg.get('weight_decay', 0.01)),
-        betas=(0.9, adam_beta2) # jukebox paper uses default beta1 (0.9) but modified beta2
+        betas=(0.9, adam_beta2)  # jukebox paper uses default beta1 (0.9) but modified beta2
     )
 
     if retrain and 'optimizer_state' in checkpoint:
@@ -307,10 +338,10 @@ def train_transformer_prior(
         optimizer,
         max_lr=float(train_cfg['learning_rate']),
         total_steps=total_steps,
-        pct_start=0.05, # Peaks at 5% of training, then gently decays
+        pct_start=0.05,  # Peaks at 5% of training, then gently decays
         anneal_strategy='cos'
     )
-    
+
     if retrain and 'scheduler_state' in checkpoint:
         try:
             scheduler.load_state_dict(checkpoint['scheduler_state'])
@@ -353,7 +384,6 @@ def train_transformer_prior(
         config_to_save['model']['inferred_upsample_stride'] = int(upsample_stride)
     if second_upsample_stride is not None:
         config_to_save['model']['inferred_second_upsample_stride'] = int(second_upsample_stride)
-    # Persist conditioning slice info for diagnostics and potential future use.
     if cond_seq_len > 0:
         config_to_save['model']['inferred_cond_seq_len'] = int(cond_seq_len)
         config_to_save['model']['inferred_cond_time_cols'] = int(cond_time_cols)
@@ -374,7 +404,7 @@ def train_transformer_prior(
     best_val_loss = initial_best_metric if initial_best_metric is not None else float('inf')
     best_epoch = start_epoch if start_epoch > 0 else 0
 
-    if early_stopping is not None :
+    if early_stopping is not None:
         if (start_epoch >= epochs) or (early_stopping.counter >= early_stopping.patience):
             print(f"Checkpoint epoch ({start_epoch}) is already >= configured epochs ({epochs}) or patience ({early_stopping.patience}) has been exhausted (counter: {early_stopping.counter}). Nothing to train.")
             return
@@ -386,25 +416,18 @@ def train_transformer_prior(
 
         pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs} [Train:{selected_level}]')
         for batch_idx, batch in enumerate(pbar):
-            top_indices = batch[0].to(device)
-            mid_indices = batch[1].to(device)
-            bot_indices = batch[2].to(device)
-            timing = batch[3].to(device)  # (B, 3): [start_time_s, total_duration_s, fraction_elapsed]
-            meta = batch[4].to(device) if len(batch) > 4 else torch.zeros((top_indices.shape[0], 2), device=device, dtype=torch.long)
+            # dataset now returns (target, cond, second_cond, timing) for all levels.
+            # 'cond' is the temporally-aligned upper-level slice (None for top).
+            # 'second_cond' is the aligned top slice for bottom (None otherwise).
+            target_indices = batch[0].to(device)
+            cond_indices = batch[1].to(device) if batch[1] is not None else None
+            second_cond_indices = batch[2].to(device) if batch[2] is not None else None
+            timing = batch[3].to(device)
 
-            cond_seq = None
-            second_cond_seq = None
-            if selected_level == 'top':
-                target_indices = top_indices
-            elif selected_level == 'middle':
-                target_indices = mid_indices
-                cond_seq = top_indices.view(top_indices.shape[0], -1) # condition on the aligned slice of Top (already handled by Dataset)
-            else: # bottom
-                target_indices = bot_indices
-                cond_seq = mid_indices.view(mid_indices.shape[0], -1)
-                second_cond_seq = top_indices.view(top_indices.shape[0], -1)
-
-            target_seq = target_indices.view(target_indices.shape[0], -1)   # flatten the target grid for loss
+            # Flatten 2D grids into 1D sequences for the model
+            target_seq = target_indices.view(target_indices.shape[0], -1)
+            cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
+            second_cond_seq = second_cond_indices.view(second_cond_indices.shape[0], -1) if second_cond_indices is not None else None
 
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
@@ -442,30 +465,14 @@ def train_transformer_prior(
             val_running_loss = 0.0
             with torch.no_grad():
                 for batch in tqdm(val_loader, desc=f'Epoch {epoch + 1}/{epochs} [Val:{selected_level}]'):
-                    top_indices = batch[0].to(device)
-                    mid_indices = batch[1].to(device)
-                    bot_indices = batch[2].to(device)
+                    target_indices = batch[0].to(device)
+                    cond_indices = batch[1].to(device) if batch[1] is not None else None
+                    second_cond_indices = batch[2].to(device) if batch[2] is not None else None
                     timing = batch[3].to(device)
-                    meta = batch[4].to(device) if len(batch) > 4 else torch.zeros((top_indices.shape[0], 2), device=device, dtype=torch.long)
-
                     # Flatten 2D grids (Time, Freq) into 1D sequences (Time*Freq = 512)
-                    top_seq = top_indices.view(top_indices.shape[0], -1)
-                    mid_seq = mid_indices.view(mid_indices.shape[0], -1)
-                    bot_seq = bot_indices.view(bot_indices.shape[0], -1)
-
-                    cond_seq = None
-                    second_cond_seq = None
-                    if selected_level == 'top':
-                        target_seq = top_seq
-                    elif selected_level == 'middle':
-                        target_seq = mid_seq
-                        # Condition on the aligned slice of Top
-                        cond_seq = top_seq 
-                    else: # bottom
-                        target_seq = bot_seq
-                        # Primary conditioning (Middle) and Secondary (Top)
-                        cond_seq = mid_seq
-                        second_cond_seq = top_seq
+                    target_seq = target_indices.view(target_indices.shape[0], -1)
+                    cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
+                    second_cond_seq = second_cond_indices.view(second_cond_indices.shape[0], -1) if second_cond_indices is not None else None
 
                     if use_amp:
                         with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
@@ -484,8 +491,8 @@ def train_transformer_prior(
             f"Epoch {epoch + 1}: Train Loss={epoch_train_loss:.4f}"
             + (f" Val Loss={epoch_val_loss:.4f}" if epoch_val_loss is not None else "")
         )
-    
-        if epoch_val_loss:
+
+        if epoch_val_loss is not None:
             # Save models
             ## Save best model based on validation loss
             if epoch_val_loss < best_val_loss:
@@ -499,12 +506,13 @@ def train_transformer_prior(
                         'train_loss': epoch_train_loss,
                         'val_loss': epoch_val_loss,
                         'history': {'train_loss': train_losses, 'val_loss': val_losses},
+                        'optimizer_state': optimizer.state_dict(),
+                        'scheduler_state': scheduler.state_dict(),
                     },
                     os.path.join(run_dir, 'best_model.pth')
                 )
                 print('Saved best model.')
 
-        ## Periodic checkpointing every 10 epochs
         if (epoch + 1) % 10 == 0:
             torch.save(
                 {
@@ -513,6 +521,8 @@ def train_transformer_prior(
                     'train_loss': epoch_train_loss,
                     'val_loss': epoch_val_loss,
                     'history': {'train_loss': train_losses, 'val_loss': val_losses},
+                    'optimizer_state': optimizer.state_dict(),
+                    'scheduler_state': scheduler.state_dict(),
                 },
                 os.path.join(run_dir, f'model_epoch_{epoch + 1}.pth')
             )
@@ -525,6 +535,8 @@ def train_transformer_prior(
                 'train_loss': epoch_train_loss,
                 'val_loss': epoch_val_loss,
                 'history': {'train_loss': train_losses, 'val_loss': val_losses},
+                'optimizer_state': optimizer.state_dict(),
+                'scheduler_state': scheduler.state_dict(),
             },
             os.path.join(run_dir, f'latest_model.pth')
         )
