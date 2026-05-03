@@ -61,6 +61,13 @@ class TransformerPriorConditioned(nn.Module):
         conditioner_dilation_cycle: int = 8,
         dropout: float = 0.1,
         attention_qkv_ratio: float = 1.0,
+        use_timing_conditioning: bool = True,
+        timing_num_bins: int = 1024,
+        duration_num_bins: int = 256,
+        timing_window_seconds: Optional[float] = None,
+        timing_max_duration_seconds: float = 3600.0,
+        timing_embedding_init_std: float = 0.02,
+        timing_embedding_scale: float = 1.0,
     ):
         """!
         @brief Initializes the TransformerPrior model.
@@ -95,6 +102,7 @@ class TransformerPriorConditioned(nn.Module):
         @param conditioner_dilation_growth_rate The rate at which the dilation factor grows in the WaveNet conditioner. Defaults to 3.
         @param conditioner_dilation_cycle The cycle length for the dilation factors in the WaveNet conditioner. Defaults to 8.
         @param dropout The dropout probability. Defaults to 0.1.
+        @param use_timing_conditioning Whether to add learned timing metadata to every token embedding.
         """
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -108,6 +116,12 @@ class TransformerPriorConditioned(nn.Module):
         self.max_time_steps = max_time_steps
         self.use_bos_token = use_bos_token
         self.attention_qkv_ratio = float(attention_qkv_ratio)
+        self.use_timing_conditioning = bool(use_timing_conditioning)
+        self.timing_num_bins = int(timing_num_bins)
+        self.duration_num_bins = int(duration_num_bins)
+        self.timing_window_seconds = float(timing_window_seconds) if timing_window_seconds is not None else None
+        self.timing_max_duration_seconds = float(timing_max_duration_seconds)
+        self.timing_embedding_scale = float(timing_embedding_scale)
         self.bos_token_id = num_embeddings if use_bos_token else None
         self.input_vocab_size = num_embeddings + (1 if use_bos_token else 0)
 
@@ -151,14 +165,32 @@ class TransformerPriorConditioned(nn.Module):
         # Embedding layers for tokens and positions
         self.token_embedding = nn.Embedding(self.input_vocab_size, model_dim)
         self.pos_embedding = nn.Embedding(max_seq_len, model_dim)
-        # Continuous timing projection: maps [start_time_s, total_duration_s, fraction_elapsed]
-        # to model_dim and adds a global conditioning signal broadcast over the sequence.
-        self.timing_proj = nn.Linear(3, model_dim)  # jukebox Section 5.2
+        self.absolute_timing_embedding = None
+        self.relative_timing_embedding = None
+        self.duration_timing_embedding = None
+        if self.use_timing_conditioning:
+            if self.timing_num_bins < 2:
+                raise ValueError(f"timing_num_bins must be >= 2, got {self.timing_num_bins}")
+            if self.duration_num_bins < 2:
+                raise ValueError(f"duration_num_bins must be >= 2, got {self.duration_num_bins}")
+            self.absolute_timing_embedding = nn.Embedding(self.timing_num_bins, model_dim)
+            self.relative_timing_embedding = nn.Embedding(self.timing_num_bins, model_dim)
+            self.duration_timing_embedding = nn.Embedding(self.duration_num_bins, model_dim)
+            self._init_learned_timing_embeddings(float(timing_embedding_init_std))
 
         # Initialize the transformer layers
         self._init_factored_transformer_layers()
         self.norm = nn.LayerNorm(model_dim)
         self.to_logits = nn.Linear(model_dim, num_embeddings, bias=False)
+
+    def _init_learned_timing_embeddings(self, init_std: float):
+        """Initialize timing embeddings gently so they start as a cue, not a dominant signal."""
+        for emb in (
+            self.absolute_timing_embedding,
+            self.relative_timing_embedding,
+            self.duration_timing_embedding,
+        ):
+            nn.init.normal_(emb.weight, mean=0.0, std=init_std)
 
     def _init_factored_transformer_layers(self):
         """!
@@ -196,8 +228,8 @@ class TransformerPriorConditioned(nn.Module):
         @param upper_indices The input token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
         This is used as conditioning information for upsampler priors. Defaults to None (no conditioning).
         @param timing Optional global timing tensor of shape (batch_size, 3) with float values
-        [start_time_seconds, total_duration_seconds, fraction_elapsed]. Projected to model_dim
-        and broadcast over the full sequence so the model knows where it is inside a song.
+        [start_time_seconds, total_duration_seconds, fraction_elapsed]. Converted into bounded learned timing
+        buckets so the model knows where the current sequence is inside a song.
         @return Logits over the vocabulary for the next token prediction (shape: [batch_size, seq_len, num_embeddings]).
         """
         if indices.ndim != 2:
@@ -217,10 +249,9 @@ class TransformerPriorConditioned(nn.Module):
         # base embeddings (tokens + position)
         x = self.token_embedding(indices) + self.pos_embedding(pos)
 
-        # Add global timing embedding if provided.
+        # Add learned timing embeddings if provided.
         # timing shape: (B, 3) with [start_time_s, total_duration_s, fraction_elapsed].
-        # Projected to (B, model_dim) then broadcast over seq_len.
-        if timing is not None:
+        if self.use_timing_conditioning and timing is not None:
             timing = timing.to(device=device, dtype=torch.float32)
             if timing.ndim == 1:
                 timing = timing.unsqueeze(0)
@@ -230,8 +261,8 @@ class TransformerPriorConditioned(nn.Module):
                 raise ValueError(
                     f"timing must have shape (B, 3) or (1, 3), got {tuple(timing.shape)}"
                 )
-            t_emb = self.timing_proj(timing)    # (B, model_dim)
-            x = x + t_emb.unsqueeze(1)          # broadcast: (B, 1, model_dim) + (B, T, model_dim)
+            t_emb = self._learned_timing_embedding(timing, seq_len, device)
+            x = x + self.timing_embedding_scale * t_emb
 
         if self.is_upsampler:
             if upper_indices is None:
@@ -300,6 +331,48 @@ class TransformerPriorConditioned(nn.Module):
         logits = self.to_logits(x)
         
         return logits
+
+    def _learned_timing_embedding(
+        self,
+        timing: torch.Tensor,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Build bounded learned timing embeddings from absolute song position,
+        relative position inside the model window, and total duration.
+        """
+        pos = torch.arange(seq_len, device=device)
+        token_time_col = torch.div(pos, self.block_len, rounding_mode='floor')
+        window_time_cols = max(1, (self.max_seq_len + self.block_len - 1) // self.block_len)
+        rel_denom = max(1, window_time_cols - 1)
+        rel_fraction = (token_time_col.float() / rel_denom).clamp(0.0, 1.0)
+        rel_idx = torch.round(rel_fraction * (self.timing_num_bins - 1)).long()
+
+        start_s = timing[:, 0:1].clamp_min(0.0)
+        duration_s = timing[:, 1:2].clamp_min(1e-6)
+        window_s = self.timing_window_seconds
+        if window_s is None or window_s <= 0:
+            # Fall back to using the stored segment start fraction only.
+            abs_fraction = timing[:, 2:3].clamp(0.0, 1.0).expand(-1, seq_len)
+        else:
+            token_offset_s = rel_fraction.view(1, seq_len) * float(window_s)
+            abs_fraction = ((start_s + token_offset_s) / duration_s).clamp(0.0, 1.0)
+        abs_idx = torch.round(abs_fraction * (self.timing_num_bins - 1)).long()
+
+        max_duration = max(self.timing_max_duration_seconds, 1.0)
+        duration_clamped = duration_s.clamp(1.0, max_duration)
+        duration_fraction = torch.log1p(duration_clamped) / torch.log1p(
+            torch.tensor(max_duration, device=device, dtype=torch.float32)
+        )
+        duration_idx = torch.round(
+            duration_fraction.clamp(0.0, 1.0) * (self.duration_num_bins - 1)
+        ).long().squeeze(1)
+
+        rel_emb = self.relative_timing_embedding(rel_idx).unsqueeze(0)
+        abs_emb = self.absolute_timing_embedding(abs_idx)
+        dur_emb = self.duration_timing_embedding(duration_idx).unsqueeze(1)
+        return abs_emb + rel_emb + dur_emb
 
     def loss(
         self,
