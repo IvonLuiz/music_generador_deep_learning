@@ -201,6 +201,8 @@ def train_transformer_prior(
     _top_tf = int(level_target_time_frames.get('top', target_time_frames))
     _mid_tf = int(level_target_time_frames.get('middle', target_time_frames))
     _bot_tf = int(level_target_time_frames.get('bottom', target_time_frames))
+    selected_tf = {'top': _top_tf, 'middle': _mid_tf, 'bottom': _bot_tf}[selected_level]
+    timing_window_seconds = (selected_tf * hop_length) / sample_rate
 
     cond_seq_len = int(cond_indices_sample.numel()) if cond_indices_sample.numel() > 0 else 0
     second_cond_seq_len = int(second_cond_indices_sample.numel()) if second_cond_indices_sample.numel() > 0 else 0
@@ -253,7 +255,18 @@ def train_transformer_prior(
         dropout=float(prior_cfg.get('dropout', 0.1)),
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
         use_bos_token=bool(prior_cfg.get('use_bos_token', False)),
+        use_timing_conditioning=bool(prior_cfg.get('use_timing_conditioning', True)),
+        timing_num_bins=int(prior_cfg.get('timing_num_bins', 1024)),
+        duration_num_bins=int(prior_cfg.get('duration_num_bins', 256)),
+        timing_window_seconds=float(prior_cfg.get('timing_window_seconds', timing_window_seconds)),
+        timing_max_duration_seconds=float(prior_cfg.get('timing_max_duration_seconds', 3600.0)),
+        timing_embedding_init_std=float(prior_cfg.get('timing_embedding_init_std', 0.02)),
+        timing_embedding_scale=float(prior_cfg.get('timing_embedding_scale', 1.0)),
     ).to(device)
+    print(
+        f"Timing conditioning: {'enabled' if prior.use_timing_conditioning else 'disabled'} "
+        f"(learned absolute/relative/duration embeddings)"
+    )
 
     retrain = bool(train_cfg.get('retrain', False))
     pretrained_weights_path = train_cfg.get('pretrained_weights_path')
@@ -311,7 +324,7 @@ def train_transformer_prior(
             counter=historical_counter
         )
 
-    adam_beta2 = float(prior_cfg.get('adam_beta2', 0.95))
+    adam_beta2 = float(train_cfg.get('adam_beta2',  0.95))
     optimizer = optim.AdamW(
         prior.parameters(),
         lr=float(train_cfg['learning_rate']),
@@ -331,18 +344,31 @@ def train_transformer_prior(
         f"(micro_batch={int(train_cfg['batch_size'])}, effective_batch={effective_batch_size})"
     )
 
-    # Warmup for the first ~5% of total training steps
+    scheduler_name = str(train_cfg.get('scheduler', 'onecycle')).strip().lower()
     optimizer_steps_per_epoch = max(1, math.ceil(len(train_loader) / grad_accum_steps))
     total_steps = optimizer_steps_per_epoch * epochs
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=float(train_cfg['learning_rate']),
-        total_steps=total_steps,
-        pct_start=0.05,  # Peaks at 5% of training, then gently decays
-        anneal_strategy='cos'
-    )
+    scheduler = None
+    if scheduler_name in ('none', 'off', 'disabled'):
+        print("Scheduler: disabled")
+    elif scheduler_name == 'onecycle':
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=float(train_cfg['learning_rate']),
+            total_steps=total_steps,
+            pct_start=float(train_cfg.get('scheduler_pct_start', 0.05)),
+            anneal_strategy=str(train_cfg.get('scheduler_anneal_strategy', 'cos')),
+        )
+        print(
+            f"Scheduler: onecycle "
+            f"(optimizer_steps_per_epoch={optimizer_steps_per_epoch}, total_steps={total_steps})"
+        )
+    else:
+        raise ValueError(
+            f"Unsupported scheduler '{scheduler_name}'. "
+            "Expected one of: onecycle, none"
+        )
 
-    if retrain and 'scheduler_state' in checkpoint:
+    if scheduler is not None and retrain and 'scheduler_state' in checkpoint:
         try:
             scheduler.load_state_dict(checkpoint['scheduler_state'])
         except Exception as e:
@@ -379,6 +405,10 @@ def train_transformer_prior(
         'bottom': [int(bottom_rows), int(bottom_cols)],
     }
     config_to_save['model']['use_bos_token'] = bool(prior_cfg.get('use_bos_token', False))
+    config_to_save['model']['use_timing_conditioning'] = bool(prior_cfg.get('use_timing_conditioning', True))
+    config_to_save['model']['timing_window_seconds'] = float(
+        prior_cfg.get('timing_window_seconds', timing_window_seconds)
+    )
     config_to_save['model']['max_time_steps'] = int(max_time_steps)
     if upsample_stride is not None:
         config_to_save['model']['inferred_upsample_stride'] = int(upsample_stride)
@@ -450,7 +480,8 @@ def train_transformer_prior(
                     torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
                     optimizer.step()
 
-                scheduler.step()
+                if scheduler is not None:
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             running_loss += loss.item()
@@ -507,7 +538,7 @@ def train_transformer_prior(
                         'val_loss': epoch_val_loss,
                         'history': {'train_loss': train_losses, 'val_loss': val_losses},
                         'optimizer_state': optimizer.state_dict(),
-                        'scheduler_state': scheduler.state_dict(),
+                        'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
                     },
                     os.path.join(run_dir, 'best_model.pth')
                 )
@@ -522,7 +553,7 @@ def train_transformer_prior(
                     'val_loss': epoch_val_loss,
                     'history': {'train_loss': train_losses, 'val_loss': val_losses},
                     'optimizer_state': optimizer.state_dict(),
-                    'scheduler_state': scheduler.state_dict(),
+                    'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
                 },
                 os.path.join(run_dir, f'model_epoch_{epoch + 1}.pth')
             )
@@ -536,7 +567,7 @@ def train_transformer_prior(
                 'val_loss': epoch_val_loss,
                 'history': {'train_loss': train_losses, 'val_loss': val_losses},
                 'optimizer_state': optimizer.state_dict(),
-                'scheduler_state': scheduler.state_dict(),
+                'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
             },
             os.path.join(run_dir, f'latest_model.pth')
         )
