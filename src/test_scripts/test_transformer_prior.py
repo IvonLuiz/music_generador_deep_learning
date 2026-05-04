@@ -20,7 +20,6 @@ from utils import load_config
 from generation.transformer_io_utils import (
     prepare_min_max_values,
     resolve_vqvae_config_path,
-    save_decoded_spectrograms,
 )
 
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
@@ -145,6 +144,32 @@ def load_transformer_prior(
     max_time_steps_cfg = int(prior_cfg.get('max_time_steps', 0))
     max_time_steps = max_time_steps_cfg if max_time_steps_cfg > 0 else 100
 
+    deprecated_timing_keys = [
+        key for key in (
+            'time_embedding.weight',
+            'time_embedding.weight_orig',
+            'timing_proj.weight',
+            'timing_proj.weight_orig',
+            'timing_proj.bias',
+            'timing_proj.bias_orig',
+        )
+        if key in state_dict
+    ]
+    if deprecated_timing_keys:
+        raise RuntimeError(
+            f'Transformer prior checkpoint {model_path} uses deprecated timing parameters: '
+            f'{deprecated_timing_keys}. This test/generation path now supports only '
+            f'learned_absolute_relative timing. Retrain this prior with the new timing config.'
+        )
+
+    checkpoint_has_learned_timing = (
+        'absolute_timing_embedding.weight' in state_dict
+        or 'relative_timing_embedding.weight' in state_dict
+        or 'duration_timing_embedding.weight' in state_dict
+    )
+    use_timing_conditioning = bool(
+        prior_cfg.get('use_timing_conditioning', checkpoint_has_learned_timing)
+    )
 
     cond_num_embeddings = None
     upsample_stride = None
@@ -230,11 +255,37 @@ def load_transformer_prior(
         conditioner_dilation_growth_rate=conditioner_dilation_growth_rate,
         conditioner_dilation_cycle=conditioner_dilation_cycle,
         use_bos_token=use_bos_token,
+        use_timing_conditioning=use_timing_conditioning,
+        timing_num_bins=int(prior_cfg.get('timing_num_bins', 1024)),
+        duration_num_bins=int(prior_cfg.get('duration_num_bins', 256)),
+        timing_window_seconds=prior_cfg.get('timing_window_seconds', model_cfg.get('timing_window_seconds')),
+        timing_max_duration_seconds=float(prior_cfg.get('timing_max_duration_seconds', 3600.0)),
+        timing_embedding_init_std=float(prior_cfg.get('timing_embedding_init_std', 0.02)),
+        timing_embedding_scale=float(prior_cfg.get('timing_embedding_scale', 1.0)),
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
         dropout=float(prior_cfg.get('dropout', 0.1)),
     ).to(device)
 
-    prior_transformer.load_state_dict(state_dict)
+    load_state = dict(state_dict)
+    if not use_timing_conditioning:
+        load_state.pop('absolute_timing_embedding.weight', None)
+        load_state.pop('relative_timing_embedding.weight', None)
+        load_state.pop('duration_timing_embedding.weight', None)
+
+    missing, unexpected = prior_transformer.load_state_dict(load_state, strict=False)
+    allowed_missing = set()
+    if not use_timing_conditioning:
+        allowed_missing.update({
+            'absolute_timing_embedding.weight',
+            'relative_timing_embedding.weight',
+            'duration_timing_embedding.weight',
+        })
+    missing = [key for key in missing if key not in allowed_missing]
+    if missing or unexpected:
+        raise RuntimeError(
+            f'Error loading Transformer prior from {model_path}. '
+            f'Missing keys: {missing[:10]} Unexpected keys: {unexpected[:10]}'
+        )
     prior_transformer.eval()
 
     return prior_transformer, config, model_path
@@ -279,7 +330,7 @@ def _decode_indices(
     if indices.ndim != 2:
         raise ValueError(f'Expected indices shape (B, T), got {tuple(indices.shape)}')
     if not (isinstance(grid, list) and len(grid) == 2):
-        raise ValueError('Bottom grid is required to reshape indices into (H, W)')
+        raise ValueError('A level grid is required to reshape indices into (H, W)')
 
     device = next(vqvae.parameters()).device
     # grid[0] is now Time, grid[1] is now Frequency
@@ -303,6 +354,96 @@ def _decode_indices(
 
     return x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()
 
+
+def _resolve_level_vqvae_path(level: str, bottom_vqvae_path: Optional[str], vqvae_cfg: dict) -> Optional[str]:
+    if level == 'bottom':
+        return bottom_vqvae_path or vqvae_cfg.get('bottom_model_dir')
+    return vqvae_cfg.get(f'{level}_model_dir')
+
+
+def _save_level_spectrograms(decoded_specs: np.ndarray, output_dir: str, level: str) -> str:
+    spectrogram_dir = os.path.join(output_dir, level, 'spectrograms')
+    os.makedirs(spectrogram_dir, exist_ok=True)
+    np.save(os.path.join(spectrogram_dir, f'{level}_decoded_specs.npy'), decoded_specs)
+
+    for i in range(decoded_specs.shape[0]):
+        spec = decoded_specs[i, :, :, 0] if decoded_specs.ndim == 4 else decoded_specs[i]
+        plt.figure(figsize=(10, 4))
+        plt.imshow(spec, origin='lower', aspect='auto', cmap='magma')
+        plt.colorbar(label='Normalized amplitude')
+        plt.title(f'{level.capitalize()} decoded spectrogram {i}')
+        plt.tight_layout()
+        plt.savefig(os.path.join(spectrogram_dir, f'{level}_spectrogram_{i:03d}.png'), dpi=150)
+        plt.close()
+
+    return spectrogram_dir
+
+
+def _decode_level_to_audio(
+    level: str,
+    tokens: torch.Tensor,
+    grid: Optional[list],
+    vqvae_path: str,
+    weights_file: str,
+    audio_method: str,
+    save_dir: str,
+    device: torch.device,
+) -> None:
+    vqvae_config_path = resolve_vqvae_config_path(vqvae_path)
+    vqvae_config = load_config(vqvae_config_path)
+    resolved_dataset_cfg = vqvae_config.get('dataset', {}) if isinstance(vqvae_config, dict) else {}
+
+    min_max_values_path = resolved_dataset_cfg.get('min_max_values_path')
+    if not min_max_values_path:
+        raise ValueError(f'Missing dataset.min_max_values_path in {level} VQ-VAE config: {vqvae_config_path}')
+    if not os.path.exists(min_max_values_path):
+        raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
+
+    sample_rate = int(resolved_dataset_cfg.get('sample_rate', SAMPLE_RATE))
+    hop_length = int(resolved_dataset_cfg.get('hop_length', HOP_LENGTH))
+    frame_size = int(resolved_dataset_cfg.get('frame_size', FRAME_SIZE))
+    spectrograms_path = resolved_dataset_cfg.get('processed_path', '')
+    spectrogram_type_cfg = resolved_dataset_cfg.get('spectrogram_type')
+    spectrogram_type = str(spectrogram_type_cfg).strip().lower() if spectrogram_type_cfg else (
+        'mel' if 'mel' in str(spectrograms_path).lower() else 'linear'
+    )
+    n_mels = int(resolved_dataset_cfg.get('n_mels', N_MELS))
+
+    print(f'Loading {level} VQ-VAE from {vqvae_path}')
+    vqvae = load_jukebox_model(vqvae_path, level, device, weights_file)
+
+    with open(min_max_values_path, 'rb') as f:
+        min_max_values = pickle.load(f)
+
+    print(f'Decoding {level} indices into spectrograms and audio...')
+    decoded_specs = _decode_indices(vqvae, tokens, grid)
+    spectrogram_dir = _save_level_spectrograms(decoded_specs, save_dir, level)
+    min_max_list = prepare_min_max_values(min_max_values, decoded_specs.shape[0])
+
+    sound_generator = SoundGenerator(
+        vqvae,
+        hop_length=hop_length,
+        sample_rate=sample_rate,
+        n_fft=frame_size,
+        spectrogram_type=spectrogram_type,
+        n_mels=n_mels,
+    )
+    audio_signals = sound_generator.convert_spectrograms_to_audio(
+        decoded_specs, min_max_list, method=audio_method
+    )
+
+    audio_dir = os.path.join(save_dir, level, 'audio')
+    os.makedirs(audio_dir, exist_ok=True)
+    for i, signal in enumerate(audio_signals):
+        sf.write(os.path.join(audio_dir, f'{level}_sample_{i}.wav'), signal, sample_rate)
+
+    print(f'Saved {level} spectrograms to {spectrogram_dir}')
+    print(f'Saved {level} audio to {audio_dir}')
+
+    del vqvae
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 def test_transformer_prior(
     top_prior_path: str,
     middle_prior_path: str,
@@ -313,7 +454,7 @@ def test_transformer_prior(
     temperature: float,
     top_k: int,
     weights_file: str,
-    decode_level: str = 'bottom',
+    decode_level: str = 'all',
     timing: Optional[torch.Tensor] = None,
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -338,26 +479,27 @@ def test_transformer_prior(
 
     vqvae_cfg = bottom_config.get('vqvae', {}) if isinstance(bottom_config, dict) else {}
     effective_bottom_vqvae = bottom_vqvae_path or vqvae_cfg.get('bottom_model_dir')
-    effective_weights_file = weights_file or vqvae_cfg.get('weights_file', 'best_model.pth')
+    effective_vqvae_weights_file = vqvae_cfg.get('weights_file', 'best_model.pth')
 
-    # Default timing: start of a segment-length clip (fraction_elapsed=0, start_time=0).
-    # total_duration is estimated from the bottom level's VQ-VAE segment length.
+    # Default timing: start of a single top-level training window.
+    # This matches the transformer priors' global window span better than using
+    # the bottom VQ-VAE crop length.
     if timing is None:
-        dataset_cfg = bottom_config.get('dataset', {}) if isinstance(bottom_config, dict) else {}
+        transformer_dataset_cfg = bottom_config.get('dataset', {}) if isinstance(bottom_config, dict) else {}
+        dataset_cfg = dict(transformer_dataset_cfg)
         if effective_bottom_vqvae:
             vqvae_config_path = resolve_vqvae_config_path(effective_bottom_vqvae)
             vqvae_config = load_config(vqvae_config_path)
-            dataset_cfg = vqvae_config.get('dataset', dataset_cfg) if isinstance(vqvae_config, dict) else dataset_cfg
+            if isinstance(vqvae_config, dict):
+                dataset_cfg = {**vqvae_config.get('dataset', {}), **dataset_cfg}
 
-        target_time_frames = int(dataset_cfg.get('target_time_frames', 2048))
+        level_target_time_frames = transformer_dataset_cfg.get('level_target_time_frames') or {}
+        target_time_frames = int(level_target_time_frames.get('top', transformer_dataset_cfg.get('target_time_frames', 2048)))
         hop_length = int(dataset_cfg.get('hop_length', 256))
         sample_rate = int(dataset_cfg.get('sample_rate', 22050))
-        segment_overlap = float(dataset_cfg.get('segment_overlap', 0.0))
 
         segment_samples = max(1, (target_time_frames - 1) * hop_length)
-        segment_duration_s = segment_samples / sample_rate
-        hop_samples = max(1, int(segment_samples * (1.0 - segment_overlap)))
-        total_duration_s = segment_duration_s
+        total_duration_s = segment_samples / sample_rate
         timing = torch.zeros((num_samples, 3), dtype=torch.float32, device=device)
         timing[:, 1] = total_duration_s
 
@@ -413,78 +555,34 @@ def test_transformer_prior(
     torch.cuda.empty_cache()
 
     decode_level = str(decode_level).strip().lower()
-    if decode_level not in ('bottom', 'middle', 'top'):
-        raise ValueError(f'--decode_level must be one of "bottom", "middle", "top", got {decode_level}')
+    if decode_level not in ('all', 'bottom', 'middle', 'top'):
+        raise ValueError(f'--decode_level must be one of "all", "bottom", "middle", "top", got {decode_level}')
 
-    if decode_level == 'bottom':
-        decode_tokens = bottom_tokens
-        decode_grid = bottom_grid
-        effective_decode_vqvae = effective_bottom_vqvae
-    elif decode_level == 'middle':
-        decode_tokens = middle_tokens
-        decode_grid = middle_grid
-        effective_decode_vqvae = vqvae_cfg.get('middle_model_dir')
-    else:
-        decode_tokens = top_tokens
-        decode_grid = top_grid
-        effective_decode_vqvae = vqvae_cfg.get('top_model_dir')
+    generated_by_level = {
+        'top': (top_tokens, top_grid),
+        'middle': (middle_tokens, middle_grid),
+        'bottom': (bottom_tokens, bottom_grid),
+    }
+    levels_to_decode = ['top', 'middle', 'bottom'] if decode_level == 'all' else [decode_level]
 
-    if not effective_decode_vqvae:
-        raise ValueError(
-            f'{decode_level} VQ-VAE path is required. Update vqvae.{decode_level}_model_dir in Transformer config.'
+    for level in levels_to_decode:
+        effective_decode_vqvae = _resolve_level_vqvae_path(level, bottom_vqvae_path, vqvae_cfg)
+        if not effective_decode_vqvae:
+            raise ValueError(
+                f'{level} VQ-VAE path is required. Update vqvae.{level}_model_dir in Transformer config '
+                f'or pass --bottom_vqvae for the bottom level.'
+            )
+        decode_tokens, decode_grid = generated_by_level[level]
+        _decode_level_to_audio(
+            level=level,
+            tokens=decode_tokens,
+            grid=decode_grid,
+            vqvae_path=effective_decode_vqvae,
+            weights_file=effective_vqvae_weights_file,
+            audio_method=audio_method,
+            save_dir=save_dir,
+            device=device,
         )
-
-    vqvae_config_path = resolve_vqvae_config_path(effective_decode_vqvae)
-    vqvae_config = load_config(vqvae_config_path)
-    resolved_dataset_cfg = vqvae_config.get('dataset', {}) if isinstance(vqvae_config, dict) else {}
-
-    min_max_values_path = resolved_dataset_cfg.get('min_max_values_path')
-    if not min_max_values_path:
-        raise ValueError(f'Missing dataset.min_max_values_path in bottom VQ-VAE config: {vqvae_config_path}')
-
-    sample_rate = int(resolved_dataset_cfg.get('sample_rate', SAMPLE_RATE))
-    hop_length = int(resolved_dataset_cfg.get('hop_length', HOP_LENGTH))
-    frame_size = int(resolved_dataset_cfg.get('frame_size', FRAME_SIZE))
-    spectrograms_path = resolved_dataset_cfg.get('processed_path', '')
-    spectrogram_type_cfg = resolved_dataset_cfg.get('spectrogram_type')
-    spectrogram_type = str(spectrogram_type_cfg).strip().lower() if spectrogram_type_cfg else (
-        'mel' if 'mel' in str(spectrograms_path).lower() else 'linear'
-    )
-    n_mels = int(resolved_dataset_cfg.get('n_mels', N_MELS))
-
-    if effective_decode_vqvae is not None:
-        print(f'Loading {decode_level} VQ-VAE from {effective_decode_vqvae}')
-        vqvae = load_jukebox_model(effective_decode_vqvae, decode_level, device, effective_weights_file)
-
-        if not os.path.exists(min_max_values_path):
-            raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
-
-        with open(min_max_values_path, 'rb') as f:
-            min_max_values = pickle.load(f)
-
-        decoded_specs = _decode_indices(vqvae, decode_tokens, decode_grid)
-        save_decoded_spectrograms(decoded_specs, save_dir)
-        min_max_list = prepare_min_max_values(min_max_values, decoded_specs.shape[0])
-
-        sound_generator = SoundGenerator(
-            vqvae,
-            hop_length=hop_length,
-            sample_rate=sample_rate,
-            n_fft=frame_size,
-            spectrogram_type=spectrogram_type,
-            n_mels=n_mels,
-        )
-        audio_signals = sound_generator.convert_spectrograms_to_audio(
-            decoded_specs, min_max_list, method=audio_method
-        )
-
-        audio_dir = os.path.join(save_dir, 'audio')
-        os.makedirs(audio_dir, exist_ok=True)
-        for i, signal in enumerate(audio_signals):
-            sf.write(os.path.join(audio_dir, f'sample_{i}.wav'), signal, sample_rate)
-        print(f'Saved audio to {audio_dir}')
-    else:
-        print('No bottom VQ-VAE path provided, skipping spectrogram decoding and audio generation.')
 
 
 if __name__ == '__main__':
@@ -498,7 +596,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_samples', type=int, default=6, help='Number of samples to generate (default: 6)')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (default: 1.0)')
     parser.add_argument('--top_k', type=int, default=None, help='Top-k filtering for sampling (0 or negative for no filtering)')
-    parser.add_argument('--decode_level', type=str, default='bottom', choices=['bottom', 'middle', 'top'], help='Which level to decode to audio (default: bottom)')
+    parser.add_argument('--decode_level', type=str, default='all', choices=['all', 'bottom', 'middle', 'top'], help='Which level to decode to audio (default: all)')
     args = parser.parse_args()
 
     if args.temperature <= 0:
