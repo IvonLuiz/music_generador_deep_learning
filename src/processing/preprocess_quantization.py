@@ -3,7 +3,7 @@ import json
 import os
 import sys
 from glob import glob
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 import torch
@@ -13,51 +13,69 @@ from tqdm import tqdm
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from train_scripts.jukebox_utils import load_jukebox_model
+from windowed_data_utils import (
+    build_level_starts,
+    build_timing_tensor,
+    extract_window,
+    source_stem,
+)
 
 
 WINDOWED_MANIFEST = 'windowed_manifest.jsonl'
+DEFAULT_WINDOW_OVERLAP_FRACTION = 0.50
 
 
-def _source_stem(file_path: str) -> str:
-    return os.path.basename(file_path).replace('.npy', '')
-
-
-def _build_level_starts(total_frames: int, window_size: int, step: int) -> List[int]:
+def _step_from_overlap(window_size: int, overlap_fraction: float, level_name: str) -> int:
+    """!
+    @brief Calculate the step size from the window size and overlap fraction.
+    @param window_size The size of the window in frames for the level.
+    @param overlap_fraction The desired overlap fraction between windows (e.g., 0.75 for 75% overlap).
+    @param level_name The name of the level (e.g., 'top', 'middle', 'bottom') for error messages.
+    @return The calculated step size in frames, ensuring it is at least 1 and does not exceed the window size.
+    """
+    
     if window_size <= 0:
-        raise ValueError(f'window_size must be > 0, got {window_size}')
-    if step <= 0:
-        raise ValueError(f'step must be > 0, got {step}')
-    if total_frames <= window_size:
-        return [0]
+        raise ValueError(f'{level_name}_time_frames must be > 0, got {window_size}')
+    if not 0.0 <= overlap_fraction < 1.0:
+        raise ValueError(f'overlap_fraction must be in [0, 1), got {overlap_fraction}')
 
-    starts = list(range(0, total_frames - window_size + 1, step))
-    last_start = total_frames - window_size
-    if starts[-1] != last_start:
-        starts.append(last_start)
-    return starts
+    step = int(round(window_size * (1.0 - overlap_fraction)))
+    return max(1, min(window_size, step))
 
 
-def _extract_window(spec: np.ndarray, start_frame: int, window_size: int) -> np.ndarray:
-    chunk = spec[:, start_frame:start_frame + window_size]
-    if chunk.shape[1] < window_size:
-        pad_width = window_size - chunk.shape[1]
-        chunk = np.pad(chunk, ((0, 0), (0, pad_width)), mode='constant')
-    return chunk.astype(np.float32, copy=False)
+def _resolve_step_frames(
+    explicit_step: Optional[int],
+    window_size: int,
+    overlap_fraction: float,
+    level_name: str,
+) -> int:
+    """!
+    @brief Resolve the step frames for a given level, using either an explicit value or deriving from the overlap fraction.
+    @param explicit_step An optional explicit step frame count. If provided, this value is used directly after validation.
+    @param window_size The size of the window in frames for the level.
+    @param overlap_fraction The desired overlap fraction between windows, used to derive the step if explicit_step is not provided.
+    @param level_name The name of the level (e.g., 'top', 'middle', 'bottom') for error messages.
+    @return The validated step size in frames for the requested level.
+    """
+    if explicit_step is not None:
+        if explicit_step <= 0:
+            raise ValueError(f'{level_name}_step_frames must be > 0, got {explicit_step}')
+        return int(explicit_step)
+
+    return _step_from_overlap(window_size, overlap_fraction, level_name)
 
 
 def _encode_level_windows(model, batch_windows: np.ndarray, device: torch.device) -> torch.Tensor:
+    """!
+    @brief Encode a batch of spectrogram windows into VQ code indices.
+    @param model Loaded Jukebox VQ-VAE model for one hierarchy level.
+    @param batch_windows NumPy batch shaped (B, Freq, Time) containing normalized spectrogram windows.
+    @param device Torch device used for the VQ-VAE forward pass.
+    @return Integer tensor shaped (B, Time_latent, Freq_latent) on CPU for serialization.
+    """
     x_batch = torch.from_numpy(batch_windows).unsqueeze(1).float().to(device)
-    encoded = model.encoder(x_batch)
-    pre_vq = model.pre_vq_conv(encoded)
-    _, indices, _, _, _ = model.vq(pre_vq)
+    indices = model.encode_to_indices(x_batch)
     return indices.transpose(1, 2).contiguous().cpu().to(torch.int32)
-
-
-def _build_timing(start_frame: int, total_frames: int, sample_rate: int, hop_length: int) -> torch.Tensor:
-    start_time_s = (start_frame * hop_length) / sample_rate
-    total_duration_s = (total_frames * hop_length) / sample_rate
-    fraction = start_time_s / max(total_duration_s, 1e-6)
-    return torch.tensor([start_time_s, total_duration_s, fraction], dtype=torch.float32)
 
 
 def _build_anchor_schedule(
@@ -69,9 +87,23 @@ def _build_anchor_schedule(
     middle_step_frames: int,
     bottom_step_frames: int,
 ) -> Dict[int, List[str]]:
-    top_starts = _build_level_starts(total_frames, top_time_frames, top_step_frames)
-    middle_starts = _build_level_starts(total_frames, middle_time_frames, middle_step_frames)
-    bottom_starts = _build_level_starts(total_frames, bottom_time_frames, bottom_step_frames)
+    """!
+    @brief Build a schedule of anchor start frames mapped to their eligible 
+    levels based on the provided window and step configurations.
+    @param total_frames The total number of frames in the spectrogram.
+    @param top_time_frames The window size in frames for the top level.
+    @param middle_time_frames The window size in frames for the middle level.
+    @param bottom_time_frames The window size in frames for the bottom level.
+    @param top_step_frames The step size in frames for the top level.
+    @param middle_step_frames The step size in frames for the middle level.
+    @param bottom_step_frames The step size in frames for the bottom level.
+    @return A dictionary mapping each anchor start frame (int) to a list of 
+    eligible level names (List[str]) that can be trained at that anchor based
+    on the window and step configurations.
+    """
+    top_starts = build_level_starts(total_frames, top_time_frames, top_step_frames)
+    middle_starts = build_level_starts(total_frames, middle_time_frames, middle_step_frames)
+    bottom_starts = build_level_starts(total_frames, bottom_time_frames, bottom_step_frames)
 
     anchor_to_levels: Dict[int, List[str]] = {}
     for level_name, starts in (
@@ -95,6 +127,16 @@ def precompute_full_songs(
     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     weights_file="best_model.pth"
 ):
+    """!
+    @brief Quantize whole songs chunk-by-chunk and save one stitched latent file per source spectrogram.
+    @param vqvae_dirs Mapping with the trained VQ-VAE directory for the top, middle, and bottom levels.
+    @param source_npy_path Directory containing source spectrogram `.npy` files.
+    @param output_dir Directory where stitched quantized `.pt` files will be saved.
+    @param chunk_size Raw spectrogram time frames processed at once to stay within GPU memory limits.
+    @param device Torch device used for quantization.
+    @param weights_file Checkpoint filename to load from each VQ-VAE directory.
+    @return None. Quantized latent files are written to `output_dir`.
+    """
     os.makedirs(output_dir, exist_ok=True)
     models = {lvl: load_jukebox_model(vqvae_dirs[lvl], lvl, device, weights_file).eval() 
               for lvl in ['top', 'middle', 'bottom']}
@@ -106,18 +148,16 @@ def precompute_full_songs(
             spec = np.load(f)  # [Freq, Total_Time]
             total_frames = spec.shape[1]
             
-            # Dicionários para guardar os pedaços de índices de cada nível
+            # Collect latent index chunks on CPU before stitching the full-song timeline.
             all_indices = {'top': [], 'middle': [], 'bottom': []}
 
-            # Loop por blocos temporais
             for start in range(0, total_frames, chunk_size):
                 end = min(start + chunk_size, total_frames)
                 
-                # Extrai o pedaço e garante que é múltiplo de 32 para evitar erros de shape no encoder
+                # Pad the last chunk temporarily so the deepest top encoder can downsample cleanly.
                 chunk = spec[:, start:end]
                 actual_len = chunk.shape[1]
                 
-                # Se o último pedaço não for múltiplo de 32, fazemos um padding temporário
                 pad_val = 0
                 if actual_len % 32 != 0:
                     pad_val = 32 - (actual_len % 32)
@@ -127,21 +167,16 @@ def precompute_full_songs(
 
                 for lvl in ['top', 'middle', 'bottom']:
                     m = models[lvl]
-                    # Forward pass do chunk
-                    z = m.encoder(x_chunk)
-                    z = m.pre_vq_conv(z)
-                    _, idx, _, _, _ = m.vq(z)
+                    idx = m.encode_to_indices(x_chunk)
                     
-                    # Converte para [Time, Freq] e remove o padding se necessário
-                    # O downsampling ratio muda por nível: Top=32, Mid=16, Bot=8
+                    # Convert to [Time, Freq] and drop latent columns introduced only by padding.
                     ratio = 32 if lvl == 'top' else 16 if lvl == 'middle' else 8
                     tokens_to_keep = actual_len // ratio
                     
-                    # idx shape: [1, Freq, Time_steps]
                     idx_np = idx.squeeze(0).transpose(0, 1).cpu().numpy()
                     all_indices[lvl].append(idx_np[:tokens_to_keep, :])
 
-            # Junta todos os chunks processados no CPU
+            # Stitch the per-chunk latent timelines on CPU once the whole song has been encoded.
             full_latents = {
                 lvl: np.concatenate(all_indices[lvl], axis=0) 
                 for lvl in ['top', 'middle', 'bottom']
@@ -157,8 +192,8 @@ def precompute_full_songs(
             out_name = os.path.basename(f).replace(".npy", "_full_quantized.pt")
             torch.save(save_data, os.path.join(output_dir, out_name))
             
-            # Limpa cache da GPU após cada música para garantir estabilidade
-            torch.cuda.empty_cache()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
 
 
 def precompute_windowed_examples(
@@ -168,16 +203,45 @@ def precompute_windowed_examples(
     top_time_frames=2048,
     middle_time_frames=512,
     bottom_time_frames=128,
-    top_step_frames=2048,
-    middle_step_frames=512,
-    bottom_step_frames=128,
+    top_step_frames=None,
+    middle_step_frames=None,
+    bottom_step_frames=None,
+    overlap_fraction=DEFAULT_WINDOW_OVERLAP_FRACTION,
     batch_size=8,
     sample_rate=22050,
     hop_length=256,
     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     weights_file='best_model.pth',
 ):
+    """!
+    @brief Quantize aligned top, middle, and bottom windows into seam-free training examples for transformer priors.
+    @param vqvae_dirs Mapping with the trained VQ-VAE directory for the top, middle, and bottom levels.
+    @param source_npy_path Directory containing source spectrogram `.npy` files.
+    @param output_dir Directory where windowed quantized `.pt` files and metadata will be saved.
+    @param top_time_frames Raw spectrogram window size for the top prior examples.
+    @param middle_time_frames Raw spectrogram window size for the middle prior examples.
+    @param bottom_time_frames Raw spectrogram window size for the bottom prior examples.
+    @param top_step_frames Optional explicit raw-frame hop for top windows. If omitted, it is derived from `overlap_fraction`.
+    @param middle_step_frames Optional explicit raw-frame hop for middle windows. If omitted, it is derived from `overlap_fraction`.
+    @param bottom_step_frames Optional explicit raw-frame hop for bottom windows. If omitted, it is derived from `overlap_fraction`.
+    @param overlap_fraction Requested window overlap fraction used to derive step sizes when explicit hops are not provided.
+    @param batch_size Number of anchor positions quantized together per forward pass.
+    @param sample_rate Audio sample rate used to convert start frames into seconds.
+    @param hop_length Spectrogram hop length used to convert start frames into seconds.
+    @param device Torch device used for quantization.
+    @param weights_file Checkpoint filename to load from each VQ-VAE directory.
+    @return None. Quantized examples plus manifest/config metadata are written to `output_dir`.
+    """
     os.makedirs(output_dir, exist_ok=True)
+    top_step_frames = _resolve_step_frames(top_step_frames, top_time_frames, overlap_fraction, 'top')
+    middle_step_frames = _resolve_step_frames(middle_step_frames, middle_time_frames, overlap_fraction, 'middle')
+    bottom_step_frames = _resolve_step_frames(bottom_step_frames, bottom_time_frames, overlap_fraction, 'bottom')
+    effective_overlap = {
+        'top': 1.0 - (top_step_frames / float(top_time_frames)),
+        'middle': 1.0 - (middle_step_frames / float(middle_time_frames)),
+        'bottom': 1.0 - (bottom_step_frames / float(bottom_time_frames)),
+    }
+
     models = {
         lvl: load_jukebox_model(vqvae_dirs[lvl], lvl, device, weights_file).eval()
         for lvl in ['top', 'middle', 'bottom']
@@ -196,6 +260,8 @@ def precompute_windowed_examples(
         'top_step_frames': int(top_step_frames),
         'middle_step_frames': int(middle_step_frames),
         'bottom_step_frames': int(bottom_step_frames),
+        'requested_overlap_fraction': float(overlap_fraction),
+        'effective_overlap_fraction': effective_overlap,
         'batch_size': int(batch_size),
         'sample_rate': int(sample_rate),
         'hop_length': int(hop_length),
@@ -233,7 +299,7 @@ def precompute_windowed_examples(
         for file_path in files:
             spec = np.load(file_path)
             total_frames = int(spec.shape[1])
-            source_stem = _source_stem(file_path)
+            source_file_stem = source_stem(file_path)
             source_basename = os.path.basename(file_path)
 
             anchor_to_levels = _build_anchor_schedule(
@@ -253,15 +319,15 @@ def precompute_windowed_examples(
                 batch_starts = starts[i:end]
                 try:
                     top_batch = np.stack(
-                        [_extract_window(spec, start_frame=s, window_size=top_time_frames) for s in batch_starts],
+                        [extract_window(spec, start_frame=s, window_size=top_time_frames) for s in batch_starts],
                         axis=0,
                     )
                     middle_batch = np.stack(
-                        [_extract_window(spec, start_frame=s, window_size=middle_time_frames) for s in batch_starts],
+                        [extract_window(spec, start_frame=s, window_size=middle_time_frames) for s in batch_starts],
                         axis=0,
                     )
                     bottom_batch = np.stack(
-                        [_extract_window(spec, start_frame=s, window_size=bottom_time_frames) for s in batch_starts],
+                        [extract_window(spec, start_frame=s, window_size=bottom_time_frames) for s in batch_starts],
                         axis=0,
                     )
 
@@ -271,14 +337,14 @@ def precompute_windowed_examples(
 
                     for batch_idx, start_frame in enumerate(batch_starts):
                         eligible_levels = anchor_to_levels[int(start_frame)]
-                        filename = f'{source_stem}__start_{int(start_frame):08d}_window_quantized.pt'
+                        filename = f'{source_file_stem}__start_{int(start_frame):08d}_window_quantized.pt'
                         payload = {
                             'format': 'windowed_v1',
                             'source_basename': source_basename,
-                            'source_stem': source_stem,
+                            'source_stem': source_file_stem,
                             'start_frame': int(start_frame),
                             'total_frames': total_frames,
-                            'timing': _build_timing(
+                            'timing': build_timing_tensor(
                                 start_frame=int(start_frame),
                                 total_frames=total_frames,
                                 sample_rate=sample_rate,
@@ -295,7 +361,7 @@ def precompute_windowed_examples(
                                 {
                                     'file': filename,
                                     'source_basename': source_basename,
-                                    'source_stem': source_stem,
+                                    'source_stem': source_file_stem,
                                     'start_frame': int(start_frame),
                                     'total_frames': total_frames,
                                     'eligible_levels': list(eligible_levels),
@@ -326,6 +392,11 @@ def precompute_windowed_examples(
 
 
 def main():
+    """!
+    @brief Parse CLI arguments and run quantization preprocessing in either windowed or legacy full-song mode.
+    @param None
+    @return None. The selected quantized dataset is written to disk and progress is printed to stdout.
+    """
     parser = argparse.ArgumentParser(
         description='Preprocess and quantize spectrograms for hierarchical transformer prior training.'
     )
@@ -375,9 +446,30 @@ def main():
     parser.add_argument('--top_time_frames', type=int, default=2048, help='Top-level window (same as preprocess_audio TARGET_TIME_FRAMES)')
     parser.add_argument('--middle_time_frames', type=int, default=512, help='Middle-level window')
     parser.add_argument('--bottom_time_frames', type=int, default=128, help='Bottom-level window')
-    parser.add_argument('--top_step_frames', type=int, default=2048, help='Top-level anchor step. Default keeps one top example per 2048-frame span.')
-    parser.add_argument('--middle_step_frames', type=int, default=512, help='Middle-level anchor step. Default keeps four middle examples per 2048-frame span.')
-    parser.add_argument('--bottom_step_frames', type=int, default=128, help='Bottom-level anchor step. Default keeps sixteen bottom examples per 2048-frame span.')
+    parser.add_argument(
+        '--overlap_fraction',
+        type=float,
+        default=DEFAULT_WINDOW_OVERLAP_FRACTION,
+        help='Default overlap used to derive step frames when explicit step args are omitted (default: 0.50).',
+    )
+    parser.add_argument(
+        '--top_step_frames',
+        type=int,
+        default=None,
+        help='Top-level anchor step. Omit to derive from --overlap_fraction; with defaults this is 1024.',
+    )
+    parser.add_argument(
+        '--middle_step_frames',
+        type=int,
+        default=None,
+        help='Middle-level anchor step. Omit to derive from --overlap_fraction; with defaults this is 256.',
+    )
+    parser.add_argument(
+        '--bottom_step_frames',
+        type=int,
+        default=None,
+        help='Bottom-level anchor step. Omit to derive from --overlap_fraction; with defaults this is 64.',
+    )
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for windowed quantization.')
     parser.add_argument('--sample_rate', type=int, default=22050, help='Sample rate used in preprocess_audio')
     parser.add_argument('--hop_length', type=int, default=256, help='Hop length used in preprocess_audio')
@@ -402,6 +494,20 @@ def main():
             sys.exit(1)
     
     device = torch.device(args.device)
+    top_step_frames = _resolve_step_frames(
+        args.top_step_frames, args.top_time_frames, args.overlap_fraction, 'top'
+    )
+    middle_step_frames = _resolve_step_frames(
+        args.middle_step_frames, args.middle_time_frames, args.overlap_fraction, 'middle'
+    )
+    bottom_step_frames = _resolve_step_frames(
+        args.bottom_step_frames, args.bottom_time_frames, args.overlap_fraction, 'bottom'
+    )
+    effective_overlap = {
+        'top': 1.0 - (top_step_frames / float(args.top_time_frames)),
+        'middle': 1.0 - (middle_step_frames / float(args.middle_time_frames)),
+        'bottom': 1.0 - (bottom_step_frames / float(args.bottom_time_frames)),
+    }
     print(f'Using device: {device}')
     
     vqvae_dirs = {
@@ -415,9 +521,16 @@ def main():
     print(f'Weights file: {args.weights_file}')
     print(
         f'Temporal config: top={args.top_time_frames}, middle={args.middle_time_frames}, '
-        f'bottom={args.bottom_time_frames}, top_step={args.top_step_frames}, '
-        f'middle_step={args.middle_step_frames}, bottom_step={args.bottom_step_frames}, '
+        f'bottom={args.bottom_time_frames}, top_step={top_step_frames}, '
+        f'middle_step={middle_step_frames}, bottom_step={bottom_step_frames}, '
         f'sr={args.sample_rate}, hop={args.hop_length}'
+    )
+    print(
+        'Window overlap: '
+        f"requested={args.overlap_fraction:.3f}, "
+        f"effective top={effective_overlap['top']:.3f}, "
+        f"middle={effective_overlap['middle']:.3f}, "
+        f"bottom={effective_overlap['bottom']:.3f}"
     )
     print()
 
@@ -429,9 +542,10 @@ def main():
             top_time_frames=args.top_time_frames,
             middle_time_frames=args.middle_time_frames,
             bottom_time_frames=args.bottom_time_frames,
-            top_step_frames=args.top_step_frames,
-            middle_step_frames=args.middle_step_frames,
-            bottom_step_frames=args.bottom_step_frames,
+            top_step_frames=top_step_frames,
+            middle_step_frames=middle_step_frames,
+            bottom_step_frames=bottom_step_frames,
+            overlap_fraction=args.overlap_fraction,
             batch_size=args.batch_size,
             sample_rate=args.sample_rate,
             hop_length=args.hop_length,
