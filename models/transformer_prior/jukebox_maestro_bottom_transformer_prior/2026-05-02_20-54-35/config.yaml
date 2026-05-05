@@ -1,0 +1,142 @@
+dataset:
+  level_target_time_frames:
+    bottom: 128
+    middle: 512
+    top: 2048
+  processed_path: /home/ivon/code/datasets/processed/maestro/
+  quantized_data_path: /home/ivon/code/datasets/processed/maestro_quantized_windowed/
+  target_time_frames: 2048
+model:
+  inferred_cond_seq_len: 128
+  inferred_cond_time_cols: 8
+  inferred_grids:
+    bottom:
+    - 16
+    - 32
+    middle:
+    - 32
+    - 16
+    top:
+    - 64
+    - 8
+  inferred_second_cond_seq_len: 32
+  inferred_second_cond_time_cols: 4
+  inferred_second_upsample_stride: 16
+  inferred_seq_lens:
+    bottom: 512
+    middle: 512
+    top: 512
+  inferred_upsample_stride: 4
+  max_time_steps: 512
+  name: jukebox_maestro
+  selected_level: bottom
+  timing_window_seconds: 1.486077097505669
+  use_bos_token: false
+  use_timing_conditioning: true
+priors:
+  bottom_prior:
+    attention_qkv_ratio: 0.25
+    block_len: 32
+    condition_on_top: true
+    conditioner_conv_channels: 512
+    conditioner_dilation_cycle: 8
+    conditioner_dilation_growth_rate: 3
+    conditioner_kernel_size: 3
+    conditioner_residual_block_width: 512
+    conditioner_residual_blocks: 8
+    conditioner_upsample_stride: 4
+    dim_feedforward: 2048
+    dropout: 0.1
+    duration_num_bins: 256
+    max_time_steps: 512
+    model_dim: 512
+    num_heads: 1
+    num_layers: 12
+    timing_embedding_init_std: 0.02
+    timing_embedding_scale: 1.0
+    timing_max_duration_seconds: 3600.0
+    timing_num_bins: 1024
+    use_timing_conditioning: true
+  middle_prior:
+    attention_qkv_ratio: 0.25
+    block_len: 16
+    conditioner_conv_channels: 512
+    conditioner_dilation_cycle: 8
+    conditioner_dilation_growth_rate: 3
+    conditioner_kernel_size: 3
+    conditioner_residual_block_width: 512
+    conditioner_residual_blocks: 8
+    conditioner_upsample_stride: 4
+    dim_feedforward: 2048
+    dropout: 0.1
+    duration_num_bins: 256
+    max_time_steps: 512
+    model_dim: 512
+    num_heads: 1
+    num_layers: 12
+    timing_embedding_init_std: 0.02
+    timing_embedding_scale: 1.0
+    timing_max_duration_seconds: 3600.0
+    timing_num_bins: 1024
+    use_timing_conditioning: true
+  top_prior:
+    attention_qkv_ratio: 1.0
+    block_len: 8
+    dim_feedforward: 4096
+    dropout: 0.1
+    duration_num_bins: 256
+    max_time_steps: 512
+    model_dim: 1280
+    num_heads: 8
+    num_layers: 28
+    timing_embedding_init_std: 0.02
+    timing_embedding_scale: 1.0
+    timing_max_duration_seconds: 3600.0
+    timing_num_bins: 1024
+    use_bos_token: true
+    use_timing_conditioning: true
+training:
+  bottom_prior:
+    adam_beta2: 0.95
+    batch_size: 64
+    epochs: 1000
+    gradient_accumulation_steps: 4
+    learning_rate: 0.0002
+    pretrained_weights_path: ''
+    retrain: false
+    scheduler: none
+    weight_decay: 0.01
+  early_stopping_patience: 15
+  middle_prior:
+    adam_beta2: 0.95
+    batch_size: 64
+    epochs: 1000
+    gradient_accumulation_steps: 4
+    learning_rate: 0.0003
+    pretrained_weights_path: ''
+    retrain: false
+    scheduler: none
+    weight_decay: 0.01
+  num_workers: 12
+  persist_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  save_dir: ./models/transformer_prior/
+  seed: 42
+  top_prior:
+    adam_beta2: 0.925
+    batch_size: 3
+    epochs: 1000
+    gradient_accumulation_steps: 16
+    learning_rate: 0.0001
+    pretrained_weights_path: ''
+    retrain: false
+    scheduler: none
+    weight_decay: 0.002
+  validation_split: 0.1
+vqvae:
+  bottom_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro_bottom/2026-04-26_22-26-06
+  codebook_size: 2048
+  middle_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro_middle/2026-04-26_17-30-30
+  top_model_dir: ./models/jukebox_vq_vae/jukebox_vqvae_maestro_top/2026-04-26_02-13-14
+  weights_file: best_model.pth
