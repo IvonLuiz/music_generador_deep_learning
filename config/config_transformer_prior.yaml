@@ -1,6 +1,6 @@
 dataset:
   processed_path: "/home/ivon/code/datasets/processed/maestro/"
-  quantized_data_path: "/home/ivon/code/datasets/processed/maestro_quantized_windowed/"
+  quantized_data_path: "/home/ivon/code/datasets/processed/maestro_quantized_dataset_overlap50/"
   # Top-level window: load 2048-frame spectrograms (≈24s).
   # Each level encodes a different-length slice of the same segment,
   # so all levels produce the same number of tokens (512) but cover different durations.
@@ -30,11 +30,11 @@ priors:
   top_prior:
     model_dim: 1280       # Transformer width (size of the embedding vector for each token) (Jukebox uses 4800)
     num_heads: 8          # Atention heads (Jukebox uses 8 for Top)
-    num_layers: 28        # Transformer self-attention layers (Jukebox uses 72)
+    num_layers: 18        # Transformer self-attention layers (Jukebox uses 72)
     dim_feedforward: 4096 # Transformer feedforward layers
     dropout: 0.1
     max_time_steps: 512  # seq_len = 8×64 = 512 tokens
-    attention_qkv_ratio: 1.0
+    attention_qkv_ratio: 0.25
     block_len: 8         # freq dimension of Top grid (8 freq bins × 64 time steps)
     use_bos_token: true
     use_timing_conditioning: true
@@ -97,14 +97,14 @@ priors:
 training:
   seed: 42
   validation_split: 0.1
-  early_stopping_patience: 15
+  early_stopping_patience: 10
   save_dir: "./models/transformer_prior/"
   num_workers: 12
   pin_memory: true
   persist_workers: true
   prefetch_factor: 4
   top_prior:
-    batch_size: 3
+    batch_size: 16
     gradient_accumulation_steps: 16
     learning_rate: 0.0001
     scheduler: none
