@@ -164,10 +164,7 @@ def _infer_level_shapes(jukebox_models: List[JukeboxVQVAE], device: torch.device
 
 def _encode_indices_for_level(level_model: JukeboxVQVAE, x_batch: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
-        z = level_model.encoder(x_batch)
-        z = level_model.pre_vq_conv(z)
-        _, indices, _, _, _ = level_model.vq(z)
-    return indices
+        return level_model.encode_to_indices(x_batch)
 
 
 def _sample_real_batch(pixelcnn_config: dict, num_samples: int, device: torch.device) -> torch.Tensor:
