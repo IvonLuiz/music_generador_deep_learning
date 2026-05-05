@@ -24,12 +24,10 @@ def extract_song_prefix(file_path: str) -> str:
     @return String prefix shared by all segments of the same song.
     @throws ValueError If the expected naming pattern is not found.
     """
+    # if the song has suffix, it should be grouped
     match = re.search(r'^(.+)_segment_\d+\.npy$', str(file_path))
     if match is None:
-        raise ValueError(
-            f"Could not extract song prefix from file path: {file_path}. "
-            "Expected suffix '_segment_<int>.npy'."
-        )
+        return os.path.basename(file_path)  # fallback to full filename if pattern not found
     return match.group(1)
 
 def parse_level(level: str) -> str:

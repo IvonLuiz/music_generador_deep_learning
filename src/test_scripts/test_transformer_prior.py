@@ -18,8 +18,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from test_scripts.hierarchical_pixelcnn_common import resolve_model_paths
 from utils import load_config
 from generation.transformer_io_utils import (
+    decode_jukebox_indices,
     prepare_min_max_values,
     resolve_vqvae_config_path,
+    save_level_spectrograms,
 )
 
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
@@ -314,69 +316,10 @@ def _save_indices(indices: np.ndarray, save_dir: str, name: str, grid: Optional[
             plt.close()
 
 
-def _decode_indices(
-    vqvae,
-    indices: torch.Tensor,
-    grid: Optional[list],
-) -> np.ndarray:
-    """
-    Decode VQ-VAE indices into spectrograms.
-
-    @param vqvae: Loaded JukeboxVQVAE model.
-    @param indices: numpy array of shape (B, T) with integer token indices.
-    @param grid: [time_steps, freq_bins] matching the selected level grid.
-    @return: numpy array of shape (B, H, W, 1) decoded spectrograms.
-    """
-    if indices.ndim != 2:
-        raise ValueError(f'Expected indices shape (B, T), got {tuple(indices.shape)}')
-    if not (isinstance(grid, list) and len(grid) == 2):
-        raise ValueError('A level grid is required to reshape indices into (H, W)')
-
-    device = next(vqvae.parameters()).device
-    # grid[0] is now Time, grid[1] is now Frequency
-    time_steps, freq_bins = int(grid[0]), int(grid[1])
-    if time_steps * freq_bins != indices.shape[1]:
-        raise ValueError(f'Grid {grid} does not match seq_len={indices.shape[1]}')
-
-    idx_2d = indices.long().to(device)  # (B, T)
-    idx_2d = idx_2d.view(idx_2d.shape[0], time_steps, freq_bins).transpose(1, 2).contiguous()  # (B, freq_bins, time_steps)
-    
-    vqvae.eval()
-    with torch.no_grad():
-        B, H, W = idx_2d.shape
-        idx_flat = idx_2d.reshape(-1).to(device)   # (B * H * W)
-        emb_flat = vqvae.vq.embedding[idx_flat]  # (B * H * W, D)
-        emb = emb_flat.view(B, H, W, -1)  # (B, freq_bins, time_steps, D)
-        z_q = emb.permute(0, 3, 1, 2).contiguous()  # (B, D, Freq, Time)
-        x_hat = vqvae.decoder(z_q)
-        if vqvae.activation_layer is not None:
-            x_hat = vqvae.activation_layer(x_hat)
-
-    return x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()
-
-
 def _resolve_level_vqvae_path(level: str, bottom_vqvae_path: Optional[str], vqvae_cfg: dict) -> Optional[str]:
     if level == 'bottom':
         return bottom_vqvae_path or vqvae_cfg.get('bottom_model_dir')
     return vqvae_cfg.get(f'{level}_model_dir')
-
-
-def _save_level_spectrograms(decoded_specs: np.ndarray, output_dir: str, level: str) -> str:
-    spectrogram_dir = os.path.join(output_dir, level, 'spectrograms')
-    os.makedirs(spectrogram_dir, exist_ok=True)
-    np.save(os.path.join(spectrogram_dir, f'{level}_decoded_specs.npy'), decoded_specs)
-
-    for i in range(decoded_specs.shape[0]):
-        spec = decoded_specs[i, :, :, 0] if decoded_specs.ndim == 4 else decoded_specs[i]
-        plt.figure(figsize=(10, 4))
-        plt.imshow(spec, origin='lower', aspect='auto', cmap='magma')
-        plt.colorbar(label='Normalized amplitude')
-        plt.title(f'{level.capitalize()} decoded spectrogram {i}')
-        plt.tight_layout()
-        plt.savefig(os.path.join(spectrogram_dir, f'{level}_spectrogram_{i:03d}.png'), dpi=150)
-        plt.close()
-
-    return spectrogram_dir
 
 
 def _decode_level_to_audio(
@@ -416,8 +359,18 @@ def _decode_level_to_audio(
         min_max_values = pickle.load(f)
 
     print(f'Decoding {level} indices into spectrograms and audio...')
-    decoded_specs = _decode_indices(vqvae, tokens, grid)
-    spectrogram_dir = _save_level_spectrograms(decoded_specs, save_dir, level)
+    decoded_specs = decode_jukebox_indices(vqvae, tokens, grid)
+    spectrogram_dir = save_level_spectrograms(
+        decoded_specs,
+        os.path.join(save_dir, level),
+        level,
+        root_subdir='spectrograms',
+        npy_filename=f'{level}_decoded_specs.npy',
+        filename_prefix=f'{level}_spectrogram',
+        title_template=f'{level.capitalize()} decoded spectrogram {{index}}',
+        cmap='magma',
+        figsize=(10, 4),
+    )
     min_max_list = prepare_min_max_values(min_max_values, decoded_specs.shape[0])
 
     sound_generator = SoundGenerator(
