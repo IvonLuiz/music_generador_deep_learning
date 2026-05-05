@@ -63,10 +63,7 @@ def _load_min_max_values(path: str) -> dict:
 
 def _extract_code_indices(model, x: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
-        z = model.encoder(x)
-        z = model.pre_vq_conv(z)
-        _, idx, _, _, _ = model.vq(z)
-    return idx.long()
+        return model.encode_to_indices(x)
 
 
 def _crop_or_pad_spectrogram(spectrogram: np.ndarray, target_time_frames: int) -> np.ndarray:

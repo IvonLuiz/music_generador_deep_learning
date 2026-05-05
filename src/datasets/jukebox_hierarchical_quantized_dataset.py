@@ -195,9 +195,7 @@ class JukeboxHierarchicalQuantizedDataset(Dataset):
                         
                         # Forward pass
                         model = self.models[lvl]
-                        encoded = model.encoder(sliced_batch)
-                        pre_vq = model.pre_vq_conv(encoded)
-                        _, idx, _, _, _ = model.vq(pre_vq)
+                        idx = model.encode_to_indices(sliced_batch)
 
                         self.indices[lvl].append(idx.cpu().to(torch.int32))
 
