@@ -1,7 +1,7 @@
 import os
 import random
 import numpy as np
-from typing import Union
+from typing import Optional, Union
 from tqdm import tqdm
 import yaml
 import torch
@@ -13,13 +13,18 @@ from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
 
-def set_global_seed(seed: int) -> None:
-    """Set global RNG seeds without forcing deterministic kernels (keeps training fast)."""
+def set_global_seed(seed: Optional[int], deterministic: bool = False) -> None:
+    """Set global RNG seeds, optionally forcing deterministic CUDA kernels for sampling/debugging."""
+    if seed is None:
+        return
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 def list_npy_files(path):
     all_files = []

@@ -2,7 +2,6 @@ import argparse
 import json
 import os
 import pickle
-import random
 import sys
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -15,26 +14,17 @@ import torch
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from generation.soundgenerator import SoundGenerator
+from generation.transformer_io_utils import (
+    decode_jukebox_indices,
+    resolve_vqvae_min_max_values_path,
+    save_spectrogram_image,
+)
 from train_scripts.jukebox_utils import load_jukebox_model
-from utils import find_min_max_for_path, load_config
+from utils import find_min_max_for_path, load_config, set_global_seed
 
 
 WINDOWED_MANIFEST = 'windowed_manifest.jsonl'
 WINDOWED_CONFIG = 'windowed_quantization_config.json'
-
-
-def _set_seed(seed: Optional[int]) -> None:
-    if seed is None:
-        return
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _source_stem(path: str) -> str:
-    return os.path.basename(path).replace('.npy', '')
 
 
 def _legacy_source_basename(pt_path: str) -> str:
@@ -95,14 +85,6 @@ def _resolve_source_path(
         'Could not resolve processed spectrogram source path. '
         'Pass --source_path explicitly.'
     )
-
-
-def _resolve_min_max_values_path(vqvae_config: dict) -> str:
-    dataset_cfg = vqvae_config.get('dataset') or {}
-    min_max_path = dataset_cfg.get('min_max_values_path')
-    if not min_max_path:
-        raise ValueError('dataset.min_max_values_path missing from VQ-VAE config.')
-    return str(min_max_path)
 
 
 def _resolve_level_target_time_frames(vqvae_config: dict, level: str) -> int:
@@ -173,26 +155,6 @@ def _select_legacy_files(
     return [files[int(i)] for i in chosen_idx]
 
 
-def _decode_indices(vqvae, indices_2d: torch.Tensor) -> np.ndarray:
-    if indices_2d.ndim != 2:
-        raise ValueError(f'Expected indices shape (time, freq), got {tuple(indices_2d.shape)}')
-
-    idx = indices_2d.unsqueeze(0).long().to(next(vqvae.parameters()).device)
-    idx = idx.transpose(1, 2).contiguous()  # (B, freq, time)
-
-    with torch.no_grad():
-        batch_size, freq_bins, time_steps = idx.shape
-        idx_flat = idx.reshape(-1)
-        emb_flat = vqvae.vq.embedding[idx_flat]
-        emb = emb_flat.view(batch_size, freq_bins, time_steps, -1)
-        z_q = emb.permute(0, 3, 1, 2).contiguous()
-        x_hat = vqvae.decoder(z_q)
-        if vqvae.activation_layer is not None:
-            x_hat = vqvae.activation_layer(x_hat)
-
-    return x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()
-
-
 def _load_original_window(source_file: str, start_frame: int, target_time_frames: int) -> np.ndarray:
     spec = np.load(source_file)
     if spec.ndim == 3 and spec.shape[-1] == 1:
@@ -245,17 +207,6 @@ def _save_comparison_plot(original: np.ndarray, decoded: np.ndarray, out_path: s
     return {'mse': mse, 'mae': mae, 'psnr': psnr}
 
 
-def _save_single_spec(spec: np.ndarray, out_path: str, title: str) -> None:
-    img = spec[:, :, 0]
-    plt.figure(figsize=(8, 4))
-    plt.imshow(img, origin='lower', aspect='auto', cmap='viridis', vmin=0, vmax=1)
-    plt.colorbar()
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-
-
 def _prepare_min_max(
     source_file: str,
     min_max_values: dict,
@@ -286,7 +237,7 @@ def _inspect_windowed_sample(
 
     source_file = os.path.join(source_path, source_basename)
     original_spec = _load_original_window(source_file, start_frame, target_time_frames)
-    decoded_spec = _decode_indices(vqvae, indices)[0]
+    decoded_spec = decode_jukebox_indices(vqvae, indices)[0]
     decoded_spec = decoded_spec.astype(np.float32, copy=False)
 
     sample_dir = os.path.join(save_root, f'{source_basename}__start_{start_frame:08d}__{level}')
@@ -299,15 +250,21 @@ def _inspect_windowed_sample(
     np.save(os.path.join(sample_dir, 'token_indices.npy'), indices.numpy())
     np.save(os.path.join(sample_dir, 'original_spec.npy'), original_spec)
     np.save(os.path.join(sample_dir, 'decoded_spec.npy'), decoded_spec)
-    _save_single_spec(
+    save_spectrogram_image(
         original_spec,
         os.path.join(spec_dir, 'original.png'),
         title=f'Original | {source_basename} | start={start_frame}',
+        cmap='viridis',
+        vmin=0,
+        vmax=1,
     )
-    _save_single_spec(
+    save_spectrogram_image(
         decoded_spec,
         os.path.join(spec_dir, 'decoded.png'),
         title=f'Decoded | {source_basename} | start={start_frame}',
+        cmap='viridis',
+        vmin=0,
+        vmax=1,
     )
 
     metrics = _save_comparison_plot(
@@ -385,7 +342,7 @@ def _inspect_legacy_sample(
         token_slice = torch.cat([token_slice, pad], dim=0)
 
     original_spec = _load_original_window(source_file, actual_start_frame, target_time_frames)
-    decoded_spec = _decode_indices(vqvae, token_slice)[0]
+    decoded_spec = decode_jukebox_indices(vqvae, token_slice)[0]
     decoded_spec = decoded_spec.astype(np.float32, copy=False)
 
     sample_dir = os.path.join(save_root, f'{source_basename}__start_{actual_start_frame:08d}__{level}')
@@ -398,15 +355,21 @@ def _inspect_legacy_sample(
     np.save(os.path.join(sample_dir, 'token_indices.npy'), token_slice.numpy())
     np.save(os.path.join(sample_dir, 'original_spec.npy'), original_spec)
     np.save(os.path.join(sample_dir, 'decoded_spec.npy'), decoded_spec)
-    _save_single_spec(
+    save_spectrogram_image(
         original_spec,
         os.path.join(spec_dir, 'original.png'),
         title=f'Original | {source_basename} | start={actual_start_frame}',
+        cmap='viridis',
+        vmin=0,
+        vmax=1,
     )
-    _save_single_spec(
+    save_spectrogram_image(
         decoded_spec,
         os.path.join(spec_dir, 'decoded.png'),
         title=f'Decoded | {source_basename} | start={actual_start_frame}',
+        cmap='viridis',
+        vmin=0,
+        vmax=1,
     )
 
     metrics = _save_comparison_plot(
@@ -463,7 +426,7 @@ def main() -> None:
     if args.samples <= 0:
         raise ValueError(f'--samples must be > 0, got {args.samples}')
 
-    _set_seed(args.seed)
+    set_global_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -486,7 +449,7 @@ def main() -> None:
         explicit_source_path=args.source_path,
         vqvae_config=vqvae_config,
     )
-    min_max_values_path = _resolve_min_max_values_path(vqvae_config)
+    min_max_values_path = resolve_vqvae_min_max_values_path(vqvae_config)
     target_time_frames = _resolve_level_target_time_frames(vqvae_config, args.level)
 
     if not os.path.exists(min_max_values_path):
