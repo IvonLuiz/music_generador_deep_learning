@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -49,47 +50,114 @@ class JukeboxQuantizedDataset(Dataset):
         self.selected_level = selected_level
         self.sample_rate = sample_rate
         self.hop_length = hop_length
+        self.quantized_path = quantized_path
+        self.mode = 'legacy_full_song'
+        self.window_entries = []
 
         lvl = level_target_time_frames or {}
         self.top_tf    = int(lvl.get('top',    target_time_frames))
         self.middle_tf = int(lvl.get('middle', target_time_frames))
         self.bottom_tf = int(lvl.get('bottom', target_time_frames))
 
-        if file_paths:
-            self.files = [
-                os.path.join(quantized_path, os.path.basename(f).replace('.npy', '_full_quantized.pt'))
-                for f in file_paths
-            ]
-        else:
-            self.files = sorted(glob(os.path.join(quantized_path, "*.pt")))
+        if not self._init_windowed_files(file_paths=file_paths):
+            if file_paths:
+                self.files = [
+                    os.path.join(quantized_path, os.path.basename(f).replace('.npy', '_full_quantized.pt'))
+                    for f in file_paths
+                ]
+            else:
+                self.files = sorted(glob(os.path.join(quantized_path, "*.pt")))
 
         # Peek at the first file to learn the actual token grid shapes.
         # This replaces all hardcoded ratio constants.
         self._init_grids()
 
+    def _init_windowed_files(self, file_paths: Optional[List[str]]) -> bool:
+        manifest_path = os.path.join(self.quantized_path, 'windowed_manifest.jsonl')
+        if not os.path.isfile(manifest_path):
+            return False
+
+        allowed_stems = None
+        if file_paths:
+            allowed_stems = {self._source_stem(path) for path in file_paths}
+
+        entries = []
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if allowed_stems is not None and record.get('source_stem') not in allowed_stems:
+                    continue
+                if self.selected_level not in record.get('eligible_levels', []):
+                    continue
+                file_path = os.path.join(self.quantized_path, record['file'])
+                if not os.path.isfile(file_path):
+                    continue
+                entries.append(record)
+
+        if not entries:
+            return False
+
+        self.mode = 'windowed'
+        self.window_entries = entries
+        self.files = [os.path.join(self.quantized_path, entry['file']) for entry in entries]
+        return True
+
     def _init_grids(self):
-        """Read one payload to discover (time_steps, freq_bins) for each level."""
+        """Read one payload to discover both full-song and fixed-window token grids."""
         if not self.files:
             raise ValueError("No quantized .pt files found.")
         payload = torch.load(self.files[0], weights_only=False)
-        # Each level array has shape [Total_Time_Steps, Freq_Bins]
-        self.top_grid    = (int(payload['top'].shape[0]),    int(payload['top'].shape[1]))
-        self.middle_grid = (int(payload['middle'].shape[0]), int(payload['middle'].shape[1]))
-        self.bottom_grid = (int(payload['bottom'].shape[0]), int(payload['bottom'].shape[1]))
+        if payload.get('format') == 'windowed_v1':
+            self._init_windowed_grids(payload)
+            return
+
+        self._init_legacy_grids(payload)
+
+    def _init_windowed_grids(self, payload: dict):
+        self.mode = 'windowed'
+        self.top_grid = tuple(int(x) for x in self._shape_2d(payload['top']))
+        self.middle_grid = tuple(int(x) for x in self._shape_2d(payload['middle']))
+        self.bottom_grid = tuple(int(x) for x in self._shape_2d(payload['bottom']))
+        self.top_full_grid = self.top_grid
+        self.middle_full_grid = self.middle_grid
+        self.bottom_full_grid = self.bottom_grid
+
+        self.ratios = {
+            'top': max(1, self.top_tf // self.top_grid[0]),
+            'middle': max(1, self.middle_tf // self.middle_grid[0]),
+            'bottom': max(1, self.bottom_tf // self.bottom_grid[0]),
+        }
+
+        self._top_window_cols = self.top_grid[0]
+        self._middle_window_cols = self.middle_grid[0]
+        self._bottom_window_cols = self.bottom_grid[0]
+        self._top_cols_for_middle = max(1, round(self._top_window_cols * self.middle_tf / self.top_tf))
+        self._top_cols_for_bottom = max(1, round(self._top_window_cols * self.bottom_tf / self.top_tf))
+        self._mid_cols_for_bottom = max(1, round(self._middle_window_cols * self.bottom_tf / self.middle_tf))
+        print(
+            f"[JukeboxQuantizedDataset] Windowed grids — "
+            f"top={self.top_grid}, middle={self.middle_grid}, bottom={self.bottom_grid} | "
+            f"ratios={self.ratios} | files={len(self.files)}"
+        )
+
+    def _init_legacy_grids(self, payload: dict):
+        # Each level array in the precomputed payload has shape [Total_Time_Steps, Freq_Bins].
+        # We keep those full-song shapes for diagnostics, but training uses fixed-size windows.
+        self.top_full_grid    = (int(payload['top'].shape[0]),    int(payload['top'].shape[1]))
+        self.middle_full_grid = (int(payload['middle'].shape[0]), int(payload['middle'].shape[1]))
+        self.bottom_full_grid = (int(payload['bottom'].shape[0]), int(payload['bottom'].shape[1]))
 
         total_frames = int(payload['total_frames'])
         # Derive downsampling ratios from actual data instead of hardcoding.
         # ratio = raw_frames / token_time_steps
         self.ratios = {
-            'top':    total_frames // self.top_grid[0],
-            'middle': total_frames // self.middle_grid[0],
-            'bottom': total_frames // self.bottom_grid[0],
+            'top':    total_frames // self.top_full_grid[0],
+            'middle': total_frames // self.middle_full_grid[0],
+            'bottom': total_frames // self.bottom_full_grid[0],
         }
-        print(
-            f"[JukeboxQuantizedDataset] Grids — "
-            f"top={self.top_grid}, middle={self.middle_grid}, bottom={self.bottom_grid} | "
-            f"ratios={self.ratios}"
-        )
 
         # Precompute how many token time-cols each level window occupies.
         # These are used to pick the right-sized conditioning slices.
@@ -97,7 +165,18 @@ class JukeboxQuantizedDataset(Dataset):
         self._middle_window_cols = self.middle_tf // self.ratios['middle']
         self._bottom_window_cols = self.bottom_tf // self.ratios['bottom']
 
-        # FIX: aligned conditioning slice sizes.
+        # Expose the fixed-size training-window grids that the prior actually sees.
+        self.top_grid    = (self._top_window_cols, self.top_full_grid[1])
+        self.middle_grid = (self._middle_window_cols, self.middle_full_grid[1])
+        self.bottom_grid = (self._bottom_window_cols, self.bottom_full_grid[1])
+        print(
+            f"[JukeboxQuantizedDataset] Full grids — "
+            f"top={self.top_full_grid}, middle={self.middle_full_grid}, bottom={self.bottom_full_grid} | "
+            f"window_grids=top={self.top_grid}, middle={self.middle_grid}, bottom={self.bottom_grid} | "
+            f"ratios={self.ratios}"
+        )
+
+        # Aligned conditioning slice sizes
         # For middle trained on a middle-window, only the TOP tokens covering
         # the same audio span are used as conditioning (not the full top window).
         self._top_cols_for_middle = max(1, round(self._top_window_cols * self.middle_tf / self.top_tf))
@@ -108,6 +187,49 @@ class JukeboxQuantizedDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
+        if self.mode == 'windowed':
+            return self._getitem_windowed(idx)
+
+        return self._getitem_legacy(idx)
+
+    def _getitem_windowed(self, idx):
+        payload = torch.load(self.files[idx % len(self.files)], weights_only=False)
+        top_tensor = self._to_long_tensor(payload['top'])
+        middle_tensor = self._to_long_tensor(payload['middle'])
+        bottom_tensor = self._to_long_tensor(payload['bottom'])
+
+        top_for_middle = top_tensor[:self._top_cols_for_middle]
+        top_for_bottom = top_tensor[:self._top_cols_for_bottom]
+        mid_for_bottom = middle_tensor[:self._mid_cols_for_bottom]
+
+        if 'timing' in payload:
+            timing = self._to_float_tensor(payload['timing'])
+        else:
+            start_frame = int(payload.get('start_frame', 0))
+            total_frames = int(payload.get('total_frames', self.top_tf))
+            start_time_s = (start_frame * self.hop_length) / self.sample_rate
+            total_duration_s = (total_frames * self.hop_length) / self.sample_rate
+            fraction = start_time_s / max(total_duration_s, 1e-6)
+            timing = torch.tensor([start_time_s, total_duration_s, fraction], dtype=torch.float32)
+
+        if self.selected_level == 'top':
+            target = top_tensor
+            cond = torch.empty(0, dtype=torch.long)
+            second_cond = torch.empty(0, dtype=torch.long)
+        elif self.selected_level == 'middle':
+            target = middle_tensor
+            cond = top_for_middle
+            second_cond = torch.empty(0, dtype=torch.long)
+        elif self.selected_level == 'bottom':
+            target = bottom_tensor
+            cond = mid_for_bottom
+            second_cond = top_for_bottom
+        else:
+            raise ValueError(f'Unsupported selected_level: {self.selected_level}')
+
+        return target, cond, second_cond, timing
+
+    def _getitem_legacy(self, idx):
         payload = torch.load(self.files[idx % len(self.files)], weights_only=False)
         total_frames = int(payload['total_frames'])
 
@@ -137,7 +259,7 @@ class JukeboxQuantizedDataset(Dataset):
         middle_slice = self._pad(middle_slice, self._middle_window_cols)
         bottom_slice = self._pad(bottom_slice, self._bottom_window_cols)
 
-        # ── FIX: Aligned conditioning slices ──────────────────────────────────
+        # ── Aligned conditioning slices ──────────────────────────────────
         # Each conditioning slice covers the SAME audio span as the target window.
         # For middle prior: use only the top tokens aligned to the middle window span.
         # For bottom prior: use only the middle/top tokens aligned to the bottom window span.
@@ -181,6 +303,29 @@ class JukeboxQuantizedDataset(Dataset):
         second_cond = second_cond if second_cond is not None else torch.empty(0, dtype=torch.long)
 
         return target, cond, second_cond, timing
+
+    @staticmethod
+    def _shape_2d(arr) -> Tuple[int, int]:
+        if torch.is_tensor(arr):
+            return int(arr.shape[0]), int(arr.shape[1])
+        np_arr = np.asarray(arr)
+        return int(np_arr.shape[0]), int(np_arr.shape[1])
+
+    @staticmethod
+    def _to_long_tensor(arr) -> torch.Tensor:
+        if torch.is_tensor(arr):
+            return arr.long()
+        return torch.as_tensor(arr, dtype=torch.long)
+
+    @staticmethod
+    def _to_float_tensor(arr) -> torch.Tensor:
+        if torch.is_tensor(arr):
+            return arr.float()
+        return torch.as_tensor(arr, dtype=torch.float32)
+
+    @staticmethod
+    def _source_stem(file_path: str) -> str:
+        return os.path.basename(file_path).replace('.npy', '')
 
     @staticmethod
     def _pad(arr: np.ndarray, target_t: int) -> np.ndarray:
@@ -314,7 +459,7 @@ def test_dataset_alignment_and_logic():
         print(f"  [Pass] DataLoader batch shapes: target={tuple(batch[0].shape)}, "
               f"cond={tuple(batch[1].shape)}, second_cond={tuple(batch[2].shape)}, timing={tuple(batch[3].shape)}")
 
-    print("\n✅ All tests passed successfully!")
+    print("\nAll tests passed successfully!")
 
 
 if __name__ == '__main__':
