@@ -3,7 +3,6 @@ import pickle
 import sys
 import soundfile as sf
 import argparse
-import random
 import math
 import json
 from datetime import datetime
@@ -12,22 +11,28 @@ import numpy as np
 import time
 
 import torch
-import matplotlib.pyplot as plt
 
-# Add 'src' to sys.path to allow imports from sibling directories
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from utils import load_config
+from utils import load_config, set_global_seed
 from train_scripts.jukebox_utils import load_jukebox_model
 from test_scripts.test_transformer_prior import load_transformer_prior
 from generation.soundgenerator import SoundGenerator
 from generation.transformer_io_utils import (
+    decode_jukebox_indices,
     prepare_min_max_values,
     resolve_min_max_values_path,
     resolve_vqvae_config_path,
+    save_level_spectrograms,
     save_decoded_spectrograms,
 )
+from windowed_data_utils import (
+    build_level_starts,
+    build_timing_schedule,
+    build_windowed_starts,
+)
 from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH, FRAME_SIZE
+
 
 
 DEFAULT_TOP_RUN_ROOT = "models/transformer_prior/jukebox_maestro_top_transformer_prior"
@@ -91,9 +96,15 @@ def _generate_level_tokens(
     top_k: Optional[int],
     upper_tokens_list: Optional[List[np.ndarray]] = None,
     second_upper_tokens_list: Optional[List[np.ndarray]] = None,
-    timing_list: Optional[List[np.ndarray]] = None,
+    timing_list: Optional[List[torch.Tensor]] = None,
+    start_frames: Optional[List[int]] = None,
+    level_time_frames: Optional[int] = None,
+    level_grid: Optional[List[int]] = None,
+    use_windowed_prefix: bool = False,
 ) -> List[np.ndarray]:
     token_blocks = []
+    previous_tokens = None
+    previous_start_frame = None
 
     for chunk in range(num_chunks):
         upper_indices = None
@@ -104,9 +115,23 @@ def _generate_level_tokens(
         if second_upper_tokens_list is not None:
             second_upper_indices = torch.from_numpy(second_upper_tokens_list[chunk]).to(device)
 
+        start_tokens = None
+        if use_windowed_prefix and previous_tokens is not None:
+            if start_frames is None or level_time_frames is None or level_grid is None:
+                raise ValueError('start_frames, level_time_frames, and level_grid are required for windowed prefix sampling.')
+            start_tokens_np = _extract_prefix_from_previous_window(
+                previous_tokens=previous_tokens,
+                previous_start_frame=previous_start_frame,
+                current_start_frame=start_frames[chunk],
+                level_time_frames=level_time_frames,
+                level_grid=level_grid,
+            )
+            if start_tokens_np is not None and start_tokens_np.shape[1] > 0:
+                start_tokens = torch.from_numpy(start_tokens_np).to(device)
+
         generate_kwargs = {
             'batch_size': 1,
-            'start_tokens': None,
+            'start_tokens': start_tokens,
             'upper_indices': upper_indices,
             'second_upper_indices': second_upper_indices,
             'seq_len': seq_len,
@@ -115,35 +140,122 @@ def _generate_level_tokens(
             'device': device,
         }
         if timing_list is not None:
-            timing = torch.from_numpy(timing_list[chunk]).to(device)
+            timing = timing_list[chunk].to(device=device, dtype=torch.float32)
             generate_kwargs['timing'] = timing
 
         with torch.no_grad():
             tokens = prior.generate(**generate_kwargs).cpu().numpy()
 
         token_blocks.append(tokens)
+        previous_tokens = tokens
+        previous_start_frame = start_frames[chunk] if start_frames is not None else None
 
     return token_blocks
 
-def _build_level_starts(total_frames: int, window_size: int, step: int) -> List[int]:
-    """
-    Match preprocess_quantization.py window starts.
 
-    The last window is shifted left when needed so it ends exactly on the
-    requested song duration instead of extending timing past the song end.
-    """
-    if window_size <= 0:
-        raise ValueError(f'window_size must be > 0, got {window_size}')
-    if step <= 0:
-        raise ValueError(f'step must be > 0, got {step}')
-    if total_frames <= window_size:
-        return [0]
+def _level_grid_info(level_time_frames: int, level_grid: List[int]) -> Tuple[int, int, int]:
+    if not (isinstance(level_grid, (list, tuple)) and len(level_grid) == 2):
+        raise ValueError(f'Expected level_grid=[time_cols, freq_bins], got {level_grid}')
+    time_cols, freq_bins = int(level_grid[0]), int(level_grid[1])
+    if time_cols <= 0 or freq_bins <= 0:
+        raise ValueError(f'Invalid level grid: {level_grid}')
+    if level_time_frames % time_cols != 0:
+        raise ValueError(
+            f'level_time_frames={level_time_frames} is not divisible by time_cols={time_cols}'
+        )
+    return time_cols, freq_bins, level_time_frames // time_cols
 
-    starts = list(range(0, total_frames - window_size + 1, step))
-    last_start = total_frames - window_size
-    if starts[-1] != last_start:
-        starts.append(last_start)
-    return starts
+
+def _extract_prefix_from_previous_window(
+    previous_tokens: np.ndarray,
+    previous_start_frame: int,
+    current_start_frame: int,
+    level_time_frames: int,
+    level_grid: List[int],
+) -> Optional[np.ndarray]:
+    """Use the overlapping tail of the previous window as autoregressive context."""
+    time_cols, freq_bins, frames_per_token_col = _level_grid_info(level_time_frames, level_grid)
+    delta_frames = int(current_start_frame) - int(previous_start_frame)
+    if delta_frames <= 0:
+        return None
+
+    delta_cols = int(round(delta_frames / frames_per_token_col))
+    if delta_cols >= time_cols:
+        return None
+    delta_cols = max(1, delta_cols)
+
+    block = previous_tokens.reshape(previous_tokens.shape[0], time_cols, freq_bins)
+    return block[:, delta_cols:, :].reshape(previous_tokens.shape[0], -1)
+
+
+def _validate_window_prefixes(
+    tokens_list: List[np.ndarray],
+    start_frames: List[int],
+    level_time_frames: int,
+    level_grid: List[int],
+    level_name: str,
+) -> None:
+    """
+    Make sure windowed sampling copied the previous overlap exactly.
+
+    The model should receive the previous overlapping code tail as immutable
+    start_tokens. If this check fails, the generated windows are not aligned
+    the same way they were sampled.
+    """
+    if len(tokens_list) <= 1:
+        return
+    if len(tokens_list) != len(start_frames):
+        raise ValueError(
+            f'{level_name} prefix validation got {len(tokens_list)} token blocks '
+            f'but {len(start_frames)} start frames.'
+        )
+
+    checked_tokens = 0
+    for idx in range(1, len(tokens_list)):
+        expected = _extract_prefix_from_previous_window(
+            previous_tokens=tokens_list[idx - 1],
+            previous_start_frame=start_frames[idx - 1],
+            current_start_frame=start_frames[idx],
+            level_time_frames=level_time_frames,
+            level_grid=level_grid,
+        )
+        if expected is None or expected.shape[1] == 0:
+            continue
+
+        actual = tokens_list[idx][:, :expected.shape[1]]
+        if actual.shape != expected.shape:
+            raise RuntimeError(
+                f'{level_name} overlap prefix shape mismatch at window {idx}: '
+                f'expected {expected.shape}, got {actual.shape}.'
+            )
+
+        mismatches = int(np.count_nonzero(actual != expected))
+        if mismatches:
+            raise RuntimeError(
+                f'{level_name} overlap prefix mismatch at window {idx}: '
+                f'{mismatches}/{expected.size} copied context tokens differ.'
+            )
+        checked_tokens += int(expected.size)
+
+    print(f'{level_name.capitalize()} overlap prefix check: OK ({checked_tokens} copied tokens)')
+
+
+def _compute_windowed_step(
+    level_time_frames: int,
+    level_grid: List[int],
+    overlap_fraction: float,
+) -> Tuple[int, float, int, int]:
+    """Convert an overlap fraction into a token-column-aligned raw-frame hop."""
+    if not 0.0 <= overlap_fraction < 1.0:
+        raise ValueError(f'overlap_fraction must be in [0, 1), got {overlap_fraction}')
+
+    time_cols, _, frames_per_token_col = _level_grid_info(level_time_frames, level_grid)
+    overlap_cols = int(round(time_cols * overlap_fraction))
+    overlap_cols = min(max(overlap_cols, 0), time_cols - 1)
+    hop_cols = time_cols - overlap_cols
+    step_frames = hop_cols * frames_per_token_col
+    effective_overlap = overlap_cols / time_cols
+    return step_frames, effective_overlap, overlap_cols, hop_cols
 
 
 def _assemble_token_timeline(
@@ -239,28 +351,6 @@ def get_token_slice_for_frame(
         
     return actual_slice
     
-def _build_timing_schedule(
-    start_frames: List[int],
-    hop_length: int,
-    sample_rate: int,
-    total_source_frames: int,
-) -> List[np.ndarray]:
-    """
-    Build timing metadata exactly like windowed quantization preprocessing.
-
-    Training stores [start_time_s, full_source_duration_s, fraction_elapsed],
-    where full_source_duration_s comes from the original song length, not from
-    the short generated clip length.
-    """
-    total_duration_s = (int(total_source_frames) * hop_length) / sample_rate
-    timing_list = []
-    for start_frame in start_frames:
-        start_time_s = (int(start_frame) * hop_length) / sample_rate
-        fraction = start_time_s / max(total_duration_s, 1e-6)
-        timing_list.append(np.array([[start_time_s, total_duration_s, fraction]], dtype=np.float32))
-    return timing_list
-
-
 def _resolve_quantized_path(transformer_config: dict) -> Optional[str]:
     dataset_cfg = transformer_config.get('dataset', {}) if isinstance(transformer_config, dict) else {}
     quantized_path = dataset_cfg.get('quantized_data_path')
@@ -288,7 +378,7 @@ def assemble_spectrogram_chunks(
     start_frames: List[int],
     total_frames: int,
 ) -> np.ndarray:
-    """Place decoded bottom windows into the requested spectrogram timeline."""
+    """Place decoded windows into the requested spectrogram timeline using linear crossfades."""
     if not spec_chunks:
         raise ValueError('No spectrogram chunks to assemble.')
     if len(spec_chunks) == 1:
@@ -299,18 +389,85 @@ def assemble_spectrogram_chunks(
     first = spec_chunks[0]
     batch_size, freq_bins, _, channels = first.shape
     assembled = np.zeros((batch_size, freq_bins, total_frames, channels), dtype=np.float32)
-    counts = np.zeros((1, 1, total_frames, 1), dtype=np.float32)
+    current_end = 0
 
     for chunk, start_frame in zip(spec_chunks, start_frames):
         start = int(start_frame)
         if start >= total_frames:
             continue
         usable = min(chunk.shape[2], total_frames - start)
-        assembled[:, :, start:start + usable, :] += chunk[:, :, :usable, :].astype(np.float32, copy=False)
-        counts[:, :, start:start + usable, :] += 1.0
+        if usable <= 0:
+            continue
 
-    counts = np.maximum(counts, 1.0)
-    return assembled / counts
+        chunk = chunk[:, :, :usable, :].astype(np.float32, copy=False)
+        end = start + usable
+
+        if start >= current_end:
+            assembled[:, :, start:end, :] = chunk
+            current_end = max(current_end, end)
+            continue
+
+        overlap_end = min(current_end, end)
+        overlap_len = max(0, overlap_end - start)
+        if overlap_len > 0:
+            fade_in = np.linspace(0.0, 1.0, num=overlap_len, dtype=np.float32).reshape(1, 1, overlap_len, 1)
+            fade_out = 1.0 - fade_in
+            assembled[:, :, start:overlap_end, :] = (
+                assembled[:, :, start:overlap_end, :] * fade_out
+                + chunk[:, :, :overlap_len, :] * fade_in
+            )
+
+        if end > overlap_end:
+            chunk_start = overlap_len
+            assembled[:, :, overlap_end:end, :] = chunk[:, :, chunk_start:chunk_start + (end - overlap_end), :]
+        current_end = max(current_end, end)
+
+    return assembled
+
+
+def _decode_full_level_spectrogram(
+    level: str,
+    vqvae_ref: str,
+    full_tokens: np.ndarray,
+    level_grid: Optional[list],
+    total_frames: int,
+    device: torch.device,
+    weights_file: str,
+    save_dir: str,
+) -> np.ndarray:
+    if not (isinstance(level_grid, (list, tuple)) and len(level_grid) == 2):
+        raise ValueError(f'{level} grid is required to decode full generated indices.')
+
+    freq_bins = int(level_grid[1])
+    if full_tokens.shape[1] % freq_bins != 0:
+        raise ValueError(
+            f'{level} full token length {full_tokens.shape[1]} is not divisible by freq_bins={freq_bins}.'
+        )
+
+    dynamic_grid = [full_tokens.shape[1] // freq_bins, freq_bins]
+    print(f'Decoding full {level} token timeline with dynamic grid {dynamic_grid}...')
+    vqvae = load_jukebox_model(vqvae_ref, level, device, weights_file)
+    tokens_tensor = torch.from_numpy(full_tokens).to(device)
+    decoded_specs = decode_jukebox_indices(vqvae, tokens_tensor, dynamic_grid, device)
+    decoded_specs = decoded_specs[:, :, :total_frames, :]
+    spectrogram_dir = save_level_spectrograms(
+        decoded_specs,
+        save_dir,
+        level,
+        root_subdir='spectrograms',
+        npy_filename=f'{level}_full_decoded_specs.npy',
+        filename_prefix=f'{level}_full_spectrogram',
+        title_template=f'{level.capitalize()} full generated spectrogram {{index}}',
+        cmap='magma',
+        figsize=(12, 4),
+    )
+    print(f'Saved full {level} spectrograms to {spectrogram_dir}')
+
+    del vqvae, tokens_tensor
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return decoded_specs
 
 
 def _infer_slice_len(
@@ -346,39 +503,9 @@ def _decode_bottom_blocks(
     for bottom_tokens in bottom_tokens_list:
         bottom_tokens_tensor = torch.from_numpy(bottom_tokens).to(device)
         with torch.no_grad():
-            decoded_specs = _decode_bottom_indices(vqvae, bottom_tokens_tensor, bottom_grid, device)
+            decoded_specs = decode_jukebox_indices(vqvae, bottom_tokens_tensor, bottom_grid, device)
         reconstructed_spectrograms.append(decoded_specs)
     return reconstructed_spectrograms
-
-def _decode_bottom_indices(
-    vqvae,
-    indices: torch.Tensor,
-    grid: Optional[list],
-    device: torch.device,
-) -> np.ndarray:
-    if indices.ndim != 2:
-        raise ValueError(f'Expected indices shape (B, T), got {tuple(indices.shape)}')
-    if not (isinstance(grid, list) and len(grid) == 2):
-        raise ValueError('Bottom grid is required to reshape indices into (H, W)')
-
-    # grid[0] is now Time, grid[1] is now Frequency
-    time_steps, freq_bins = int(grid[0]), int(grid[1])
-    
-    if time_steps * freq_bins != indices.shape[1]:
-        raise ValueError(f'Grid {grid} does not match seq_len={indices.shape[1]}')
-
-    # View as (Batch, Time, Freq), then transpose to (Batch, Freq, Time)
-    idx_2d = indices.view(indices.shape[0], time_steps, freq_bins).transpose(1, 2).contiguous().long().to(device)
-    
-    vqvae.eval()
-    with torch.no_grad():
-        emb = vqvae.vq.embedding[idx_2d]  # (B, Freq, Time, D)
-        z_q = emb.permute(0, 3, 1, 2).contiguous()  # (B, D, Freq, Time)
-        x_hat = vqvae.decoder(z_q)
-        if vqvae.activation_layer is not None:
-            x_hat = vqvae.activation_layer(x_hat)
-
-    return x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()
 
 
 def main():
@@ -392,6 +519,19 @@ def main():
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature for all priors')
     parser.add_argument('--top_k', type=int, default=None, help='Top-k sampling (None disables top-k)')
     parser.add_argument('--weights_file', type=str, default='best_model.pth', help='Checkpoint filename for transformer priors (default: best_model.pth)')
+    parser.add_argument(
+        '--sampling_mode',
+        type=str,
+        default='windowed',
+        choices=['windowed', 'independent'],
+        help='Sampling strategy. windowed reuses overlapping previous codes as context (default).',
+    )
+    parser.add_argument(
+        '--overlap_fraction',
+        type=float,
+        default=0.75,
+        help='Overlap fraction for windowed sampling (default: 0.75).',
+    )
     parser.add_argument(
         '--duration_seconds',
         type=float,
@@ -410,10 +550,14 @@ def main():
     args.top_k = args.top_k if (args.top_k is not None and args.top_k > 0) else None
     if args.duration_seconds <= 0:
         raise ValueError(f'--duration_seconds must be > 0, got {args.duration_seconds}')
+    if not 0.0 <= args.overlap_fraction < 1.0:
+        raise ValueError(f'--overlap_fraction must be in [0, 1), got {args.overlap_fraction}')
 
     if args.seed is not None and args.seed < 0:
         args.seed = None
-    _set_seed(args.seed)
+    set_global_seed(args.seed, deterministic=True)
+    if args.seed is not None:
+        print(f'Using deterministic seed: {args.seed}')
 
     try:
         save_dir = generate_hierarchical_music(args)
@@ -421,21 +565,6 @@ def main():
     except Exception as e:
         _debug(f'Generation failed in main with error: {type(e).__name__}: {e}')
         raise
-
-
-def _set_seed(seed: Optional[int]) -> None:
-    if seed is None:
-        return
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    print(f'Using deterministic seed: {seed}')
-
 def linear_crossfading(spec_chunk_1, spec_chunk_2, overlap_len):
     """
     Linearly crossfade between two spectrogram chunks over the specified overlap length
@@ -511,25 +640,42 @@ def generate_hierarchical_music(args) -> str:
     top_tf = int(quantization_cfg.get('top_time_frames', level_target_time_frames.get('top', dataset_cfg.get('target_time_frames', 2048))))
     mid_tf = int(quantization_cfg.get('middle_time_frames', level_target_time_frames.get('middle', dataset_cfg.get('target_time_frames', 2048))))
     bot_tf = int(quantization_cfg.get('bottom_time_frames', level_target_time_frames.get('bottom', dataset_cfg.get('target_time_frames', 2048))))
-    top_step = int(quantization_cfg.get('top_step_frames', top_tf))
-    mid_step = int(quantization_cfg.get('middle_step_frames', mid_tf))
-    bot_step = int(quantization_cfg.get('bottom_step_frames', bot_tf))
+    training_top_step = int(quantization_cfg.get('top_step_frames', top_tf))
+    training_mid_step = int(quantization_cfg.get('middle_step_frames', mid_tf))
+    training_bot_step = int(quantization_cfg.get('bottom_step_frames', bot_tf))
     for name, value in (
         ('top_time_frames', top_tf),
         ('middle_time_frames', mid_tf),
         ('bottom_time_frames', bot_tf),
-        ('top_step_frames', top_step),
-        ('middle_step_frames', mid_step),
-        ('bottom_step_frames', bot_step),
+        ('top_step_frames', training_top_step),
+        ('middle_step_frames', training_mid_step),
+        ('bottom_step_frames', training_bot_step),
     ):
         if value <= 0:
             raise ValueError(f'{name} must be > 0, got {value}')
 
+    effective_overlap = None
+    overlap_cols = {}
+    hop_cols = {}
+    if args.sampling_mode == 'windowed':
+        top_step, top_overlap, top_overlap_cols, top_hop_cols = _compute_windowed_step(top_tf, top_grid, args.overlap_fraction)
+        mid_step, mid_overlap, mid_overlap_cols, mid_hop_cols = _compute_windowed_step(mid_tf, middle_grid, args.overlap_fraction)
+        bot_step, bot_overlap, bot_overlap_cols, bot_hop_cols = _compute_windowed_step(bot_tf, bottom_grid, args.overlap_fraction)
+        effective_overlap = {'top': top_overlap, 'middle': mid_overlap, 'bottom': bot_overlap}
+        overlap_cols = {'top': top_overlap_cols, 'middle': mid_overlap_cols, 'bottom': bot_overlap_cols}
+        hop_cols = {'top': top_hop_cols, 'middle': mid_hop_cols, 'bottom': bot_hop_cols}
+    else:
+        top_step, mid_step, bot_step = training_top_step, training_mid_step, training_bot_step
+
     _debug('Resolving min_max_values.pkl path...')
     min_max_values_path = resolve_min_max_values_path(bottom_config, debug_fn=_debug)
 
-    _debug('Loading bottom VQ-VAE decoder...')
-    bottom_vqvae_ref = bottom_config['vqvae']['bottom_model_dir']
+    _debug('Loading bottom VQ-VAE config...')
+    vqvae_cfg = bottom_config.get('vqvae', {}) if isinstance(bottom_config, dict) else {}
+    bottom_vqvae_ref = vqvae_cfg['bottom_model_dir']
+    middle_vqvae_ref = vqvae_cfg.get('middle_model_dir')
+    top_vqvae_ref = vqvae_cfg.get('top_model_dir')
+    vqvae_weights_file = vqvae_cfg.get('weights_file', 'best_model.pth')
     bottom_vqvae_config_path = resolve_vqvae_config_path(bottom_vqvae_ref)
     bottom_vqvae_config = load_config(bottom_vqvae_config_path)
     dataset_cfg = bottom_vqvae_config.get('dataset', {}) if isinstance(bottom_vqvae_config, dict) else {}
@@ -544,16 +690,8 @@ def generate_hierarchical_music(args) -> str:
     )
     n_mels = int(dataset_cfg.get('n_mels', 256))
 
-    vqvae_bottom_decoder = load_jukebox_model(
-        bottom_vqvae_ref,
-        'bottom',
-        device,
-        bottom_config['vqvae']['weights_file'],
-    )
-    vqvae_bottom_decoder.eval()
-
     # Step 0: Prepare data
-    ## Temporal math mirrors the windowed quantized dataset used for training.
+    ## Timing uses the requested song duration; windowed mode advances by overlap-controlled hops.
     
     ## Conditioning slice sizes are inferred from the exact training config saved with each run.
     mid_slice_len = _infer_slice_len(
@@ -580,27 +718,58 @@ def generate_hierarchical_music(args) -> str:
     base_start_frame = 0
     total_source_frames = max(1, int(math.ceil((args.duration_seconds * sample_rate) / hop_length)))
 
-    top_start_frames = _build_level_starts(total_source_frames, top_tf, top_step)
-    mid_start_frames = _build_level_starts(total_source_frames, mid_tf, mid_step)
-    bot_start_frames = _build_level_starts(total_source_frames, bot_tf, bot_step)
+    if args.sampling_mode == 'windowed':
+        top_start_frames = build_windowed_starts(total_source_frames, top_tf, top_step)
+        mid_start_frames = build_windowed_starts(total_source_frames, mid_tf, mid_step)
+        bot_start_frames = build_windowed_starts(total_source_frames, bot_tf, bot_step)
+    else:
+        top_start_frames = build_level_starts(total_source_frames, top_tf, top_step)
+        mid_start_frames = build_level_starts(total_source_frames, mid_tf, mid_step)
+        bot_start_frames = build_level_starts(total_source_frames, bot_tf, bot_step)
     top_chunks = len(top_start_frames)
     middle_chunks = len(mid_start_frames)
     bottom_chunks = len(bot_start_frames)
 
     total_source_duration_s = (total_source_frames * hop_length) / sample_rate
+    top_conditioning_frames = max(
+        total_source_frames,
+        max(mid_start_frames) + mid_tf,
+        max(bot_start_frames) + bot_tf,
+    )
+    middle_conditioning_frames = max(
+        total_source_frames,
+        max(bot_start_frames) + bot_tf,
+    )
 
     print(f"--- Generation Plan ---")
+    print(f"Sampling mode: {args.sampling_mode}")
+    if args.sampling_mode == 'windowed':
+        print(
+            "Requested/effective overlap: "
+            f"{args.overlap_fraction:.2f} / "
+            f"top={effective_overlap['top']:.3f}, middle={effective_overlap['middle']:.3f}, bottom={effective_overlap['bottom']:.3f}"
+        )
     print(f"Requested generated duration: {args.duration_seconds:.2f}s")
     print(f"Timing total duration: {total_source_duration_s:.2f}s ({total_source_frames} frames)")
-    print(f"Training window steps: Top={top_step}, Mid={mid_step}, Bot={bot_step} frames")
+    print(f"Sampling window steps: Top={top_step}, Mid={mid_step}, Bot={bot_step} frames")
+    print(f"Training window steps: Top={training_top_step}, Mid={training_mid_step}, Bot={training_bot_step} frames")
+    if (
+        args.sampling_mode == 'windowed'
+        and (top_step, mid_step, bot_step) != (training_top_step, training_mid_step, training_bot_step)
+    ):
+        print(
+            'Warning: sampling window steps do not match the quantized training dataset steps. '
+            'For best quality, regenerate/retrain with matching top/middle/bottom step frames.'
+        )
+    print(f"Conditioning coverage frames: Top={top_conditioning_frames}, Middle={middle_conditioning_frames}")
     print(f"Chunks needed: Top={top_chunks}, Mid={middle_chunks}, Bot={bottom_chunks}")
 
-    top_timing = _build_timing_schedule(top_start_frames, hop_length, sample_rate, total_source_frames)
-    mid_timing = _build_timing_schedule(mid_start_frames, hop_length, sample_rate, total_source_frames)
-    bot_timing = _build_timing_schedule(bot_start_frames, hop_length, sample_rate, total_source_frames)
+    top_timing = build_timing_schedule(top_start_frames, hop_length, sample_rate, total_source_frames)
+    mid_timing = build_timing_schedule(mid_start_frames, hop_length, sample_rate, total_source_frames)
+    bot_timing = build_timing_schedule(bot_start_frames, hop_length, sample_rate, total_source_frames)
 
     # Step 1: Top-Level Unrolling (The Composer)
-    ## Generate global structure block-by-block using the same window starts as training.
+    ## Generate global structure block-by-block, reusing previous overlap in windowed mode.
     start_time = time.time()
     top_tokens_list = _generate_level_tokens(
         prior=top_prior,
@@ -611,13 +780,19 @@ def generate_hierarchical_music(args) -> str:
         top_k=args.top_k,
         upper_tokens_list=None,
         timing_list=top_timing,
+        start_frames=top_start_frames,
+        level_time_frames=top_tf,
+        level_grid=top_grid,
+        use_windowed_prefix=args.sampling_mode == 'windowed',
     )
+    if args.sampling_mode == 'windowed':
+        _validate_window_prefixes(top_tokens_list, top_start_frames, top_tf, top_grid, 'top')
     full_top_tokens = _assemble_token_timeline(
         tokens_list=top_tokens_list,
         start_frames=top_start_frames,
         level_time_frames=top_tf,
         level_grid=top_grid,
-        total_frames=total_source_frames,
+        total_frames=top_conditioning_frames,
     )
     print('Top-level generation complete. Generated tokens for each block have shape:', top_tokens_list[0].shape if top_tokens_list else None)
 
@@ -643,16 +818,22 @@ def generate_hierarchical_music(args) -> str:
         top_k=args.top_k,
         upper_tokens_list=top_slices_for_middle,
         timing_list=mid_timing,
+        start_frames=mid_start_frames,
+        level_time_frames=mid_tf,
+        level_grid=middle_grid,
+        use_windowed_prefix=args.sampling_mode == 'windowed',
     )
+    if args.sampling_mode == 'windowed':
+        _validate_window_prefixes(middle_tokens_list, mid_start_frames, mid_tf, middle_grid, 'middle')
     full_middle_tokens = _assemble_token_timeline(
         tokens_list=middle_tokens_list,
         start_frames=mid_start_frames,
         level_time_frames=mid_tf,
         level_grid=middle_grid,
-        total_frames=total_source_frames,
+        total_frames=middle_conditioning_frames,
     )
     print('Middle-level generation complete. Generated tokens for each block have shape:', middle_tokens_list[0].shape if middle_tokens_list else None)
-    print('Stitched full middle tokens shape:', full_middle_tokens.shape)
+    print('Assembled full middle tokens shape:', full_middle_tokens.shape)
     print('Middle-level generation took: {:.2f} seconds'.format(time.time() - start_time))
 
     ## conditioning bottom level on the chunk of from the top and middle levels codes corresponding to the same segment
@@ -690,14 +871,122 @@ def generate_hierarchical_music(args) -> str:
         upper_tokens_list=middle_slices_for_bottom,
         second_upper_tokens_list=top_slices_for_bottom,
         timing_list=bot_timing,
+        start_frames=bot_start_frames,
+        level_time_frames=bot_tf,
+        level_grid=bottom_grid,
+        use_windowed_prefix=args.sampling_mode == 'windowed',
+    )
+    if args.sampling_mode == 'windowed':
+        _validate_window_prefixes(bottom_tokens_list, bot_start_frames, bot_tf, bottom_grid, 'bottom')
+    full_bottom_tokens = _assemble_token_timeline(
+        tokens_list=bottom_tokens_list,
+        start_frames=bot_start_frames,
+        level_time_frames=bot_tf,
+        level_grid=bottom_grid,
+        total_frames=total_source_frames,
     )
     print('Generation complete. Bottom tokens length:', len(bottom_tokens_list),
           'with each block having shape:', bottom_tokens_list[0].shape if bottom_tokens_list else None)
+    print('Assembled full bottom tokens shape:', full_bottom_tokens.shape)
     print('Generation took: {:.2f} seconds'.format(time.time() - start_time))
+
+    current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    save_dir = os.path.join(args.save_root, current_time)
+    os.makedirs(save_dir, exist_ok=True)
+    timing_metadata = {
+        'timing_source': 'duration_conditioned_window_schedule',
+        'sampling_mode': args.sampling_mode,
+        'spectrogram_assembly': 'linear_crossfade',
+        'requested_overlap_fraction': float(args.overlap_fraction),
+        'effective_overlap_fraction': effective_overlap,
+        'overlap_time_cols': overlap_cols,
+        'hop_time_cols': hop_cols,
+        'quantized_path': quantized_path,
+        'base_start_frame': int(base_start_frame),
+        'requested_duration_seconds': float(args.duration_seconds),
+        'total_source_frames': int(total_source_frames),
+        'conditioning_coverage_frames': {
+            'top': int(top_conditioning_frames),
+            'middle': int(middle_conditioning_frames),
+            'bottom': int(total_source_frames),
+        },
+        'sample_rate': int(sample_rate),
+        'hop_length': int(hop_length),
+        'level_time_frames': {'top': int(top_tf), 'middle': int(mid_tf), 'bottom': int(bot_tf)},
+        'sampling_step_frames': {'top': int(top_step), 'middle': int(mid_step), 'bottom': int(bot_step)},
+        'training_step_frames': {'top': int(training_top_step), 'middle': int(training_mid_step), 'bottom': int(training_bot_step)},
+        'chunk_start_frames': {
+            'top': [int(x) for x in top_start_frames],
+            'middle': [int(x) for x in mid_start_frames],
+            'bottom': [int(x) for x in bot_start_frames],
+        },
+        'full_token_shapes': {
+            'top': list(full_top_tokens.shape),
+            'middle': list(full_middle_tokens.shape),
+            'bottom': list(full_bottom_tokens.shape),
+        },
+    }
+    with open(os.path.join(save_dir, 'generation_timing_metadata.json'), 'w', encoding='utf-8') as f:
+        json.dump(timing_metadata, f, indent=2)
+
+    indices_dir = os.path.join(save_dir, 'indices')
+    os.makedirs(indices_dir, exist_ok=True)
+    np.save(os.path.join(indices_dir, 'top_full_indices.npy'), full_top_tokens.astype(np.int64, copy=False))
+    np.save(os.path.join(indices_dir, 'middle_full_indices.npy'), full_middle_tokens.astype(np.int64, copy=False))
+    np.save(os.path.join(indices_dir, 'bottom_full_indices.npy'), full_bottom_tokens.astype(np.int64, copy=False))
+    np.savez_compressed(
+        os.path.join(indices_dir, 'top_window_indices.npz'),
+        **{f'window_{idx:04d}': tokens.astype(np.int64, copy=False) for idx, tokens in enumerate(top_tokens_list)},
+    )
+    np.savez_compressed(
+        os.path.join(indices_dir, 'middle_window_indices.npz'),
+        **{f'window_{idx:04d}': tokens.astype(np.int64, copy=False) for idx, tokens in enumerate(middle_tokens_list)},
+    )
+    np.savez_compressed(
+        os.path.join(indices_dir, 'bottom_window_indices.npz'),
+        **{f'window_{idx:04d}': tokens.astype(np.int64, copy=False) for idx, tokens in enumerate(bottom_tokens_list)},
+    )
+    print(f'Saved full generated token timelines to {indices_dir}')
+
+    del top_prior, middle_prior, bottom_prior
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if top_vqvae_ref:
+        _decode_full_level_spectrogram(
+            level='top',
+            vqvae_ref=top_vqvae_ref,
+            full_tokens=full_top_tokens,
+            level_grid=top_grid,
+            total_frames=total_source_frames,
+            device=device,
+            weights_file=vqvae_weights_file,
+            save_dir=save_dir,
+        )
+    if middle_vqvae_ref:
+        _decode_full_level_spectrogram(
+            level='middle',
+            vqvae_ref=middle_vqvae_ref,
+            full_tokens=full_middle_tokens,
+            level_grid=middle_grid,
+            total_frames=total_source_frames,
+            device=device,
+            weights_file=vqvae_weights_file,
+            save_dir=save_dir,
+        )
+
     print('Decoding bottom tokens into spectrograms...')
+    _debug('Loading bottom VQ-VAE decoder...')
+    vqvae_bottom_decoder = load_jukebox_model(
+        bottom_vqvae_ref,
+        'bottom',
+        device,
+        vqvae_weights_file,
+    )
+    vqvae_bottom_decoder.eval()
 
     # Step 3: Spectrogram Assembly (Audio Engineer)
-    ## Use the same start frames as training; average only if the final coverage window overlaps.
+    ## Assemble generated windows by raw frame starts; crossfade where windows overlap.
     decode_start_time = time.time()
     reconstructed_spectrograms = _decode_bottom_blocks(
         vqvae=vqvae_bottom_decoder,
@@ -717,28 +1006,6 @@ def generate_hierarchical_music(args) -> str:
 
     # Step 4: Spectrogram Inversion (The Mastering Engineer)
     ## convert final spectrograms back to audio and save
-    current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    save_dir = os.path.join(args.save_root, current_time)
-    os.makedirs(save_dir, exist_ok=True)
-    timing_metadata = {
-        'timing_source': 'windowed_training_schedule',
-        'quantized_path': quantized_path,
-        'base_start_frame': int(base_start_frame),
-        'requested_duration_seconds': float(args.duration_seconds),
-        'total_source_frames': int(total_source_frames),
-        'sample_rate': int(sample_rate),
-        'hop_length': int(hop_length),
-        'level_time_frames': {'top': int(top_tf), 'middle': int(mid_tf), 'bottom': int(bot_tf)},
-        'level_step_frames': {'top': int(top_step), 'middle': int(mid_step), 'bottom': int(bot_step)},
-        'chunk_start_frames': {
-            'top': [int(x) for x in top_start_frames],
-            'middle': [int(x) for x in mid_start_frames],
-            'bottom': [int(x) for x in bot_start_frames],
-        },
-    }
-    with open(os.path.join(save_dir, 'generation_timing_metadata.json'), 'w', encoding='utf-8') as f:
-        json.dump(timing_metadata, f, indent=2)
-
     _debug(f'Loading min/max values from: {min_max_values_path}')
     with open(min_max_values_path, 'rb') as f:
         min_max_values = pickle.load(f)
