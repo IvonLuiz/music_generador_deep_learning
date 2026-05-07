@@ -184,7 +184,10 @@ class TransformerPriorConditioned(nn.Module):
         self.to_logits = nn.Linear(model_dim, num_embeddings, bias=False)
 
     def _init_learned_timing_embeddings(self, init_std: float):
-        """Initialize timing embeddings gently so they start as a cue, not a dominant signal."""
+        """!
+        @brief Initialize timing embeddings gently so they start as a cue, not a dominant signal.
+        @param init_std Standard deviation used for normal initialization.
+        """
         for emb in (
             self.absolute_timing_embedding,
             self.relative_timing_embedding,
@@ -338,9 +341,12 @@ class TransformerPriorConditioned(nn.Module):
         seq_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """
-        Build bounded learned timing embeddings from absolute song position,
-        relative position inside the model window, and total duration.
+        """!
+        @brief Build bounded learned timing embeddings from song position and duration.
+        @param timing Timing tensor shaped `(B, 3)`.
+        @param seq_len Sequence length to generate embeddings for.
+        @param device Target device for computations.
+        @return Timing embedding tensor shaped `(B, seq_len, D)`.
         """
         pos = torch.arange(seq_len, device=device)
         token_time_col = torch.div(pos, self.block_len, rounding_mode='floor')
@@ -385,10 +391,10 @@ class TransformerPriorConditioned(nn.Module):
         Next-token cross-entropy on a full sequence tensor (B, T).
 
         @param indices The input token indices for the current level (shape: [batch_size, seq_len]).
-        @param upper_indices The input token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
-        This is used as conditioning information for upsampler priors. Defaults to None (no conditioning).
-        @param timing Optional global timing tensor of shape (batch_size, 3) with float values
-        [start_time_seconds, total_duration_seconds, fraction_elapsed]. Defaults to None.
+        @param upper_indices Upper-level token indices for upsampler priors (shape: [batch_size, upper_seq_len]).
+        @param second_upper_indices Second upper-level token indices for dual-conditioning priors.
+        @param timing Optional timing tensor (shape: [batch_size, 3]) with
+        [start_time_seconds, total_duration_seconds, fraction_elapsed].
         @return The computed cross-entropy loss for next-token prediction.
         """
         if indices.ndim != 2:
