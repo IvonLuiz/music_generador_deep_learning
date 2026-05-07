@@ -219,21 +219,26 @@ class TransformerPriorConditioned(nn.Module):
         upper_indices: Optional[torch.Tensor] = None,
         second_upper_indices: Optional[torch.Tensor] = None,
         timing: Optional[torch.Tensor] = None,
+        conditioning_emb: Optional[torch.Tensor] = None,
+        second_conditioning_emb: Optional[torch.Tensor] = None,
+        timing_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Forward pass for the TransformerPriorConditioned model.
+        """!
+        @brief Forward pass for the TransformerPriorConditioned model.
 
-        Architecture adapted from jukebox. We pass the input token indices through token and position embeddings, add
+        @details Architecture adapted from jukebox. We pass the input token indices through token and position embeddings, add
         conditioning information if this is an upsampler prior, and then pass through a series of factored transformer
         layers before projecting to logits over the vocabulary.
 
-        @param indices The input token indices for the current level (shape: [batch_size, seq_len]).
-        @param upper_indices The input token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
-        This is used as conditioning information for upsampler priors. Defaults to None (no conditioning).
-        @param timing Optional global timing tensor of shape (batch_size, 3) with float values
-        [start_time_seconds, total_duration_seconds, fraction_elapsed]. Converted into bounded learned timing
-        buckets so the model knows where the current sequence is inside a song.
-        @return Logits over the vocabulary for the next token prediction (shape: [batch_size, seq_len, num_embeddings]).
+        @param indices Input token indices for the current level (shape: [batch_size, seq_len]).
+        @param upper_indices Upper-level token indices for upsampler priors (shape: [batch_size, upper_seq_len]).
+        @param second_upper_indices Second upper-level token indices for dual-conditioning priors.
+        @param timing Optional timing tensor (shape: [batch_size, 3]) with
+        [start_time_seconds, total_duration_seconds, fraction_elapsed].
+        @param conditioning_emb Optional precomputed conditioning embedding (shape: [batch_size, T, D]).
+        @param second_conditioning_emb Optional second conditioning embedding (shape: [batch_size, T, D]).
+        @param timing_emb Optional precomputed timing embedding (shape: [batch_size, T, D]).
+        @return Logits over the vocabulary (shape: [batch_size, seq_len, num_embeddings]).
         """
         if indices.ndim != 2:
             raise ValueError(f"indices must have shape (B, T), got {tuple(indices.shape)}")
@@ -254,7 +259,10 @@ class TransformerPriorConditioned(nn.Module):
 
         # Add learned timing embeddings if provided.
         # timing shape: (B, 3) with [start_time_s, total_duration_s, fraction_elapsed].
-        if self.use_timing_conditioning and timing is not None:
+        if self.use_timing_conditioning and timing_emb is not None:
+            t_emb = self._align_cached_embedding(timing_emb, batch_size, seq_len, device, 'timing_emb')
+            x = x + self.timing_embedding_scale * t_emb
+        elif self.use_timing_conditioning and timing is not None:
             timing = timing.to(device=device, dtype=torch.float32)
             if timing.ndim == 1:
                 timing = timing.unsqueeze(0)
@@ -268,50 +276,30 @@ class TransformerPriorConditioned(nn.Module):
             x = x + self.timing_embedding_scale * t_emb
 
         if self.is_upsampler:
-            if upper_indices is None:
-                raise ValueError('upper_indices must be provided for upsampler priors')
-            upper_indices = upper_indices.to(device=device, dtype=torch.long)
-            # Conditioning embedding vocabulary comes from the upper level codebook size
-            cond_vocab = self.conditioner.token_embedding.weight.shape[0]
-
-            if torch.any(upper_indices < 0):
-                raise ValueError("upper_indices contains negative values")
-
-            # Allow exactly one out-of-range ID for BOS from an upper prior with BOS enabled
-            # BOS id is expected to be exactly equal to cond_vocab and is mapped to a neutral token
-            if torch.any(upper_indices >= cond_vocab):
-                if torch.any(upper_indices > cond_vocab):
-                    raise ValueError(
-                        f"upper_indices contains values above conditioning vocab (max allowed={cond_vocab})"
-                    )
-                upper_indices = upper_indices.clone()
-                upper_indices[upper_indices == cond_vocab] = 0
-
-            # Process the conditioning input through the WaveNet conditioner
-            cond_emb = self.conditioner(upper_indices)  # [batch_size, upper_seq_len, model_dim]
-            # Add the conditioning embeddings to the token embeddings
-            x = x + cond_emb[:, :seq_len, :]  # Ensure the conditioning embeddings are added only up to the current sequence length (in case of any length mismatch)
+            if conditioning_emb is None:
+                cond_emb = self._compute_conditioning_embedding(
+                    upper_indices,
+                    self.conditioner,
+                    device,
+                    'upper_indices',
+                )
+            else:
+                cond_emb = conditioning_emb
+            cond_emb = self._align_cached_embedding(cond_emb, batch_size, seq_len, device, 'conditioning_emb')
+            x = x + cond_emb    # add the conditioning embeddings to the token embeddings before feeding into the transformer layers.
 
             if self.second_conditioner is not None:
-                if second_upper_indices is None:
-                    raise ValueError('second_upper_indices must be provided when second_conditioner is enabled')
-
-                second_upper_indices = second_upper_indices.to(device=device, dtype=torch.long)
-                cond_vocab_2 = self.second_conditioner.token_embedding.weight.shape[0]
-
-                if torch.any(second_upper_indices < 0):
-                    raise ValueError("second_upper_indices contains negative values")
-
-                if torch.any(second_upper_indices >= cond_vocab_2):
-                    if torch.any(second_upper_indices > cond_vocab_2):
-                        raise ValueError(
-                            f"second_upper_indices contains values above conditioning vocab (max allowed={cond_vocab_2})"
-                        )
-                    second_upper_indices = second_upper_indices.clone()
-                    second_upper_indices[second_upper_indices == cond_vocab_2] = 0
-
-                cond_emb_2 = self.second_conditioner(second_upper_indices)
-                x = x + cond_emb_2[:, :seq_len, :]
+                if second_conditioning_emb is None:
+                    cond_emb_2 = self._compute_conditioning_embedding(
+                        second_upper_indices,
+                        self.second_conditioner,
+                        device,
+                        'second_upper_indices',
+                    )
+                else:
+                    cond_emb_2 = second_conditioning_emb
+                cond_emb_2 = self._align_cached_embedding(cond_emb_2, batch_size, seq_len, device, 'second_conditioning_emb')
+                x = x + cond_emb_2  # add the second conditioning embeddings if present (e.g., for the bottom prior conditioned on both middle and top)
 
         # pass through transformer layers
         # FactoredAttention requires seq_len to be a multiple of block_len
@@ -334,6 +322,73 @@ class TransformerPriorConditioned(nn.Module):
         logits = self.to_logits(x)
         
         return logits
+
+    def _compute_conditioning_embedding(
+        self,
+        indices: Optional[torch.Tensor],
+        conditioner: nn.Module,
+        device: torch.device,
+        name: str,
+    ) -> torch.Tensor:
+        """!
+        @brief Compute a WaveNet conditioner embedding from upper-level indices.
+        @param indices Conditioning token indices from the upper level.
+        @param conditioner WaveNet conditioner module to apply.
+        @param device Target device for conditioning tensors.
+        @param name Label used in validation errors.
+        @return Conditioning embeddings shaped `(B, T, D)`.
+        @throws ValueError If indices are missing or out of range.
+        """
+        if indices is None:
+            raise ValueError(f'{name} must be provided for upsampler priors')
+
+        indices = indices.to(device=device, dtype=torch.long)
+        cond_vocab = conditioner.token_embedding.weight.shape[0] # cond vocabulary comes from the upper level codebook size
+
+        if torch.any(indices < 0):
+            raise ValueError(f"{name} contains negative values")
+
+        # Allow exactly one out-of-range ID for BOS from an upper prior with BOS enabled
+        # BOS id is expected to be exactly equal to cond_vocab and is mapped to a neutral token
+        if torch.any(indices >= cond_vocab):
+            if torch.any(indices > cond_vocab):
+                raise ValueError(
+                    f"{name} contains values above conditioning vocab (max allowed={cond_vocab})"
+                )
+            indices = indices.clone()
+            indices[indices == cond_vocab] = 0
+
+        # Process the conditioning input through the WaveNet conditioner
+        return conditioner(indices)
+
+    @staticmethod
+    def _align_cached_embedding(
+        embedding: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        name: str,
+    ) -> torch.Tensor:
+        """!
+        @brief Align a cached embedding to the requested batch and sequence length.
+        @param embedding Cached embedding tensor shaped `(B, T, D)`.
+        @param batch_size Expected batch size for the current request.
+        @param seq_len Required sequence length.
+        @param device Target device for the embedding.
+        @param name Label used in validation errors.
+        @return Embedding tensor cropped to `(batch_size, seq_len, D)`.
+        @throws ValueError If the embedding shape is incompatible.
+        """
+        if embedding.ndim != 3:
+            raise ValueError(f'{name} must have shape (B, T, D), got {tuple(embedding.shape)}')
+        embedding = embedding.to(device=device)
+        if embedding.shape[0] == 1 and batch_size > 1:
+            embedding = embedding.expand(batch_size, -1, -1)
+        if embedding.shape[0] != batch_size:
+            raise ValueError(f'{name} batch size {embedding.shape[0]} does not match indices batch size {batch_size}')
+        if embedding.shape[1] < seq_len:
+            raise ValueError(f'{name} length {embedding.shape[1]} is shorter than requested seq_len={seq_len}')
+        return embedding[:, :seq_len, :]
 
     def _learned_timing_embedding(
         self,
@@ -388,8 +443,7 @@ class TransformerPriorConditioned(nn.Module):
         timing: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """!
-        Next-token cross-entropy on a full sequence tensor (B, T).
-
+        @brief Compute next-token cross-entropy on a full sequence tensor (B, T).
         @param indices The input token indices for the current level (shape: [batch_size, seq_len]).
         @param upper_indices Upper-level token indices for upsampler priors (shape: [batch_size, upper_seq_len]).
         @param second_upper_indices Second upper-level token indices for dual-conditioning priors.
