@@ -416,7 +416,7 @@ class TransformerPriorConditioned(nn.Module):
         )
         return F.cross_entropy(logits.reshape(-1, self.num_embeddings), target.reshape(-1))
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(
         self,
         batch_size: int,
@@ -456,13 +456,19 @@ class TransformerPriorConditioned(nn.Module):
             device = next(self.parameters()).device
         
         bos_prefix_len = 0
-
         if start_tokens is not None:
             if start_tokens.ndim != 2:
                 raise ValueError(f"start_tokens must have shape (B, T), got {tuple(start_tokens.shape)}")
             if start_tokens.shape[0] != batch_size:
                 raise ValueError("start_tokens batch size does not match requested batch_size")
-            tokens = start_tokens.to(device).long()
+            start_tokens = start_tokens.to(device).long()
+            if self.use_bos_token:
+                # Continuation prefixes still need the same BOS-shifted positions used during training.
+                bos = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
+                tokens = torch.cat([bos, start_tokens], dim=1)
+                bos_prefix_len = 1
+            else:
+                tokens = start_tokens
         else:
             if self.use_bos_token:
                 tokens = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
@@ -470,10 +476,11 @@ class TransformerPriorConditioned(nn.Module):
             else:
                 tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
         
-        if tokens.shape[1] > seq_len:
+        target_len = seq_len + bos_prefix_len
+
+        if tokens.shape[1] > target_len:
             raise ValueError("start_tokens length cannot exceed requested seq_len")
 
-        target_len = seq_len + bos_prefix_len
 
         while tokens.shape[1] < target_len:
             logits = self.forward(
