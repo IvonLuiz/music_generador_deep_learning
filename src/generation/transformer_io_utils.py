@@ -9,6 +9,13 @@ from utils import load_config
 
 
 def prepare_min_max_values(min_max_values: object, count: int) -> list:
+    """!
+    @brief Normalize min/max metadata into a list of a requested length.
+    @param min_max_values Dict or list of per-dataset min/max tuples.
+    @param count Number of entries required.
+    @return List of min/max entries sized to `count`.
+    @throws ValueError If the input type is unsupported or empty.
+    """
     if isinstance(min_max_values, dict):
         values = list(min_max_values.values())
     elif isinstance(min_max_values, list):
@@ -27,6 +34,12 @@ def prepare_min_max_values(min_max_values: object, count: int) -> list:
 
 
 def resolve_vqvae_config_path(model_dir_or_file: str) -> str:
+    """!
+    @brief Resolve a VQ-VAE config path from a model directory or file.
+    @param model_dir_or_file Path to a model directory or a file within it.
+    @return Absolute path to `config.yaml`.
+    @throws FileNotFoundError If the model reference or config file cannot be located.
+    """
     if os.path.isdir(model_dir_or_file):
         config_path = os.path.join(model_dir_or_file, 'config.yaml')
     elif os.path.isfile(model_dir_or_file):
@@ -45,6 +58,13 @@ def resolve_vqvae_config_path(model_dir_or_file: str) -> str:
 
 
 def resolve_min_max_values_path(bottom_config: dict, debug_fn: Optional[Callable[[str], None]] = None) -> str:
+    """!
+    @brief Resolve the dataset min/max normalization file for decoding.
+    @param bottom_config Parsed bottom-level transformer config.
+    @param debug_fn Optional logger for candidate path tracing.
+    @return Absolute path to `min_max_values.pkl`.
+    @throws FileNotFoundError If no valid min/max file is found.
+    """
     def _normalize_candidate_path(path: Optional[str]) -> Optional[str]:
         if not path or not isinstance(path, str):
             return None
@@ -156,6 +176,7 @@ def save_level_spectrograms(
     *,
     root_subdir: str = 'spectrograms',
     include_level_subdir: bool = True,
+    npy_subdir: Optional[str] = None,
     npy_filename: Optional[str] = None,
     filename_prefix: Optional[str] = None,
     title_template: Optional[str] = None,
@@ -171,6 +192,7 @@ def save_level_spectrograms(
     @param level Logical level name such as `top`, `middle`, or `bottom`.
     @param root_subdir Root folder under `output_dir` where spectrograms are stored.
     @param include_level_subdir Whether to create a per-level subdirectory under `root_subdir`.
+    @param npy_subdir Optional subdirectory, relative to `root_subdir`, for saved `.npy` arrays.
     @param npy_filename Output filename for the saved `.npy` array.
     @param filename_prefix Prefix used for generated PNG files.
     @param title_template Figure title template. Use `{index}` for the sample index.
@@ -182,12 +204,14 @@ def save_level_spectrograms(
     """
     spectrogram_dir = os.path.join(output_dir, root_subdir, level) if include_level_subdir else os.path.join(output_dir, root_subdir)
     os.makedirs(spectrogram_dir, exist_ok=True)
+    npy_dir = os.path.join(output_dir, root_subdir, npy_subdir) if npy_subdir else spectrogram_dir
+    os.makedirs(npy_dir, exist_ok=True)
 
     array_name = npy_filename or f'{level}_decoded_specs.npy'
     image_prefix = filename_prefix or f'{level}_spectrogram'
     title_fmt = title_template or f'{level.capitalize()} decoded spectrogram {{index}}'
 
-    np.save(os.path.join(spectrogram_dir, array_name), decoded_specs)
+    np.save(os.path.join(npy_dir, array_name), decoded_specs)
 
     for i in range(decoded_specs.shape[0]):
         spec = decoded_specs[i, :, :, 0] if decoded_specs.ndim == 4 else decoded_specs[i]
@@ -265,10 +289,11 @@ def save_decoded_spectrograms(specs: np.ndarray, save_dir: str) -> None:
         'bottom',
         root_subdir='spectrograms',
         include_level_subdir=False,
+        npy_subdir='npy',
         npy_filename='bottom_decoded_specs.npy',
         filename_prefix='bottom_spec',
         title_template='Decoded Bottom Spectrogram {index}',
         cmap='magma',
-        figsize=(6, 4),
+        figsize=(12, 4),
         colorbar_label='Normalized amplitude',
     )
