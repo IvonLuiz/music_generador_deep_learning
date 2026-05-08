@@ -541,13 +541,45 @@ class TransformerPriorConditioned(nn.Module):
         if tokens.shape[1] > target_len:
             raise ValueError("start_tokens length cannot exceed requested seq_len")
 
+        cached_conditioning_emb = None
+        cached_second_conditioning_emb = None
+        if self.is_upsampler:
+            cached_conditioning_emb = self._compute_conditioning_embedding(
+                upper_indices,
+                self.conditioner,
+                device,
+                'upper_indices',
+            )
+            if self.second_conditioner is not None:
+                cached_second_conditioning_emb = self._compute_conditioning_embedding(
+                    second_upper_indices,
+                    self.second_conditioner,
+                    device,
+                    'second_upper_indices',
+                )
+
+        cached_timing_emb = None
+        if self.use_timing_conditioning and timing is not None:
+            timing_for_cache = timing.to(device=device, dtype=torch.float32)
+            if timing_for_cache.ndim == 1:
+                timing_for_cache = timing_for_cache.unsqueeze(0)
+            if timing_for_cache.shape[0] == 1 and batch_size > 1:
+                timing_for_cache = timing_for_cache.expand(batch_size, -1)
+            if timing_for_cache.shape != (batch_size, 3):
+                raise ValueError(
+                    f"timing must have shape (B, 3) or (1, 3), got {tuple(timing_for_cache.shape)}"
+                )
+            cached_timing_emb = self._learned_timing_embedding(timing_for_cache, self.max_seq_len, device)
 
         while tokens.shape[1] < target_len:
             logits = self.forward(
                 tokens,
-                upper_indices=upper_indices,
-                second_upper_indices=second_upper_indices,
-                timing=timing,
+                upper_indices=None if cached_conditioning_emb is not None else upper_indices,
+                second_upper_indices=None if cached_second_conditioning_emb is not None else second_upper_indices,
+                timing=None if cached_timing_emb is not None else timing,
+                conditioning_emb=cached_conditioning_emb,
+                second_conditioning_emb=cached_second_conditioning_emb,
+                timing_emb=cached_timing_emb,
             )
             
             next_logits = logits[:, -1, :] / temperature
