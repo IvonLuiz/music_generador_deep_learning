@@ -508,6 +508,54 @@ def _decode_bottom_blocks(
     return reconstructed_spectrograms
 
 
+def _save_audio_from_spectrogram(
+    spectrograms: np.ndarray,
+    min_max_values,
+    save_dir: str,
+    filename: str,
+    hop_length: int,
+    sample_rate: int,
+    frame_size: int,
+    spectrogram_type: str,
+    n_mels: int,
+    audio_method: str,
+) -> str:
+    """!
+    @brief Convert decoded normalized spectrograms to audio and save the first sample.
+    @param spectrograms Decoded spectrogram batch shaped `(B, F, T, 1)`.
+    @param min_max_values Dataset min/max metadata used to denormalize the spectrogram.
+    @param save_dir Generation output directory.
+    @param filename Output filename inside the `audio` subdirectory.
+    @param hop_length STFT/mel hop length used during preprocessing.
+    @param sample_rate Audio sample rate.
+    @param frame_size FFT frame size.
+    @param spectrogram_type Spectrogram type: `linear` or `mel`.
+    @param n_mels Number of mel bins when using mel spectrograms.
+    @param audio_method Inversion method accepted by `SoundGenerator`.
+    @return Full path of the written waveform file.
+    """
+    min_max_list = prepare_min_max_values(min_max_values, spectrograms.shape[0])
+    sound_generator = SoundGenerator(
+        None,
+        hop_length=hop_length,
+        sample_rate=sample_rate,
+        n_fft=frame_size,
+        spectrogram_type=spectrogram_type,
+        n_mels=n_mels,
+    )
+    audio_signals = sound_generator.convert_spectrograms_to_audio(
+        spectrograms,
+        min_max_list,
+        method=audio_method,
+    )
+
+    audio_dir = os.path.join(save_dir, 'audio')
+    os.makedirs(audio_dir, exist_ok=True)
+    audio_path = os.path.join(audio_dir, filename)
+    sf.write(audio_path, audio_signals[0], sample_rate)
+    return audio_path
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate music from hierarchical transformer priors.')
     parser.add_argument('--top_config', type=str, default=None, help='Path to top prior config.yaml or run directory')
@@ -1011,26 +1059,37 @@ def generate_hierarchical_music(args) -> str:
         min_max_values = pickle.load(f)
 
     save_decoded_spectrograms(final_spectrogram, save_dir)
-    min_max_list = prepare_min_max_values(min_max_values, final_spectrogram.shape[0])
-
-
-    sound_generator = SoundGenerator(
-        vqvae_bottom_decoder,
+    bottom_audio_path = _save_audio_from_spectrogram(
+        spectrograms=final_spectrogram,
+        min_max_values=min_max_values,
+        save_dir=save_dir,
+        filename='sample.wav',
         hop_length=hop_length,
         sample_rate=sample_rate,
-        n_fft=frame_size,
+        frame_size=frame_size,
         spectrogram_type=spectrogram_type,
         n_mels=n_mels,
+        audio_method=args.audio_method,
     )
-    audio_signals = sound_generator.convert_spectrograms_to_audio(
-        final_spectrogram, min_max_list, method=args.audio_method
-    )
-    final_audio = audio_signals[0]
-    
-    # Save the final waveform
-    audio_dir = os.path.join(save_dir, 'audio')
-    os.makedirs(audio_dir, exist_ok=True)
-    sf.write(os.path.join(audio_dir, 'sample.wav'), final_audio, sample_rate)
+    print(f'Saved bottom audio to {bottom_audio_path}')
+
+    if args.save_middle_audio:
+        if middle_decoded_specs is None:
+            print('Skipping middle audio because the middle VQ-VAE reference is unavailable.')
+        else:
+            middle_audio_path = _save_audio_from_spectrogram(
+                spectrograms=middle_decoded_specs,
+                min_max_values=min_max_values,
+                save_dir=save_dir,
+                filename='middle_sample.wav',
+                hop_length=hop_length,
+                sample_rate=sample_rate,
+                frame_size=frame_size,
+                spectrogram_type=spectrogram_type,
+                n_mels=n_mels,
+                audio_method=args.audio_method,
+            )
+            print(f'Saved middle audio to {middle_audio_path}')
 
     return save_dir
 
