@@ -1,6 +1,6 @@
 import os
 import sys
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -49,9 +49,11 @@ class TransformerPriorConditioned(nn.Module):
         max_time_steps: int = 100,
         is_upsampler: bool = False,
         cond_num_embeddings: Optional[int] = None,
-        upsample_stride: Optional[int] = None,
+        cond_block_len: Optional[int] = None,
+        upsample_stride: Optional[Union[int, Tuple[int, int]]] = None,
         second_cond_num_embeddings: Optional[int] = None,
-        second_upsample_stride: Optional[int] = None,
+        second_cond_block_len: Optional[int] = None,
+        second_upsample_stride: Optional[Union[int, Tuple[int, int]]] = None,
         use_bos_token: bool = False,
         conditioner_residual_block_width: int = 1024,
         conditioner_residual_blocks: int = 16,
@@ -68,6 +70,7 @@ class TransformerPriorConditioned(nn.Module):
         timing_max_duration_seconds: float = 3600.0,
         timing_embedding_init_std: float = 0.02,
         timing_embedding_scale: float = 1.0,
+        use_2d_conditioner: bool = True,
     ):
         """!
         @brief Initializes the TransformerPrior model.
@@ -122,6 +125,7 @@ class TransformerPriorConditioned(nn.Module):
         self.timing_window_seconds = float(timing_window_seconds) if timing_window_seconds is not None else None
         self.timing_max_duration_seconds = float(timing_max_duration_seconds)
         self.timing_embedding_scale = float(timing_embedding_scale)
+        self.use_2d_conditioner = bool(use_2d_conditioner)
         self.bos_token_id = num_embeddings if use_bos_token else None
         self.input_vocab_size = num_embeddings + (1 if use_bos_token else 0)
 
@@ -130,11 +134,15 @@ class TransformerPriorConditioned(nn.Module):
         if self.is_upsampler:
             if cond_num_embeddings is None or upsample_stride is None:
                 raise ValueError('cond_num_embeddings and upsample_stride must be provided for upsampler priors')
+            if self.use_2d_conditioner and cond_block_len is None:
+                raise ValueError('cond_block_len must be provided for 2D upsampler priors')
         
+            # To instantiate a WaveNet conditioner that resamples a 2D sequence, we must know the conditioning `block_len` (freq dimension length)
             # instantiate the WaveNet Conditioner for processing the conditioning input
             self.conditioner = WaveNetConditioner(
                 num_embeddings=cond_num_embeddings,
                 embedding_dim=model_dim,
+                cond_freq_bins=cond_block_len if self.use_2d_conditioner else None,
                 num_layers=conditioner_residual_blocks,
                 num_channels=conditioner_residual_block_width,
                 kernel_size=conditioner_kernel_size,
@@ -143,13 +151,20 @@ class TransformerPriorConditioned(nn.Module):
                 dilation_cycle=conditioner_dilation_cycle,
                 upsample_stride=upsample_stride,
                 dropout=dropout,
+                use_2d_conditioner=self.use_2d_conditioner,
             )
 
             self.second_conditioner = None
-            if second_cond_num_embeddings is not None and second_upsample_stride is not None:
+            has_second_conditioner = (
+                second_cond_num_embeddings is not None
+                and second_upsample_stride is not None
+                and (not self.use_2d_conditioner or second_cond_block_len is not None)
+            )
+            if has_second_conditioner:
                 self.second_conditioner = WaveNetConditioner(
                     num_embeddings=second_cond_num_embeddings,
                     embedding_dim=model_dim,
+                    cond_freq_bins=second_cond_block_len if self.use_2d_conditioner else None,
                     num_layers=conditioner_residual_blocks,
                     num_channels=conditioner_residual_block_width,
                     kernel_size=conditioner_kernel_size,
@@ -158,6 +173,7 @@ class TransformerPriorConditioned(nn.Module):
                     dilation_cycle=conditioner_dilation_cycle,
                     upsample_stride=second_upsample_stride,
                     dropout=dropout,
+                    use_2d_conditioner=self.use_2d_conditioner,
                 )
         else:
             self.second_conditioner = None
@@ -630,7 +646,9 @@ if __name__ == "__main__":
     num_layers = 6
     dim_feedforward = 2048
     max_seq_len = 512
-    upsample_stride = 4    # 128 upper tokens → 512 lower tokens
+    middle_upsample_stride = (2, 2)  # 8x16 sliced top -> 16x32 middle
+    bottom_middle_upsample_stride = (2, 2)  # 16x8 sliced middle -> 32x16 bottom
+    bottom_top_upsample_stride = (4, 4)  # 8x4 sliced top -> 32x16 bottom
     padding = 0
     kernel_size = 3
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -707,7 +725,8 @@ if __name__ == "__main__":
         block_len=16,  # Middle grid: 16 freq × 32 time
         is_upsampler=True,
         cond_num_embeddings=num_embeddings,
-        upsample_stride=upsample_stride,  # 128 → 512, stride=4
+        cond_block_len=8,
+        upsample_stride=middle_upsample_stride,
         dropout=0.1,
     ).to(device)
 
@@ -750,11 +769,14 @@ if __name__ == "__main__":
         num_layers=num_layers,
         dim_feedforward=dim_feedforward,
         max_seq_len=seq_len_bot,
+        block_len=32,
         is_upsampler=True,
         cond_num_embeddings=num_embeddings, # Middle level codebook
-        upsample_stride=4,                  # 128 -> 512
+        cond_block_len=16,
+        upsample_stride=bottom_middle_upsample_stride,
         second_cond_num_embeddings=num_embeddings, # Top level codebook
-        second_upsample_stride=16,          # 32 -> 512
+        second_cond_block_len=8,
+        second_upsample_stride=bottom_top_upsample_stride,
     ).to(device)
 
     # Dummy data
