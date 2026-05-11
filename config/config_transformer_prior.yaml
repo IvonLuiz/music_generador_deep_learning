@@ -28,15 +28,16 @@ model:
 #   Bottom secondary (Top→Bottom): sliced Top = top_h*(128/2048)*top_w = 8*4=32 tokens  → stride 512/32=16
 priors:
   top_prior:
-    model_dim: 1280       # Transformer width (size of the embedding vector for each token) (Jukebox uses 4800)
-    num_heads: 8          # Atention heads (Jukebox uses 8 for Top)
-    num_layers: 18        # Transformer self-attention layers (Jukebox uses 72)
+    model_dim: 1024       # Transformer width (size of the embedding vector for each token) (Jukebox uses 4800)
+    num_heads: 16         # Atention heads [1024 / 64 = 16] (Jukebox uses 8 for Top)
+    num_layers: 24        # Transformer self-attention layers (Jukebox uses 72)
     dim_feedforward: 4096 # Transformer feedforward layers
     dropout: 0.1
     max_time_steps: 512  # seq_len = 8×64 = 512 tokens
     attention_qkv_ratio: 0.25
     block_len: 8         # freq dimension of Top grid (8 freq bins × 64 time steps)
-    use_bos_token: true
+    # Timing conditioning parameters
+    use_bos_token: false
     use_timing_conditioning: true
     timing_num_bins: 1024
     duration_num_bins: 256
@@ -104,8 +105,8 @@ training:
   persist_workers: true
   prefetch_factor: 4
   top_prior:
-    batch_size: 16
-    gradient_accumulation_steps: 16
+    batch_size: 14
+    gradient_accumulation_steps: 18
     learning_rate: 0.0001
     scheduler: none
     weight_decay: 0.002
