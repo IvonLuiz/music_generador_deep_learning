@@ -211,7 +211,7 @@ def split_train_val_paths(
     validation_split: float,
     seed: Optional[int] = None,
 ):
-
+    all_file_paths = list(all_file_paths)
     split_rng = np.random.default_rng(seed)
     split_rng.shuffle(all_file_paths)
 
@@ -220,21 +220,20 @@ def split_train_val_paths(
     if validation_split == 0:
         return all_file_paths, None # all data in training
 
-    # Logic to use entire songs in either train or val set, based on filename prefixes,
-    # to prevent data leakage. Assumes files from the same song share a common prefix
-    all_files = list_npy_files(dataset_cfg['processed_path'])
-    song_prefixes = sorted(list(set([extract_song_prefix(f) for f in all_files])))
-
-    # Split prefixes (e.g., 10% validation)
-    num_val = int(len(all_file_paths) * validation_split)
-    num_val_songs = int(len(song_prefixes) * num_val / len(all_file_paths))
+    # Keep whole songs in either train or val to prevent leakage between chunks
+    # from the same piece. We split over unique song prefixes, then map back to files.
+    song_prefixes = sorted({extract_song_prefix(f) for f in all_file_paths})
+    split_rng.shuffle(song_prefixes)
+    num_val_songs = int(round(len(song_prefixes) * validation_split))
+    if len(song_prefixes) > 1:
+        num_val_songs = max(1, min(len(song_prefixes) - 1, num_val_songs))
+    else:
+        num_val_songs = 0
     val_songs = set(song_prefixes[:num_val_songs])
 
-    # Create the final lists
-    train_file_paths = [f for f in all_files if extract_song_prefix(f) not in val_songs]
-    val_file_paths = [f for f in all_files if extract_song_prefix(f) in val_songs]
+    train_file_paths = [f for f in all_file_paths if extract_song_prefix(f) not in val_songs]
+    val_file_paths = [f for f in all_file_paths if extract_song_prefix(f) in val_songs]
     
     print(f"Songs: {len(song_prefixes) - num_val_songs} train, {num_val_songs} val")
 
     return train_file_paths, val_file_paths
-
