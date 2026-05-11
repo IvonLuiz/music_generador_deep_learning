@@ -5,7 +5,7 @@ import argparse
 import json
 import numpy as np
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 import math
 
 import torch
@@ -65,6 +65,75 @@ def _compute_stride(lower_len: int, upper_len: int, level_name: str) -> int:
     return lower_len // upper_len
 
 
+def _tensor_grid_shape(name: str, tensor: torch.Tensor) -> Tuple[int, int]:
+    if tensor is None or tensor.numel() == 0:
+        raise ValueError(f'{name} is required to infer 2D conditioner geometry.')
+    if tensor.ndim != 2:
+        raise ValueError(f'{name} must have shape (time_cols, freq_bins), got {tuple(tensor.shape)}')
+    time_cols, freq_bins = int(tensor.shape[0]), int(tensor.shape[1])
+    if time_cols <= 0 or freq_bins <= 0:
+        raise ValueError(f'{name} has invalid shape {tuple(tensor.shape)}')
+    return time_cols, freq_bins
+
+
+def _compute_2d_stride_from_tensors(
+    target_indices: torch.Tensor,
+    cond_indices: torch.Tensor,
+    label: str,
+) -> Tuple[Tuple[int, int], int]:
+    target_time, target_freq = _tensor_grid_shape(f'{label} target', target_indices)
+    cond_time, cond_freq = _tensor_grid_shape(f'{label} conditioning', cond_indices)
+    if target_time % cond_time != 0 or target_freq % cond_freq != 0:
+        raise ValueError(
+            f'Cannot infer 2D conditioner stride for {label}: '
+            f'target_shape=({target_time}, {target_freq}), '
+            f'cond_shape=({cond_time}, {cond_freq})'
+        )
+    return (target_time // cond_time, target_freq // cond_freq), cond_freq
+
+
+def _serialize_stride(stride):
+    if isinstance(stride, (tuple, list)):
+        if len(stride) != 2:
+            raise ValueError(f'Expected stride tuple/list of length 2, got {stride}')
+        return [int(stride[0]), int(stride[1])]
+    return int(stride)
+
+
+def _load_model_state_compatibly(model: nn.Module, state_dict: dict) -> bool:
+    try:
+        model.load_state_dict(state_dict)
+        return False
+    except RuntimeError as exc:
+        print(f"Strict checkpoint load failed; retrying with shape-compatible weights only: {exc}")
+
+    current_state = model.state_dict()
+    compatible_state = {}
+    skipped = []
+    unexpected = []
+    for key, value in state_dict.items():
+        if key not in current_state:
+            unexpected.append(key)
+            continue
+        if tuple(current_state[key].shape) != tuple(value.shape):
+            skipped.append(key)
+            continue
+        compatible_state[key] = value
+
+    missing, unexpected_from_load = model.load_state_dict(compatible_state, strict=False)
+    unexpected.extend(unexpected_from_load)
+    if skipped:
+        print(
+            "Skipped checkpoint weights with incompatible shapes "
+            f"({len(skipped)} total): {skipped[:10]}"
+        )
+    if missing:
+        print(f"Model parameters initialized fresh ({len(missing)} total): {missing[:10]}")
+    if unexpected:
+        print(f"Ignored unexpected checkpoint keys ({len(unexpected)} total): {unexpected[:10]}")
+    return True
+
+
 def _loader_kwargs(num_workers: int, pin_memory: bool, persist_workers: bool, prefetch_factor: Optional[int]) -> dict:
     kwargs = {
         'num_workers': num_workers,
@@ -118,11 +187,17 @@ def train_transformer_prior(
     print(f'Found {len(all_file_paths)} spectrogram files for quantization.')
     print(f'Level target time frames: {level_target_time_frames}')
 
+    validation_split = float(train_cfg.get('validation_split', 0.1))
     train_file_paths, val_file_paths = split_train_val_paths(
         all_file_paths=all_file_paths,
         dataset_cfg=dataset_cfg,
-        validation_split=train_cfg.get('validation_split', 0.1),
+        validation_split=validation_split,
         seed=seed,
+    )
+    print(
+        f"Using {len(train_file_paths)} training files and "
+        f"{len(val_file_paths) if val_file_paths else 0} validation files "
+        f"(validation_split={validation_split:.3f})."
     )
 
     # Load precomputed quantized dataset
@@ -183,8 +258,25 @@ def train_transformer_prior(
     middle_rows, middle_cols = train_dataset.middle_grid
     bottom_rows, bottom_cols = train_dataset.bottom_grid
 
+    grid_shapes = {
+        'top': (top_rows, top_cols),
+        'middle': (middle_rows, middle_cols),
+        'bottom': (bottom_rows, bottom_cols)
+    }
+
     target_seq_len = int(target_indices.numel())
-    seq_lens = {'top': target_seq_len, 'middle': target_seq_len, 'bottom': target_seq_len}
+    seq_lens = {
+        'top': int(top_rows * top_cols),
+        'middle': int(middle_rows * middle_cols),
+        'bottom': int(bottom_rows * bottom_cols),
+    }
+    expected_target_seq_len = seq_lens[selected_level]
+    if target_seq_len != expected_target_seq_len:
+        raise ValueError(
+            f'{selected_level} target has {target_seq_len} tokens, but dataset grid '
+            f'{grid_shapes[selected_level] if "grid_shapes" in locals() else "unknown"} implies '
+            f'{expected_target_seq_len}.'
+        )
 
     print(f"Top grid shape: ({top_rows}, {top_cols})")
     print(f"Middle grid shape: ({middle_rows}, {middle_cols})")
@@ -197,6 +289,7 @@ def train_transformer_prior(
     cond_level = COND_LEVEL[selected_level]
     second_cond_level = SECOND_COND_LEVEL[selected_level]
     condition_on_top = bool(prior_cfg.get('condition_on_top', False)) and selected_level == 'bottom'
+    is_upsampler = prior_cfg.get('is_upsampler', selected_level in ['middle', 'bottom'])
 
     _top_tf = int(level_target_time_frames.get('top', target_time_frames))
     _mid_tf = int(level_target_time_frames.get('middle', target_time_frames))
@@ -207,28 +300,46 @@ def train_transformer_prior(
     cond_seq_len = int(cond_indices_sample.numel()) if cond_indices_sample.numel() > 0 else 0
     second_cond_seq_len = int(second_cond_indices_sample.numel()) if second_cond_indices_sample.numel() > 0 else 0
     cond_time_cols = int(cond_indices_sample.shape[0]) if cond_indices_sample.ndim == 2 and cond_indices_sample.numel() > 0 else 0
+    cond_freq_bins = int(cond_indices_sample.shape[1]) if cond_indices_sample.ndim == 2 and cond_indices_sample.numel() > 0 else 0
     second_cond_time_cols = (
         int(second_cond_indices_sample.shape[0])
         if second_cond_indices_sample.ndim == 2 and second_cond_indices_sample.numel() > 0
         else 0
     )
+    second_cond_freq_bins = (
+        int(second_cond_indices_sample.shape[1])
+        if second_cond_indices_sample.ndim == 2 and second_cond_indices_sample.numel() > 0
+        else 0
+    )
 
     if cond_seq_len > 0:
-        print(f"Conditioning slice for {selected_level}: {cond_time_cols} time-cols × {top_cols if selected_level == 'middle' else middle_cols} freq = {cond_seq_len} tokens")
+        print(f"Conditioning slice for {selected_level}: {cond_time_cols} time-cols × {cond_freq_bins} freq = {cond_seq_len} tokens")
     if second_cond_seq_len > 0:
-        print(f"Second conditioning slice (Top→Bottom): {second_cond_time_cols} time-cols × {top_cols} freq = {second_cond_seq_len} tokens")
+        print(f"Second conditioning slice (Top→Bottom): {second_cond_time_cols} time-cols × {second_cond_freq_bins} freq = {second_cond_seq_len} tokens")
 
     is_upsampler = cond_level is not None
     upsample_stride = None
     cond_num_embeddings = None
+    cond_block_len = None
     second_upsample_stride = None
     second_cond_num_embeddings = None
+    second_cond_block_len = None
     if is_upsampler:
         cond_num_embeddings = num_embeddings_map[cond_level]
-        upsample_stride = _compute_stride(target_seq_len, cond_seq_len, selected_level)
+        upsample_stride, cond_block_len = _compute_2d_stride_from_tensors(
+            target_indices,
+            cond_indices_sample,
+            f'{cond_level}->{selected_level}',
+        )
+        print(f"Primary 2D conditioner stride for {cond_level}->{selected_level}: {upsample_stride}")
     if condition_on_top and second_cond_level is not None:
         second_cond_num_embeddings = num_embeddings_map[second_cond_level]
-        second_upsample_stride = _compute_stride(target_seq_len, second_cond_seq_len, selected_level)
+        second_upsample_stride, second_cond_block_len = _compute_2d_stride_from_tensors(
+            target_indices,
+            second_cond_indices_sample,
+            f'{second_cond_level}->{selected_level}',
+        )
+        print(f"Second 2D conditioner stride for {second_cond_level}->{selected_level}: {second_upsample_stride}")
 
     max_time_steps = int(prior_cfg.get('max_time_steps', 500))
 
@@ -243,8 +354,10 @@ def train_transformer_prior(
         max_time_steps=max_time_steps,
         is_upsampler=is_upsampler,
         cond_num_embeddings=cond_num_embeddings,
+        cond_block_len=cond_block_len,
         upsample_stride=upsample_stride,
         second_cond_num_embeddings=second_cond_num_embeddings,
+        second_cond_block_len=second_cond_block_len,
         second_upsample_stride=second_upsample_stride,
         conditioner_residual_block_width=int(prior_cfg.get('conditioner_residual_block_width', 1024)),
         conditioner_residual_blocks=int(prior_cfg.get('conditioner_residual_blocks', 16)),
@@ -262,6 +375,7 @@ def train_transformer_prior(
         timing_max_duration_seconds=float(prior_cfg.get('timing_max_duration_seconds', 3600.0)),
         timing_embedding_init_std=float(prior_cfg.get('timing_embedding_init_std', 0.02)),
         timing_embedding_scale=float(prior_cfg.get('timing_embedding_scale', 1.0)),
+        use_2d_conditioner=bool(prior_cfg.get('use_2d_conditioner', True)),
     ).to(device)
     print(
         f"Timing conditioning: {'enabled' if prior.use_timing_conditioning else 'disabled'} "
@@ -406,20 +520,23 @@ def train_transformer_prior(
     }
     config_to_save['model']['use_bos_token'] = bool(prior_cfg.get('use_bos_token', False))
     config_to_save['model']['use_timing_conditioning'] = bool(prior_cfg.get('use_timing_conditioning', True))
+    config_to_save['model']['use_2d_conditioner'] = bool(prior_cfg.get('use_2d_conditioner', True))
     config_to_save['model']['timing_window_seconds'] = float(
         prior_cfg.get('timing_window_seconds', timing_window_seconds)
     )
     config_to_save['model']['max_time_steps'] = int(max_time_steps)
     if upsample_stride is not None:
-        config_to_save['model']['inferred_upsample_stride'] = int(upsample_stride)
+        config_to_save['model']['inferred_upsample_stride'] = _serialize_stride(upsample_stride)
     if second_upsample_stride is not None:
-        config_to_save['model']['inferred_second_upsample_stride'] = int(second_upsample_stride)
+        config_to_save['model']['inferred_second_upsample_stride'] = _serialize_stride(second_upsample_stride)
     if cond_seq_len > 0:
         config_to_save['model']['inferred_cond_seq_len'] = int(cond_seq_len)
         config_to_save['model']['inferred_cond_time_cols'] = int(cond_time_cols)
+        config_to_save['model']['inferred_cond_freq_bins'] = int(cond_freq_bins)
     if second_cond_seq_len > 0:
         config_to_save['model']['inferred_second_cond_seq_len'] = int(second_cond_seq_len)
         config_to_save['model']['inferred_second_cond_time_cols'] = int(second_cond_time_cols)
+        config_to_save['model']['inferred_second_cond_freq_bins'] = int(second_cond_freq_bins)
     config_to_save['dataset'] = dict(config_to_save.get('dataset', {}))
     config_to_save['dataset']['level_target_time_frames'] = dict(level_target_time_frames)
 
