@@ -434,6 +434,7 @@ def _decode_full_level_spectrogram(
     device: torch.device,
     weights_file: str,
     save_dir: str,
+    context_cols: int = 0,
 ) -> np.ndarray:
     if not (isinstance(level_grid, (list, tuple)) and len(level_grid) == 2):
         raise ValueError(f'{level} grid is required to decode full generated indices.')
@@ -444,17 +445,51 @@ def _decode_full_level_spectrogram(
             f'{level} full token length {full_tokens.shape[1]} is not divisible by freq_bins={freq_bins}.'
         )
 
-    dynamic_grid = [full_tokens.shape[1] // freq_bins, freq_bins]
-    print(f'Decoding full {level} token timeline with dynamic grid {dynamic_grid}...')
+    total_token_cols = full_tokens.shape[1] // freq_bins
+    dynamic_grid = [total_token_cols, freq_bins]
+    chunk_cols = int(level_grid[0])
+    if chunk_cols <= 0:
+        raise ValueError(f'{level} grid has invalid time columns: {level_grid}')
+    context_cols = max(0, int(context_cols))
+    context_suffix = f' plus {context_cols} context columns' if context_cols else ''
+    print(
+        f'Decoding full {level} token timeline with dynamic grid {dynamic_grid} '
+        f'in chunks of {chunk_cols} token columns{context_suffix}...'
+    )
     vqvae = load_jukebox_model(vqvae_ref, level, device, weights_file)
-    tokens_tensor = torch.from_numpy(full_tokens).to(device)
-    decoded_specs = decode_jukebox_indices(vqvae, tokens_tensor, dynamic_grid, device)
+    decoded_chunks = []
+    tokens_2d = full_tokens.reshape(full_tokens.shape[0], total_token_cols, freq_bins)
+    for start_col in range(0, total_token_cols, chunk_cols):
+        target_end_col = min(total_token_cols, start_col + chunk_cols)
+        ext_start_col = max(0, start_col - context_cols)
+        ext_end_col = min(total_token_cols, target_end_col + context_cols)
+        chunk_tokens = tokens_2d[:, ext_start_col:ext_end_col, :].reshape(full_tokens.shape[0], -1)
+        chunk_grid = [ext_end_col - ext_start_col, freq_bins]
+        tokens_tensor = torch.from_numpy(chunk_tokens).to(device)
+        decoded_chunk = decode_jukebox_indices(vqvae, tokens_tensor, chunk_grid, device)
+        decoded_cols = ext_end_col - ext_start_col
+        if decoded_cols <= 0 or decoded_chunk.shape[2] % decoded_cols != 0:
+            raise ValueError(
+                f'Cannot crop decoded {level} chunk: decoded time frames={decoded_chunk.shape[2]}, '
+                f'token columns={decoded_cols}.'
+            )
+        frames_per_token_col = decoded_chunk.shape[2] // decoded_cols
+        crop_start = (start_col - ext_start_col) * frames_per_token_col
+        crop_end = crop_start + (target_end_col - start_col) * frames_per_token_col
+        decoded_chunks.append(decoded_chunk[:, :, crop_start:crop_end, :])
+        del tokens_tensor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    decoded_specs = np.concatenate(decoded_chunks, axis=2)
     decoded_specs = decoded_specs[:, :, :total_frames, :]
     spectrogram_dir = save_level_spectrograms(
         decoded_specs,
         save_dir,
         level,
         root_subdir='spectrograms',
+        include_level_subdir=False,
+        npy_subdir='npy',
         npy_filename=f'{level}_full_decoded_specs.npy',
         filename_prefix=f'{level}_full_spectrogram',
         title_template=f'{level.capitalize()} full generated spectrogram {{index}}',
@@ -463,7 +498,7 @@ def _decode_full_level_spectrogram(
     )
     print(f'Saved full {level} spectrograms to {spectrogram_dir}')
 
-    del vqvae, tokens_tensor
+    del vqvae, decoded_chunks
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -480,7 +515,13 @@ def _infer_slice_len(
     if inferred_len > 0:
         return inferred_len
 
-    inferred_stride = int(model_cfg.get(inferred_stride_key, 0))
+    inferred_stride_value = model_cfg.get(inferred_stride_key, 0)
+    if isinstance(inferred_stride_value, (tuple, list)):
+        if len(inferred_stride_value) != 2:
+            raise ValueError(f"Expected {inferred_stride_key} to have two values, got {inferred_stride_value}")
+        inferred_stride = int(inferred_stride_value[0]) * int(inferred_stride_value[1])
+    else:
+        inferred_stride = int(inferred_stride_value)
     if inferred_stride > 0:
         if target_seq_len % inferred_stride != 0:
             raise ValueError(
@@ -566,19 +607,31 @@ def main():
     parser.add_argument('--bottom_run_root', type=str, default=DEFAULT_BOTTOM_RUN_ROOT, help='Default bottom run root used when --bottom_config is not provided')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature for all priors')
     parser.add_argument('--top_k', type=int, default=None, help='Top-k sampling (None disables top-k)')
+    parser.add_argument(
+        '--bottom_temperature',
+        type=float,
+        default=None,
+        help='Optional bottom-only sampling temperature. Defaults to --temperature.',
+    )
+    parser.add_argument(
+        '--bottom_top_k',
+        type=int,
+        default=None,
+        help='Optional bottom-only top-k. Defaults to --top_k.',
+    )
     parser.add_argument('--weights_file', type=str, default='best_model.pth', help='Checkpoint filename for transformer priors (default: best_model.pth)')
     parser.add_argument(
         '--sampling_mode',
         type=str,
         default='windowed',
-        choices=['windowed', 'independent'],
-        help='Sampling strategy. windowed reuses overlapping previous codes as context (default).',
+        choices=['windowed', 'independent', 'no_overlap'],
+        help='Sampling strategy. windowed reuses overlapping previous codes as context (default); independent uses training hops without copied prefixes; no_overlap uses full-window hops.',
     )
     parser.add_argument(
         '--overlap_fraction',
         type=float,
-        default=0.75,
-        help='Overlap fraction for windowed sampling (default: 0.75).',
+        default=0.5,
+        help='Overlap fraction for windowed sampling (default: 0.5).',
     )
     parser.add_argument(
         '--duration_seconds',
@@ -586,8 +639,47 @@ def main():
         default=30.0,
         help='Target generated song duration in seconds. This is also the timing conditioning total_duration_s.',
     )
+    parser.add_argument(
+        '--disable_timing_conditioning',
+        action='store_true',
+        help='Do not pass timing metadata to the priors during generation.',
+    )
+    parser.add_argument(
+        '--disable_top_timing_conditioning',
+        action='store_true',
+        help='Do not pass timing metadata to the top prior during generation.',
+    )
+    parser.add_argument(
+        '--disable_middle_timing_conditioning',
+        action='store_true',
+        help='Do not pass timing metadata to the middle prior during generation.',
+    )
+    parser.add_argument(
+        '--disable_bottom_timing_conditioning',
+        action='store_true',
+        help='Do not pass timing metadata to the bottom prior during generation.',
+    )
+    parser.add_argument(
+        '--bottom_decode_mode',
+        type=str,
+        default='timeline',
+        choices=['timeline', 'windowed'],
+        help='Decode final bottom spectrogram from the assembled token timeline (default) or legacy window crossfade.',
+    )
+    parser.add_argument(
+        '--bottom_decode_context_cols',
+        type=int,
+        default=0,
+        help='Extra latent token columns to include on each side when timeline-decoding bottom chunks.',
+    )
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible generation (set to negative to disable)')
     parser.add_argument('--audio_method', type=str, default='griffinlim', choices=['griffinlim', 'istft'], help='Spectrogram inversion method')
+    parser.add_argument(
+        '--save_middle_audio',
+        action='store_true',
+        default=True,
+        help='Also invert the decoded full middle spectrogram and save it as audio/middle_sample.wav.',
+    )
     parser.add_argument('--save_root', type=str, default='samples/generate_music_maestro', help='Root directory for generated outputs')
     args = parser.parse_args()
 
@@ -596,10 +688,23 @@ def main():
     if args.top_k is not None and args.top_k < 0:
         raise ValueError(f'--top_k must be >= 0, got {args.top_k}')
     args.top_k = args.top_k if (args.top_k is not None and args.top_k > 0) else None
+    if not args.weights_file.endswith('.pth'):
+        args.weights_file += '.pth'
+    if args.bottom_temperature is None:
+        args.bottom_temperature = args.temperature
+    if args.bottom_temperature <= 0:
+        raise ValueError(f'--bottom_temperature must be > 0, got {args.bottom_temperature}')
+    if args.bottom_top_k is None:
+        args.bottom_top_k = args.top_k
+    if args.bottom_top_k is not None and args.bottom_top_k < 0:
+        raise ValueError(f'--bottom_top_k must be >= 0, got {args.bottom_top_k}')
+    args.bottom_top_k = args.bottom_top_k if (args.bottom_top_k is not None and args.bottom_top_k > 0) else None
     if args.duration_seconds <= 0:
         raise ValueError(f'--duration_seconds must be > 0, got {args.duration_seconds}')
     if not 0.0 <= args.overlap_fraction < 1.0:
         raise ValueError(f'--overlap_fraction must be in [0, 1), got {args.overlap_fraction}')
+    if args.bottom_decode_context_cols < 0:
+        raise ValueError(f'--bottom_decode_context_cols must be >= 0, got {args.bottom_decode_context_cols}')
 
     if args.seed is not None and args.seed < 0:
         args.seed = None
@@ -712,6 +817,15 @@ def generate_hierarchical_music(args) -> str:
         effective_overlap = {'top': top_overlap, 'middle': mid_overlap, 'bottom': bot_overlap}
         overlap_cols = {'top': top_overlap_cols, 'middle': mid_overlap_cols, 'bottom': bot_overlap_cols}
         hop_cols = {'top': top_hop_cols, 'middle': mid_hop_cols, 'bottom': bot_hop_cols}
+    elif args.sampling_mode == 'no_overlap':
+        top_step, mid_step, bot_step = top_tf, mid_tf, bot_tf
+        effective_overlap = {'top': 0.0, 'middle': 0.0, 'bottom': 0.0}
+        overlap_cols = {'top': 0, 'middle': 0, 'bottom': 0}
+        hop_cols = {
+            'top': int(top_grid[0]),
+            'middle': int(middle_grid[0]),
+            'bottom': int(bottom_grid[0]),
+        }
     else:
         top_step, mid_step, bot_step = training_top_step, training_mid_step, training_bot_step
 
@@ -770,6 +884,10 @@ def generate_hierarchical_music(args) -> str:
         top_start_frames = build_windowed_starts(total_source_frames, top_tf, top_step)
         mid_start_frames = build_windowed_starts(total_source_frames, mid_tf, mid_step)
         bot_start_frames = build_windowed_starts(total_source_frames, bot_tf, bot_step)
+    elif args.sampling_mode == 'no_overlap':
+        top_start_frames = build_windowed_starts(total_source_frames, top_tf, top_step)
+        mid_start_frames = build_windowed_starts(total_source_frames, mid_tf, mid_step)
+        bot_start_frames = build_windowed_starts(total_source_frames, bot_tf, bot_step)
     else:
         top_start_frames = build_level_starts(total_source_frames, top_tf, top_step)
         mid_start_frames = build_level_starts(total_source_frames, mid_tf, mid_step)
@@ -798,9 +916,25 @@ def generate_hierarchical_music(args) -> str:
             f"top={effective_overlap['top']:.3f}, middle={effective_overlap['middle']:.3f}, bottom={effective_overlap['bottom']:.3f}"
         )
     print(f"Requested generated duration: {args.duration_seconds:.2f}s")
+    print(
+        "Sampling controls: "
+        f"top/middle temp={args.temperature:.3f}, top_k={args.top_k}; "
+        f"bottom temp={args.bottom_temperature:.3f}, top_k={args.bottom_top_k}"
+    )
     print(f"Timing total duration: {total_source_duration_s:.2f}s ({total_source_frames} frames)")
     print(f"Sampling window steps: Top={top_step}, Mid={mid_step}, Bot={bot_step} frames")
     print(f"Training window steps: Top={training_top_step}, Mid={training_mid_step}, Bot={training_bot_step} frames")
+    timing_enabled = {
+        'top': top_prior.use_timing_conditioning and not (args.disable_timing_conditioning or args.disable_top_timing_conditioning),
+        'middle': middle_prior.use_timing_conditioning and not (args.disable_timing_conditioning or args.disable_middle_timing_conditioning),
+        'bottom': bottom_prior.use_timing_conditioning and not (args.disable_timing_conditioning or args.disable_bottom_timing_conditioning),
+    }
+    print(
+        "Timing conditioning during generation: "
+        f"top={'enabled' if timing_enabled['top'] else 'disabled'}, "
+        f"middle={'enabled' if timing_enabled['middle'] else 'disabled'}, "
+        f"bottom={'enabled' if timing_enabled['bottom'] else 'disabled'}"
+    )
     if (
         args.sampling_mode == 'windowed'
         and (top_step, mid_step, bot_step) != (training_top_step, training_mid_step, training_bot_step)
@@ -812,9 +946,18 @@ def generate_hierarchical_music(args) -> str:
     print(f"Conditioning coverage frames: Top={top_conditioning_frames}, Middle={middle_conditioning_frames}")
     print(f"Chunks needed: Top={top_chunks}, Mid={middle_chunks}, Bot={bottom_chunks}")
 
-    top_timing = build_timing_schedule(top_start_frames, hop_length, sample_rate, total_source_frames)
-    mid_timing = build_timing_schedule(mid_start_frames, hop_length, sample_rate, total_source_frames)
-    bot_timing = build_timing_schedule(bot_start_frames, hop_length, sample_rate, total_source_frames)
+    top_timing = (
+        build_timing_schedule(top_start_frames, hop_length, sample_rate, total_source_frames)
+        if timing_enabled['top'] else None
+    )
+    mid_timing = (
+        build_timing_schedule(mid_start_frames, hop_length, sample_rate, total_source_frames)
+        if timing_enabled['middle'] else None
+    )
+    bot_timing = (
+        build_timing_schedule(bot_start_frames, hop_length, sample_rate, total_source_frames)
+        if timing_enabled['bottom'] else None
+    )
 
     # Step 1: Top-Level Unrolling (The Composer)
     ## Generate global structure block-by-block, reusing previous overlap in windowed mode.
@@ -914,8 +1057,8 @@ def generate_hierarchical_music(args) -> str:
         seq_len=bottom_seq_len,
         num_chunks=bottom_chunks,
         device=device,
-        temperature=args.temperature,
-        top_k=args.top_k,
+        temperature=args.bottom_temperature,
+        top_k=args.bottom_top_k,
         upper_tokens_list=middle_slices_for_bottom,
         second_upper_tokens_list=top_slices_for_bottom,
         timing_list=bot_timing,
@@ -941,10 +1084,30 @@ def generate_hierarchical_music(args) -> str:
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     save_dir = os.path.join(args.save_root, current_time)
     os.makedirs(save_dir, exist_ok=True)
+    if all(timing_enabled.values()):
+        timing_source = 'duration_conditioned_window_schedule'
+    elif not any(timing_enabled.values()):
+        timing_source = 'disabled'
+    else:
+        timing_source = 'partial_duration_conditioned_window_schedule'
     timing_metadata = {
-        'timing_source': 'duration_conditioned_window_schedule',
+        'timing_source': timing_source,
+        'disable_timing_conditioning': bool(args.disable_timing_conditioning),
+        'timing_conditioning_enabled': dict(timing_enabled),
         'sampling_mode': args.sampling_mode,
-        'spectrogram_assembly': 'linear_crossfade',
+        'spectrogram_assembly': 'full_token_timeline' if args.bottom_decode_mode == 'timeline' else 'linear_crossfade',
+        'bottom_decode_mode': args.bottom_decode_mode,
+        'bottom_decode_context_cols': int(args.bottom_decode_context_cols),
+        'sampling_temperature': {
+            'top': float(args.temperature),
+            'middle': float(args.temperature),
+            'bottom': float(args.bottom_temperature),
+        },
+        'sampling_top_k': {
+            'top': args.top_k,
+            'middle': args.top_k,
+            'bottom': args.bottom_top_k,
+        },
         'requested_overlap_fraction': float(args.overlap_fraction),
         'effective_overlap_fraction': effective_overlap,
         'overlap_time_cols': overlap_cols,
@@ -1000,6 +1163,8 @@ def generate_hierarchical_music(args) -> str:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    middle_decoded_specs = None
+
     if top_vqvae_ref:
         _decode_full_level_spectrogram(
             level='top',
@@ -1012,7 +1177,7 @@ def generate_hierarchical_music(args) -> str:
             save_dir=save_dir,
         )
     if middle_vqvae_ref:
-        _decode_full_level_spectrogram(
+        middle_decoded_specs = _decode_full_level_spectrogram(
             level='middle',
             vqvae_ref=middle_vqvae_ref,
             full_tokens=full_middle_tokens,
@@ -1023,33 +1188,49 @@ def generate_hierarchical_music(args) -> str:
             save_dir=save_dir,
         )
 
-    print('Decoding bottom tokens into spectrograms...')
-    _debug('Loading bottom VQ-VAE decoder...')
-    vqvae_bottom_decoder = load_jukebox_model(
-        bottom_vqvae_ref,
-        'bottom',
-        device,
-        vqvae_weights_file,
-    )
-    vqvae_bottom_decoder.eval()
-
-    # Step 3: Spectrogram Assembly (Audio Engineer)
-    ## Assemble generated windows by raw frame starts; crossfade where windows overlap.
     decode_start_time = time.time()
-    reconstructed_spectrograms = _decode_bottom_blocks(
-        vqvae=vqvae_bottom_decoder,
-        bottom_tokens_list=bottom_tokens_list,
-        bottom_grid=bottom_grid,
-        device=device,
-    )
-    print('Decoded spectrograms for all blocks. Each block has shape:', reconstructed_spectrograms[0].shape if reconstructed_spectrograms else None)
-    print('Decoding took: {:.2f} seconds'.format(time.time() - decode_start_time))
+    if args.bottom_decode_mode == 'timeline':
+        # Step 3: Spectrogram Assembly (Audio Engineer)
+        ## Decode the de-overlapped bottom token timeline once, matching top/middle handling.
+        print('Decoding assembled bottom token timeline into spectrograms...')
+        final_spectrogram = _decode_full_level_spectrogram(
+            level='bottom',
+            vqvae_ref=bottom_vqvae_ref,
+            full_tokens=full_bottom_tokens,
+            level_grid=bottom_grid,
+            total_frames=total_source_frames,
+            device=device,
+            weights_file=vqvae_weights_file,
+            save_dir=save_dir,
+            context_cols=args.bottom_decode_context_cols,
+        )
+    else:
+        print('Decoding bottom tokens into spectrograms...')
+        _debug('Loading bottom VQ-VAE decoder...')
+        vqvae_bottom_decoder = load_jukebox_model(
+            bottom_vqvae_ref,
+            'bottom',
+            device,
+            vqvae_weights_file,
+        )
+        vqvae_bottom_decoder.eval()
 
-    final_spectrogram = assemble_spectrogram_chunks(
-        spec_chunks=reconstructed_spectrograms,
-        start_frames=bot_start_frames,
-        total_frames=total_source_frames,
-    )
+        # Step 3: Spectrogram Assembly (Audio Engineer)
+        ## Legacy path: decode generated windows independently and crossfade spectrograms.
+        reconstructed_spectrograms = _decode_bottom_blocks(
+            vqvae=vqvae_bottom_decoder,
+            bottom_tokens_list=bottom_tokens_list,
+            bottom_grid=bottom_grid,
+            device=device,
+        )
+        print('Decoded spectrograms for all blocks. Each block has shape:', reconstructed_spectrograms[0].shape if reconstructed_spectrograms else None)
+        final_spectrogram = assemble_spectrogram_chunks(
+            spec_chunks=reconstructed_spectrograms,
+            start_frames=bot_start_frames,
+            total_frames=total_source_frames,
+        )
+
+    print('Decoding took: {:.2f} seconds'.format(time.time() - decode_start_time))
     print('Spectrogram reconstruction complete. Final spectrogram shape:', final_spectrogram.shape)
 
     # Step 4: Spectrogram Inversion (The Mastering Engineer)
