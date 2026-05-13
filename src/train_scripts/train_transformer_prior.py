@@ -384,6 +384,8 @@ def train_transformer_prior(
 
     retrain = bool(train_cfg.get('retrain', False))
     pretrained_weights_path = train_cfg.get('pretrained_weights_path')
+    reset_optimizer = bool(train_cfg.get('reset_optimizer', False))
+    reset_scheduler = bool(train_cfg.get('reset_scheduler', reset_optimizer))
 
     resume_history = {}
     initial_best_metric = None
@@ -399,12 +401,26 @@ def train_transformer_prior(
             train_key='train_loss',
         )
         print(f"Retraining enabled from checkpoint: {pretrained_weights_path}")
+        if reset_optimizer:
+            print(
+                "Optimizer reset enabled: model weights/history will be loaded, "
+                f"but AdamW state will start fresh with learning_rate={float(train_cfg['learning_rate']):.6g}."
+            )
+        if reset_scheduler:
+            print("Scheduler reset enabled: scheduler state will start fresh from the current config.")
         if initial_best_metric is not None:
             print(f"Baseline best metric from previous training: {initial_best_metric:.6f}")
         else:
             print("Baseline best metric unavailable from previous training history.")
 
-        prior.load_state_dict(checkpoint['model_state'])
+        partial_model_load = _load_model_state_compatibly(prior, checkpoint['model_state'])
+        if partial_model_load:
+            reset_optimizer = True
+            reset_scheduler = True
+            print(
+                "Checkpoint architecture differed from the current model; "
+                "optimizer and scheduler state will be reset."
+            )
 
         if 'epoch' in checkpoint:
             start_epoch = int(checkpoint['epoch'])
@@ -446,8 +462,15 @@ def train_transformer_prior(
         betas=(0.9, adam_beta2)  # jukebox paper uses default beta1 (0.9) but modified beta2
     )
 
-    if retrain and 'optimizer_state' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state'])
+    if retrain:
+        if reset_optimizer:
+            print(f"Using fresh optimizer state with learning_rate={float(train_cfg['learning_rate']):.6g}.")
+        elif 'optimizer_state' in checkpoint and checkpoint['optimizer_state'] is not None:
+            optimizer.load_state_dict(checkpoint['optimizer_state'])
+            loaded_lrs = [group.get('lr') for group in optimizer.param_groups]
+            print(f"Loaded optimizer state from checkpoint. Optimizer LR(s): {loaded_lrs}")
+        else:
+            print("Checkpoint has no optimizer state; using fresh optimizer state.")
 
     grad_accum_steps = int(train_cfg.get('gradient_accumulation_steps', 1))
     if grad_accum_steps < 1:
@@ -482,11 +505,17 @@ def train_transformer_prior(
             "Expected one of: onecycle, none"
         )
 
-    if scheduler is not None and retrain and 'scheduler_state' in checkpoint:
-        try:
-            scheduler.load_state_dict(checkpoint['scheduler_state'])
-        except Exception as e:
-            print(f"Warning: Failed to load scheduler state ({e}).")
+    if scheduler is not None and retrain:
+        if reset_scheduler:
+            print("Using fresh scheduler state.")
+        elif 'scheduler_state' in checkpoint and checkpoint['scheduler_state'] is not None:
+            try:
+                scheduler.load_state_dict(checkpoint['scheduler_state'])
+                print("Loaded scheduler state from checkpoint.")
+            except Exception as e:
+                print(f"Warning: Failed to load scheduler state ({e}).")
+        else:
+            print("Checkpoint has no scheduler state; using fresh scheduler state.")
 
     # Use mixed precision training if on CUDA for potential speedup and reduced memory usage
     use_amp = device.type == 'cuda'
@@ -542,6 +571,8 @@ def train_transformer_prior(
 
     config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['retrain'] = retrain
     config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['pretrained_weights_path'] = pretrained_weights_path
+    config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['reset_optimizer'] = reset_optimizer
+    config_to_save['training'][LEVEL_TO_PRIOR_CFG[selected_level]]['reset_scheduler'] = reset_scheduler
 
     with open(os.path.join(run_dir, 'config.yaml'), 'w') as f:
         yaml.dump(config_to_save, f)
@@ -640,9 +671,32 @@ def train_transformer_prior(
             + (f" Val Loss={epoch_val_loss:.4f}" if epoch_val_loss is not None else "")
         )
 
+        # Save model state and training artifacts for this epoch (including optimizer and scheduler state for potential resumption)
+        model_state = {
+            'model_state': prior.state_dict(),
+            'config': config_to_save,
+            'epoch': epoch + 1,
+            'train_loss': epoch_train_loss,
+            'val_loss': epoch_val_loss,
+            'history': {'train_loss': train_losses, 'val_loss': val_losses},
+            'optimizer_state': optimizer.state_dict(),
+            'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
+        }
+
+        # Save models
+        ## not saving every epoch's full checkpoint to avoid excessive storage use, but can be enabled if desired by uncommenting the following lines:
+        #torch.save(
+        #    model_state,
+        #    os.path.join(run_dir, f'model_epoch_{epoch + 1}.pth')
+        #)
+
+        ## always save latest model state for potential resumption
+        torch.save(
+            model_state,
+            os.path.join(run_dir, f'latest_model.pth')
+        )
+        ## Save best model based on validation loss
         if epoch_val_loss is not None:
-            # Save models
-            ## Save best model based on validation loss
             if epoch_val_loss < best_val_loss:
                 best_val_loss = epoch_val_loss
                 best_epoch = len(val_losses)
@@ -660,34 +714,6 @@ def train_transformer_prior(
                     os.path.join(run_dir, 'best_model.pth')
                 )
                 print('Saved best model.')
-
-        if (epoch + 1) % 10 == 0:
-            torch.save(
-                {
-                    'model_state': prior.state_dict(),
-                    'epoch': epoch + 1,
-                    'train_loss': epoch_train_loss,
-                    'val_loss': epoch_val_loss,
-                    'history': {'train_loss': train_losses, 'val_loss': val_losses},
-                    'optimizer_state': optimizer.state_dict(),
-                    'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
-                },
-                os.path.join(run_dir, f'model_epoch_{epoch + 1}.pth')
-            )
-
-        ## Always save the latest checkpoint
-        torch.save(
-            {
-                'model_state': prior.state_dict(),
-                'epoch': epoch + 1,
-                'train_loss': epoch_train_loss,
-                'val_loss': epoch_val_loss,
-                'history': {'train_loss': train_losses, 'val_loss': val_losses},
-                'optimizer_state': optimizer.state_dict(),
-                'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
-            },
-            os.path.join(run_dir, f'latest_model.pth')
-        )
 
         if early_stopping is not None:
             early_stopping(epoch_val_loss)
