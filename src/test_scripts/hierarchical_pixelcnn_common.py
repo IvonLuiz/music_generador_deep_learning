@@ -8,6 +8,7 @@ from modeling.torch.pixel_cnn_hierarchical import HierarchicalCondGatedPixelCNN
 
 
 def resolve_model_paths(model_dir_or_file: str, weights_file: str = "best_model.pth") -> Tuple[str, str]:
+    requested_weights_file = weights_file
     if os.path.isfile(model_dir_or_file):
         filename = os.path.basename(model_dir_or_file).lower()
         parent_dir = os.path.dirname(model_dir_or_file)
@@ -23,7 +24,7 @@ def resolve_model_paths(model_dir_or_file: str, weights_file: str = "best_model.
         config_path = os.path.join(model_dir_or_file, "config.yaml")
         model_path = os.path.join(model_dir_or_file, weights_file)
 
-    if not os.path.exists(model_path):
+    if not os.path.exists(model_path) and requested_weights_file == "best_model.pth":
         # Common fallback names used elsewhere in the project
         for candidate in ("best_model.pth", "best_pixelcnn_model.pth", "model.pth"):
             alt = os.path.join(os.path.dirname(config_path), candidate)

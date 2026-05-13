@@ -5,12 +5,12 @@ import librosa
 import numpy as np
 import matplotlib.pyplot as plt
 
-TARGET_TIME_FRAMES = 1024
+TARGET_TIME_FRAMES = 2048  # ≈24s at hop_length=256, sr=22050; Top prior uses the full window
 SAMPLE_RATE = 22050    # samples per second
 FRAME_SIZE = 2048       # samples for each STFT window
 HOP_LENGTH = 256       # move amount of samples between windows
 N_MELS = 256          # number of mel bins for LogMelSpectrogramExtractor (used only if use_mel_spectrogram=True)
-MIN_MAX_VALUES_SAVE_DIR = "./data/processed/backing_tracks_log_mel/min_max_values/"
+MIN_MAX_VALUES_SAVE_DIR = "/home/ivon/code/datasets/processed/min_max_values/"
 
 
 class Loader:
@@ -18,16 +18,27 @@ class Loader:
     Loader is responsible for loading an audio file.
     """
 
-    def __init__(self, sample_rate, duration, mono):
+    def __init__(
+        self,
+        sample_rate: int,
+        duration: float = None,
+        mono: bool = True,
+    ):
         self.sample_rate = sample_rate
         self.duration = duration
         self.mono = mono
 
     def load(self, file_path):
-        signal = librosa.load(file_path,
-                              sr=self.sample_rate,
-                              duration=self.duration,
-                              mono=self.mono)[0]
+        args = {
+            'sr': self.sample_rate,
+            'mono': self.mono,
+            }
+        if self.duration is not None:
+            # Load only the specified duration (in seconds)
+            args['duration'] = self.duration
+            
+        signal = librosa.load(file_path, **args)[0]
+
         return signal
 
 
@@ -228,7 +239,6 @@ class Saver:
     def save_feature(self, feature, file_path):
         save_path = self._generate_save_path(file_path)
         np.save(save_path, feature)
-        
         return save_path
 
     def save_min_max_values(self, min_max_values):
@@ -246,7 +256,6 @@ class Saver:
     def _generate_save_path(self, file_path):
         file_name = os.path.split(file_path)[1]
         save_path = os.path.join(self.feature_save_dir, file_name + ".npy")
-        
         return save_path
 
 
@@ -301,7 +310,8 @@ class PreprocessingPipeline:
     @loader.setter
     def loader(self, loader):
         self._loader = loader
-        self._num_expected_samples = int(loader.sample_rate * loader.duration)
+        if loader.duration is not None:
+            self._num_expected_samples = int(loader.sample_rate * loader.duration)
 
     @padder.setter
     def padder(self, padder):
@@ -329,16 +339,41 @@ class PreprocessingPipeline:
             print("Error: Saver not set.")
             return
 
-        total_segments = 0
+        total_processed = 0
         for root, _, files in os.walk(audio_files_dir):
             for file in files:
                 if file.endswith(".wav"):
                     file_path = os.path.join(root, file)
-                    segments = self._process_file_with_segments(file_path, overlapping=overlapping)
-                    total_segments += segments
-                    print(f"Processed {file} -> {segments} segments")
-        print(f"Total segments created: {total_segments}")
+                    # Process the file with overlapping segments option
+                    if self._num_expected_samples > 0:
+                        segments = self._process_file_with_segments(file_path, overlapping=overlapping)
+                        total_processed += segments
+                        print(f"Processed {file} -> {segments} segments")                        
+                    # Process the whole song as one unit (no segments)
+                    else:
+                        self._process_full_song(file_path)
+                        total_processed += 1
+                        print(f"Processed full song: {file}")
+
+        print(f"Total {'segments' if self._num_expected_samples > 0 else 'songs'} created: {total_processed}")
         self.saver.save_min_max_values(self.min_max_values)
+
+    def _process_full_song(self, file_path):
+        """Extracts and saves the spectrogram for the entire song."""
+        # Load full signal
+        signal = self.loader.load(file_path)
+        
+        # Extract spectrogram (this will now be very wide)
+        feature = self.extractor.extract(signal)
+        
+        # Normalize based on the global min/max of the whole song
+        norm_feature = self.normalizer.normalize(feature)
+        
+        # Save with original name (no segment suffix)
+        save_path = self.saver.save_feature(norm_feature, file_path)
+        
+        # Store min/max for the whole song
+        self._store_min_max_value(save_path, feature.min(), feature.max())
 
     def _process_file_with_segments(self, file_path, overlapping=0.5):
         """
@@ -454,14 +489,17 @@ if __name__ == "__main__":
     # For 256 time frames: (256 * 256) / 22050 ≈ 2.97 seconds  
     # For 512 time frames: (512 * 256) / 22050 ≈ 5.95 seconds
     # For 1024 time frames: (1024 * 256) / 22050 ≈ 11.9 seconds
+    # For 2048 time frames: (2048 * 256) / 22050 ≈ 23.8 seconds
     
     DURATION = ((TARGET_TIME_FRAMES - 1) * HOP_LENGTH) / SAMPLE_RATE # Duration in seconds for each segment based on target time frames
-    overlapping = 0.0
+    DURATION = None
+    overlapping = 0.0  
     use_mel_spectrogram = True # Set to True to use LogMelSpectrogramExtractor instead of LogSpectrogramExtractor
-    
-    print(f"Using {TARGET_TIME_FRAMES} time frames = {DURATION:.2f} seconds per segment")
-    print(f"With {overlapping*100:.0f}% overlap, a 3-minute song will generate ~{int(180/DURATION)} segments!")
-    print(f"Expected spectrogram shape per segment: (256, {TARGET_TIME_FRAMES})")
+
+    if DURATION is not None:
+        print(f"Using {TARGET_TIME_FRAMES} time frames = {DURATION:.2f} seconds per segment")
+        print(f"With {overlapping*100:.0f}% overlap, a 3-minute song will generate ~{int(180/DURATION)} segments!")
+        print(f"Expected spectrogram shape per segment: (256, {TARGET_TIME_FRAMES})")
     
     MONO = True
 
@@ -469,10 +507,10 @@ if __name__ == "__main__":
     # MIN_MAX_VALUES_SAVE_DIR = "./data/fsdd/"
     # FILES_DIR = "./data/fsdd/audio/"
     
-    FILES_DIR = "./data/raw/backing_tracks"
-    SPECTROGRAMS_SAVE_DIR = "./data/processed/backing_tracks_log_mel/"
+    FILES_DIR = "./data/raw/maestro-v3.0.0"
+    SPECTROGRAMS_SAVE_DIR = "/home/ivon/code/datasets/processed/maestro/"
     VISUALIZATION_SAVE_DIR = SPECTROGRAMS_SAVE_DIR + "/spectrograms/"
-    MIN_MAX_VALUES_SAVE_DIR = "./data/processed/backing_tracks_log_mel/min_max_values/"
+    MIN_MAX_VALUES_SAVE_DIR = "/home/ivon/code/datasets/processed/min_max_values/"
     
     # Enable visualization (set to False to disable)
     ENABLE_VISUALIZATION = False

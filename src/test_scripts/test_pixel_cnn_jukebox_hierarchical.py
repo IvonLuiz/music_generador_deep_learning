@@ -3,7 +3,6 @@ import os
 import sys
 from datetime import datetime
 from typing import List, Optional, Tuple
-import glob
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,6 +25,17 @@ LEVEL_TO_INT = {'top': 1, 'middle': 2, 'bottom': 3}
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
 COND_LEVEL = {'top': None, 'middle': 'top', 'bottom': 'middle'}
 LATEST_ALIASES = {'latest', 'newest', 'auto', 'most_recent'}
+
+
+def _resolve_level_model_ref(model_ref: Optional[str], level_name: str) -> Optional[str]:
+    if not model_ref:
+        return model_ref
+    if os.path.isfile(model_ref):
+        return model_ref
+    level_dir = os.path.join(model_ref, level_name)
+    if os.path.isdir(level_dir):
+        return level_dir
+    return model_ref
 
 
 def _normalize_state_dict_keys_for_jukebox(state_dict: dict) -> dict:
@@ -105,7 +115,8 @@ def _extract_num_embeddings_from_state_dict(state_dict: dict) -> Tuple[int, Opti
 
 
 def _load_single_level_prior(model_dir_or_file: str, level_name: str, device: torch.device, weights_file: str = 'best_model.pth') -> JukeboxLevelPixelCNN:
-    config_path, model_path = resolve_model_paths(model_dir_or_file, weights_file)
+    model_ref = _resolve_level_model_ref(model_dir_or_file, level_name)
+    config_path, model_path = resolve_model_paths(model_ref, weights_file)
     if not os.path.exists(config_path):
         raise FileNotFoundError(f'Config file not found at {config_path}')
     if not os.path.exists(model_path):
@@ -153,10 +164,7 @@ def _infer_level_shapes(jukebox_models: List[JukeboxVQVAE], device: torch.device
 
 def _encode_indices_for_level(level_model: JukeboxVQVAE, x_batch: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
-        z = level_model.encoder(x_batch)
-        z = level_model.pre_vq_conv(z)
-        _, indices, _, _, _ = level_model.vq(z)
-    return indices
+        return level_model.encode_to_indices(x_batch)
 
 
 def _sample_real_batch(pixelcnn_config: dict, num_samples: int, device: torch.device) -> torch.Tensor:
@@ -216,7 +224,7 @@ def _load_or_generate_top_codes(top_codes_file: Optional[str],
         return top_codes
 
     if top_prior_model is None:
-        raise ValueError('No top prior available. Provide --top_pixelcnn or use --top_codes_file/--transformer_prior')
+        raise ValueError('No top prior available. Provide --pixelcnn_run or use --top_codes_file')
 
     top_k_value = top_k if top_k > 0 else None
     top_codes = top_prior_model.generate(
@@ -230,22 +238,27 @@ def _load_or_generate_top_codes(top_codes_file: Optional[str],
 
 
 def _resolve_prior_model_paths(pixelcnn_cfg: dict,
-                               top_pixelcnn: Optional[str],
-                               middle_pixelcnn: Optional[str],
-                               bottom_pixelcnn: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+                               pixelcnn_run: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
     models_cfg = pixelcnn_cfg.get('pixelcnn_models', {})
     weights_file = models_cfg.get('weights_file', 'best_model.pth')
+    run_dir = pixelcnn_run or models_cfg.get('run_dir')
 
-    top_path = top_pixelcnn or models_cfg.get('top_model_dir')
-    mid_path = middle_pixelcnn or models_cfg.get('middle_model_dir')
-    bot_path = bottom_pixelcnn or models_cfg.get('bottom_model_dir')
-
-    if _is_latest_alias(top_path):
+    if _is_latest_alias(run_dir):
         top_path = _resolve_latest_prior_dir(pixelcnn_cfg, 'top')
-    if _is_latest_alias(mid_path):
         mid_path = _resolve_latest_prior_dir(pixelcnn_cfg, 'middle')
-    if _is_latest_alias(bot_path):
         bot_path = _resolve_latest_prior_dir(pixelcnn_cfg, 'bottom')
+    else:
+        run_dir = run_dir.strip() if isinstance(run_dir, str) else run_dir
+        top_path = _resolve_level_model_ref(run_dir, 'top') if run_dir else None
+        mid_path = _resolve_level_model_ref(run_dir, 'middle') if run_dir else None
+        bot_path = _resolve_level_model_ref(run_dir, 'bottom') if run_dir else None
+
+    if top_path:
+        top_path = _resolve_level_model_ref(top_path, 'top')
+    if mid_path:
+        mid_path = _resolve_level_model_ref(mid_path, 'middle')
+    if bot_path:
+        bot_path = _resolve_level_model_ref(bot_path, 'bottom')
 
     return top_path, mid_path, bot_path, weights_file
 
@@ -254,7 +267,7 @@ def _is_latest_alias(value: Optional[str]) -> bool:
     return isinstance(value, str) and value.strip().lower() in LATEST_ALIASES
 
 
-def _find_latest_run_dir(parent_dir: str) -> Optional[str]:
+def _find_latest_group_run_dir(parent_dir: str, level_name: str) -> Optional[str]:
     if not os.path.isdir(parent_dir):
         return None
 
@@ -263,7 +276,10 @@ def _find_latest_run_dir(parent_dir: str) -> Optional[str]:
         run_dir = os.path.join(parent_dir, name)
         if not os.path.isdir(run_dir):
             continue
-        if not os.path.isfile(os.path.join(run_dir, 'config.yaml')):
+        level_dir = os.path.join(run_dir, level_name)
+        if not os.path.isdir(level_dir):
+            continue
+        if not os.path.isfile(os.path.join(level_dir, 'config.yaml')):
             continue
         candidates.append(run_dir)
 
@@ -282,27 +298,15 @@ def _resolve_latest_prior_dir(config: dict, level_name: str) -> str:
     model_name = str(config.get('model', {}).get('name', '')).strip()
     save_root = str(config.get('training', {}).get('save_dir', './models/')).strip()
 
-    primary_parent = os.path.join(save_root, f'{model_name}_{level_name}_prior') if model_name else None
-    if primary_parent:
-        latest = _find_latest_run_dir(primary_parent)
-        if latest:
-            return latest
-
-    pattern = os.path.join(save_root, f'*_{level_name}_prior')
-    parent_dirs = [p for p in glob.glob(pattern) if os.path.isdir(p)]
-    latest_candidates = []
-    for parent in parent_dirs:
-        run_dir = _find_latest_run_dir(parent)
-        if run_dir:
-            latest_candidates.append(run_dir)
-
-    if latest_candidates:
-        latest_candidates.sort(key=lambda p: os.path.getmtime(p))
-        return latest_candidates[-1]
+    grouped_parent = os.path.join(save_root, f'{model_name}_prior') if model_name else None
+    if grouped_parent:
+        latest_group = _find_latest_group_run_dir(grouped_parent, level_name)
+        if latest_group:
+            return os.path.join(latest_group, level_name)
 
     raise FileNotFoundError(
         f"Could not resolve latest prior for level={level_name}. "
-        f"Expected runs under '{save_root}' matching '*_{level_name}_prior/<timestamp>/'"
+        f"Expected grouped runs under '{save_root}/{model_name}_prior/<timestamp>/{level_name}/'"
     )
 
 
@@ -315,9 +319,7 @@ def test_jukebox_hierarchical_pixelcnn(
     temperature: float = 1.0,
     top_k: int = 0,
     top_codes_file: str = None,
-    top_pixelcnn: str = None,
-    middle_pixelcnn: str = None,
-    bottom_pixelcnn: str = None,
+    pixelcnn_run: str = None,
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -340,7 +342,7 @@ def test_jukebox_hierarchical_pixelcnn(
     print(f'Latent shapes by level ([top, middle, bottom]): {latent_shapes}')
 
     top_path, mid_path, bot_path, pixelcnn_weights_file = _resolve_prior_model_paths(
-        pixelcnn_config, top_pixelcnn, middle_pixelcnn, bottom_pixelcnn
+        pixelcnn_config, pixelcnn_run
     )
 
     need_top_prior = stage_mode == 'fully_generated' and not top_codes_file
@@ -352,11 +354,11 @@ def test_jukebox_hierarchical_pixelcnn(
         raise ValueError('Top prior is required but no top prior path was provided')
 
     if need_mid_prior and not mid_path:
-        raise ValueError('Middle prior is required; provide --middle_pixelcnn or pixelcnn_models.middle_model_dir')
+        raise ValueError('Middle prior is required; provide --pixelcnn_run or pixelcnn_models.run_dir')
     mid_prior = _load_single_level_prior(mid_path, 'middle', device, pixelcnn_weights_file) if need_mid_prior else None
 
     if need_bot_prior and not bot_path:
-        raise ValueError('Bottom prior is required; provide --bottom_pixelcnn or pixelcnn_models.bottom_model_dir')
+        raise ValueError('Bottom prior is required; provide --pixelcnn_run or pixelcnn_models.run_dir')
     bot_prior = _load_single_level_prior(bot_path, 'bottom', device, pixelcnn_weights_file) if need_bot_prior else None
 
     generated_codes: List[Optional[torch.Tensor]] = [None, None, None]
@@ -444,10 +446,8 @@ def test_jukebox_hierarchical_pixelcnn(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--pixelcnn_config', type=str, default='config/config_pixelcnn_jukebox_hierarchical.yaml', help='Config containing dataset/vqvae info and optional pixelcnn_models paths')
-    parser.add_argument('--top_pixelcnn', type=str, default=None, help='Top prior run dir or .pth path')
-    parser.add_argument('--middle_pixelcnn', type=str, default=None, help='Middle prior run dir or .pth path')
-    parser.add_argument('--bottom_pixelcnn', type=str, default=None, help='Bottom prior run dir or .pth path')
+    parser.add_argument('--pixelcnn_config', type=str, default='config/config_pixelcnn_jukebox_hierarchical.yaml', help='Config containing dataset/vqvae info and pixelcnn_models.run_dir')
+    parser.add_argument('--pixelcnn_run', type=str, default=None, help='Single grouped prior run dir containing top/middle/bottom subfolders')
     parser.add_argument('--n_samples', type=int, default=3)
     parser.add_argument('--min_db', type=float, default=-40.0)
     parser.add_argument('--max_db', type=float, default=2.0)
@@ -472,7 +472,5 @@ if __name__ == '__main__':
         temperature=args.temperature,
         top_k=args.top_k,
         top_codes_file=args.top_codes_file,
-        top_pixelcnn=args.top_pixelcnn,
-        middle_pixelcnn=args.middle_pixelcnn,
-        bottom_pixelcnn=args.bottom_pixelcnn,
+        pixelcnn_run=args.pixelcnn_run,
     )

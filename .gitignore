@@ -1,14 +1,14 @@
 .venv
+*env
 # data/raw
 **.npy
 data/fsdd/audio
 data/GTZAN
-# data/processed
 
 data/raw/maestro-v3.0.0/**/**.wav
 data/raw/maestro-v3.0.0/**/**.midi
 data/raw/maestro-v3.0.0/**/**
-data/processed/maestro
+data/raw/backing_tracks/**
 data/processed
 **visualizations/
 samples/
@@ -17,3 +17,5 @@ samples/
 *.pth
 *.pkl
 __pycache__
+
+*.mp4

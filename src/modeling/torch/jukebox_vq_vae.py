@@ -1,4 +1,4 @@
-from typing import Tuple, Iterable, List
+from typing import Tuple, List
 import sys
 import os
 
@@ -190,6 +190,17 @@ class JukeboxVQVAE(nn.Module):
                 x_recon, _, _ = self.forward(x)
         return x_recon.float()
 
+    def encode_to_indices(self, x: torch.Tensor) -> torch.Tensor:
+        """!
+        @brief Encode an input batch into discrete VQ codebook indices.
+        @param x Input tensor of shape (B, C, H, W) for spectrogram models or (B, C, T) for 1D audio models.
+        @return Codebook index tensor in the quantizer layout, typically (B, H_latent, W_latent) for spectrogram models.
+        """
+        z = self.encoder(x)
+        z = self.pre_vq_conv(z)
+        _, indices, _, _, _ = self.vq(z)
+        return indices.long()
+
 
 if __name__ == "__main__":
     # Test block
@@ -202,8 +213,13 @@ if __name__ == "__main__":
     print(f"1D Input: {x_1d.shape}, Output: {y_1d.shape}")
     
     # 2D Spectrogram Test
-    model_2d = JukeboxVQVAE(input_channels=1, hidden_dim=64, levels=2, conv_type=2, 
-                           activation_layer=nn.Sigmoid())
+    model_2d = JukeboxVQVAE(
+        input_channels=1,
+        hidden_dim=64,
+        levels=2,
+        conv_type=2,
+        activation_layer=nn.Sigmoid()
+    )
     x_2d = torch.randn(2, 1, 128, 128) # (Batch, Channels, H, W)
     y_2d, _, _ = model_2d(x_2d)
     print(f"2D Input: {x_2d.shape}, Output: {y_2d.shape}")

@@ -1,94 +1,145 @@
 dataset:
-  processed_path: "./data/processed/backing_tracks_log_mel/"
-  target_time_frames: 1024
+  processed_path: "/home/ivon/code/datasets/processed/maestro/"
+  quantized_data_path: "/home/ivon/code/datasets/processed/maestro_quantized_dataset_overlap50/"
+  # Top-level window: load 2048-frame spectrograms (≈24s).
+  # Each level encodes a different-length slice of the same segment,
+  # so all levels produce the same number of tokens (512) but cover different durations.
+  target_time_frames: 2048
+  level_target_time_frames:
+    top: 2048    # full segment ≈24s  → 8×64  = 512 tokens
+    middle: 512  # first 512 frames ≈6s → 16×32 = 512 tokens
+    bottom: 128  # first 128 frames ≈1.5s → 32×16 = 512 tokens
 
 vqvae:
   # Update to your latest trained Jukebox VQ-VAE runs per level.
-  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_backing_tracks_log_mel_time-frames-1024_top/2026-04-13_02-00-45"
-  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_backing_tracks_log_mel_time-frames-1024_middle/2026-04-13_09-38-42"
-  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_backing_tracks_log_mel_time-frames-1024_bottom/2026-04-12_03-18-59"
+  top_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro_top/2026-04-26_02-13-14"
+  middle_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro_middle/2026-04-26_17-30-30"
+  bottom_model_dir: "./models/jukebox_vq_vae/jukebox_vqvae_maestro_bottom/2026-04-26_22-26-06"
   weights_file: "best_model.pth"
+  codebook_size: 2048  # VQ-VAE vocabulary size (Jukebox default: 2048)
 
 model:
-  name: "jukebox_backing_tracks_logmel_prior"
+  name: "jukebox_maestro"
 
-# Configurations related to the upsampler are calculated in the script, example:
-# the python training script will read the VQ-VAE configs to determine the number of tokens at each level,
-# and then set the upsample_stride for each prior accordingly
-# (e.g., Middle upsample_stride = 256/64 = 4, Bottom upsample_stride = 1024/256 = 4).
-# This way, your priors will be perfectly aligned with your VQ-VAE's latent space structure without
-# needing to hardcode those details here.
+# Conditioner strides are computed automatically in the training script from the temporal
+# alignment between levels:
+#   Middle primary (Top→Middle):   sliced Top = top_h*(512/2048)*top_w = 8*16=128 tokens → stride 512/128=4
+#   Bottom primary (Middle→Bottom):sliced Mid = mid_h*(128/512)*mid_w  = 16*8=128 tokens → stride 512/128=4
+#   Bottom secondary (Top→Bottom): sliced Top = top_h*(128/2048)*top_w = 8*4=32 tokens  → stride 512/32=16
 priors:
   top_prior:
-    model_dim: 512       # Transformer width (size of the embedding vector for each token) (Jukebox uses 4800)
-    num_heads: 8          # Atention heads (Jukebox uses 8 for Top)
-    num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
-    dim_feedforward: 2048 # Transformer feedforward layers
-    dropout: 0.1
-    max_time_steps: 2048
+    model_dim: 1024       # Transformer width (size of the embedding vector for each token) (Jukebox uses 4800)
+    num_heads: 16         # Atention heads [1024 / 64 = 16] (Jukebox uses 8 for Top)
+    num_layers: 24        # Transformer self-attention layers (Jukebox uses 72)
+    dim_feedforward: 4096 # Transformer feedforward layers
+    dropout: 0.15
+    max_time_steps: 512  # seq_len = 8×64 = 512 tokens
     attention_qkv_ratio: 0.25
-    block_len: 8  # Top Grid: 8 (Freq) * 32 (Time) -> block_len must be 8
-    use_bos_token: true
+    block_len: 8         # freq dimension of Top grid (8 freq bins × 64 time steps)
+    # Timing conditioning parameters
+    use_bos_token: false
+    use_timing_conditioning: true
+    timing_num_bins: 1024
+    duration_num_bins: 256
+    timing_max_duration_seconds: 3600.0
+    timing_embedding_init_std: 0.02
+    timing_embedding_scale: 1.0
   middle_prior:
-    model_dim: 512        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
-    num_heads: 1          # Atention heads (Jukebox uses 1 for Middle)
-    num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
-    dim_feedforward: 2048 # Transformer feedforward layers
+    # model dim 768 and 12 heads results in each head having dim 64, which is the same as the total model dim of Jukebox's Middle prior (which uses 1 head).
+    # So each head can learn to attend to a specific slice of the input tokens, similar to how Jukebox's single head attends to all tokens with its full 1920-dim model.
+    model_dim: 768        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
+    num_heads: 12          # Atention heads (Jukebox uses 1 for Middle)
+    num_layers: 12        # Transformer self-attention layers (Jukebox uses 72)
+    dim_feedforward: 3072 # Transformer feedforward layers
     dropout: 0.1
-    max_time_steps: 2048
+    max_time_steps: 512  # seq_len = 16×32 = 512 tokens
     attention_qkv_ratio: 0.25
-    block_len: 16  # Middle Grid: 16 (Freq) * 64 (Time) -> block_len must be 16
-    # condiditioner parameters
-    conditioner_residual_block_width: 1024
-    conditioner_residual_blocks: 16
+    block_len: 16        # freq dimension of Middle grid (16 freq bins × 32 time steps)
+    # Timing conditioning parameters
+    use_timing_conditioning: true
+    timing_num_bins: 1024
+    duration_num_bins: 256
+    timing_max_duration_seconds: 3600.0
+    timing_embedding_init_std: 0.02
+    timing_embedding_scale: 1.0
+    # Conditioner parameters
+    conditioner_residual_block_width: 512
+    conditioner_residual_blocks: 12
     conditioner_kernel_size: 3
-    conditioner_conv_channels: 1024
+    conditioner_conv_channels: 512
     conditioner_dilation_growth_rate: 3
-    conditioner_dilation_cycle: 8
-    conditioner_upsample_stride: 4 # Upsampling 256 tokens to 1024 tokens (1024 / 256 = 4). Another example (256 target time frames): upsampling 8x8 image to 16x16 image (256 / 64 = 4)
+    conditioner_dilation_cycle: 6
+    # stride=4: 128 sliced Top tokens → 512 Middle tokens (computed automatically)
+    conditioner_upsample_stride: 4
   bottom_prior:
-    model_dim: 512        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
-    num_heads: 1          # Atention heads (Jukebox uses 1 for Bottom)
-    num_layers: 36        # Transformer self-attention layers (Jukebox uses 76)
-    dim_feedforward: 2048  # Transformer feedforward layers
-    dropout: 0.1
-    max_time_steps: 2048
+    model_dim: 768        # Transformer width (size of the embedding vector for each token) (Jukebox uses 1920)
+    num_heads: 12         # Atention heads (Jukebox uses 1 for Bottom)
+    num_layers: 10        # Transformer self-attention layers (Jukebox uses 72)
+    dim_feedforward: 3072 # Transformer feedforward layers
+    dropout: 0.15
+    max_time_steps: 512  # seq_len = 32×16 = 512 tokens
     attention_qkv_ratio: 0.25
-    block_len: 32  # Bottom Grid: 32 (Freq) * 128 (Time) -> block_len must be 32
-    # condiditioner parameters
-    conditioner_residual_block_width: 1024
-    conditioner_residual_blocks: 16
+    block_len: 32        # freq dimension of Bottom grid (32 freq bins × 16 time steps)
+    # Timing conditioning parameters
+    use_timing_conditioning: true
+    timing_num_bins: 1024
+    duration_num_bins: 256
+    timing_max_duration_seconds: 3600.0
+    timing_embedding_init_std: 0.02
+    timing_embedding_scale: 1.0
+    # Conditioner parameters
+    condition_on_top: true          # bottom is conditioned on middle and top
+    conditioner_residual_block_width: 384
+    conditioner_residual_blocks: 12 # 12 blocks per conditioner
     conditioner_kernel_size: 3
-    conditioner_conv_channels: 1024
+    conditioner_conv_channels: 384  # Number of channels in the convolutional layers of the conditioner. Jukebox uses 1024
     conditioner_dilation_growth_rate: 3
-    conditioner_dilation_cycle: 8
-    conditioner_upsample_stride: 4 # Upsampling 1024 tokens to 4096 tokens (4096 / 1024 = 4)
+    conditioner_dilation_cycle: 6   # 2 perfect cycles
+    # primary stride=4:  128 sliced Middle tokens → 512 Bottom tokens (computed automatically)
+    # secondary stride=16: 32 sliced Top tokens   → 512 Bottom tokens (computed automatically)
+    conditioner_upsample_stride: 4
 
 training:
-  top_prior:
-    batch_size: 8
-    gradient_accumulation_steps: 4
-    learning_rate: 0.00005  # Warmup to lr then cosine decay
-    weight_decay: 0.002
-    epochs: 200
-    retrain: true
-    pretrained_weights_path: "./models/transformer_prior/jukebox_backing_tracks_logmel_prior_top_transformer_prior/2026-04-14_10-06-58/model_epoch_200.pth"
-  middle_prior:
-    batch_size: 2
-    gradient_accumulation_steps: 16
-    learning_rate: 0.0003  # Warmup to lr then cosine decay
-    weight_decay: 0.01
-    epochs: 200
-    retrain: true
-    pretrained_weights_path: "./models/transformer_prior/jukebox_backing_tracks_logmel_prior_middle_transformer_prior/2026-04-14_10-11-41/model_epoch_200.pth"
-  bottom_prior:
-    batch_size: 1
-    gradient_accumulation_steps: 32
-    learning_rate: 0.0003  # Warmup to lr then cosine decay
-    weight_decay: 0.01
-    epochs: 200
-    retrain: true
-    pretrained_weights_path: "./models/transformer_prior/jukebox_backing_tracks_logmel_prior_bottom_transformer_prior/2026-04-14_10-28-05/model_epoch_200.pth"
-  validation_split: 0.0
-  early_stopping_patience: 10
+  seed: 42
+  validation_split: 0.1
+  early_stopping_patience: 15
   save_dir: "./models/transformer_prior/"
+  num_workers: 12
+  pin_memory: true
+  persist_workers: true
+  prefetch_factor: 4
+  top_prior:
+    batch_size: 14
+    gradient_accumulation_steps: 18
+    learning_rate: 0.0001
+    scheduler: none
+    weight_decay: 0.002
+    adam_beta2: 0.925
+    epochs: 1000
+    retrain: false
+    pretrained_weights_path: null
+    reset_optimizer: false
+    reset_scheduler: false
+  middle_prior:
+    batch_size: 42
+    gradient_accumulation_steps: 6
+    learning_rate: 0.0005
+    scheduler: none
+    weight_decay: 0.01
+    adam_beta2: 0.999
+    epochs: 1000
+    retrain: false
+    pretrained_weights_path: null
+    reset_optimizer: false
+    reset_scheduler: false
+  bottom_prior:
+    batch_size: 52
+    gradient_accumulation_steps: 8
+    learning_rate: 0.0005
+    scheduler: none
+    weight_decay: 0.01
+    adam_beta2: 0.999
+    epochs: 1000
+    retrain: true
+    pretrained_weights_path: "./models/transformer_prior/jukebox_maestro_bottom_transformer_prior/2026-05-10_12-06-54/latest_model.pth"
+    reset_scheduler: false

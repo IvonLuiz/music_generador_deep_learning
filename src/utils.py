@@ -1,7 +1,7 @@
 import os
 import random
 import numpy as np
-from typing import Union
+from typing import Optional, Union
 from tqdm import tqdm
 import yaml
 import torch
@@ -11,6 +11,29 @@ from modeling.torch.vq_vae_residual import VQ_VAE as VQ_VAE_Residual
 from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
 from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
 from processing.preprocess_audio import TARGET_TIME_FRAMES
+
+
+def set_global_seed(seed: Optional[int], deterministic: bool = False) -> None:
+    """Set global RNG seeds, optionally forcing deterministic CUDA kernels for sampling/debugging."""
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+def list_npy_files(path):
+    all_files = []
+    for root, _, file_names in os.walk(path):
+        for file_name in file_names:
+            if file_name.endswith('.npy'):
+                all_files.append(os.path.join(root, file_name))
+    all_files.sort()
+    return all_files
 
 
 def load_maestro(path, target_time_frames=256, debug_print=False):
@@ -36,12 +59,8 @@ def load_maestro(path, target_time_frames=256, debug_print=False):
     file_paths = []
     
     # First, collect all file paths to know the total for tqdm
-    all_files = []
     print("Scanning files in:", path)
-    for root, _, file_names in os.walk(path):
-        for file_name in file_names:
-            if file_name.endswith(".npy"):
-                all_files.append(os.path.join(root, file_name))
+    all_files = list_npy_files(path)
 
     print(f"Found {len(all_files)} spectrograms. Loading...")
 

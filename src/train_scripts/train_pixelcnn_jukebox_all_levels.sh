@@ -19,6 +19,7 @@ DEFAULT_LEVELS=(top middle bottom)
 LEVELS=("${DEFAULT_LEVELS[@]}")
 FORWARD_ARGS=()
 CONDITIONING_MODE="real"
+CONFIG_PATH="./config/config_pixelcnn_jukebox_hierarchical.yaml"
 
 print_usage() {
   cat <<'EOF'
@@ -32,6 +33,8 @@ Options:
   --conditioning_mode MODE Conditioning source for middle/bottom training.
                            Valid values: real,generated
                            Default: real
+  --config PATH            Config path forwarded to trainer and used to infer save root/model name.
+                           Default: ./config/config_pixelcnn_jukebox_hierarchical.yaml
   -h, --help               Show this help message.
 
 Any extra args are forwarded to:
@@ -65,6 +68,20 @@ while [[ $# -gt 0 ]]; do
     --conditioning_mode=*)
       CONDITIONING_MODE="${1#*=}"
       ;;
+    --config)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "Error: --config requires a value." >&2
+        print_usage
+        exit 1
+      fi
+      CONFIG_PATH="$1"
+      FORWARD_ARGS+=("--config" "$CONFIG_PATH")
+      ;;
+    --config=*)
+      CONFIG_PATH="${1#*=}"
+      FORWARD_ARGS+=("--config=$CONFIG_PATH")
+      ;;
     -h|--help)
       print_usage
       exit 0
@@ -75,6 +92,28 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  echo "Error: config file not found: $CONFIG_PATH" >&2
+  exit 1
+fi
+
+TIMESTAMP="$(date +%Y-%m-%d_%H-%M-%S)"
+SHARED_RUN_ROOT="$($PYTHON_BIN - "$CONFIG_PATH" "$TIMESTAMP" <<'PY'
+import os
+import sys
+import yaml
+
+cfg_path = sys.argv[1]
+timestamp = sys.argv[2]
+with open(cfg_path, 'r') as f:
+    cfg = yaml.safe_load(f)
+
+save_root = str(cfg.get('training', {}).get('save_dir', './models/')).strip()
+model_name = str(cfg.get('model', {}).get('name', 'pixelcnn_jukebox')).strip() or 'pixelcnn_jukebox'
+print(os.path.join(save_root, f'{model_name}_prior', timestamp))
+PY
+)"
 
 case "$CONDITIONING_MODE" in
   real|generated)
@@ -109,6 +148,7 @@ echo "Starting sequential Jukebox PixelCNN prior training: ${LEVELS[*]}"
 echo "Project root: $ROOT_DIR"
 echo "Python: $PYTHON_BIN"
 echo "Conditioning mode: $CONDITIONING_MODE"
+echo "Shared run root: $SHARED_RUN_ROOT"
 
 for level in "${LEVELS[@]}"; do
   echo ""
@@ -118,6 +158,7 @@ for level in "${LEVELS[@]}"; do
   "$PYTHON_BIN" src/train_scripts/train_pixel_cnn_jukebox_hierarchical.py \
     --level "$level" \
     --conditioning_mode "$CONDITIONING_MODE" \
+    --run_dir_root "$SHARED_RUN_ROOT" \
     "${FORWARD_ARGS[@]}"
 done
 

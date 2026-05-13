@@ -1,21 +1,22 @@
-bottom_prior:
-  attention_layers: 0
-  conv_filter_size: 5
-  dropout_rate: 0.1
-  hidden_channels: 128
-  num_layers: 15
+priors:
+  top_prior:
+      attention_layers: 0
+      conv_filter_size: 5
+      dropout_rate: 0.1
+      hidden_channels: 128
+      num_layers: 15
+  bottom_prior:
+      attention_layers: 0
+      conv_filter_size: 5
+      dropout_rate: 0.1
+      hidden_channels: 128
+      num_layers: 15
 dataset:
   processed_path: ./data/processed/maestro_spectrograms_test/
   target_time_frames: 256
 model:
   name: pixelcnn_maestro2011
   num_prior_levels: 2
-top_prior:
-  attention_layers: 0
-  conv_filter_size: 5
-  dropout_rate: 0.1
-  hidden_channels: 128
-  num_layers: 15
 training:
   batch_size: 32
   epochs: 50

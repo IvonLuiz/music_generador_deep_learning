@@ -1,5 +1,6 @@
 import argparse
 import os
+import yaml
 import pickle
 import sys
 from datetime import datetime
@@ -16,7 +17,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from generation.soundgenerator import SoundGenerator
 from processing.preprocess_audio import HOP_LENGTH, MIN_MAX_VALUES_SAVE_DIR, SAMPLE_RATE, TARGET_TIME_FRAMES, FRAME_SIZE, N_MELS
 from train_scripts.jukebox_utils import parse_level, load_jukebox_model
-from utils import find_min_max_for_path, load_maestro
+from utils import find_min_max_for_path, list_npy_files
 
 
 def _resolve_min_max_values_path(path_override: Optional[str]) -> str:
@@ -33,6 +34,26 @@ def _resolve_model_reference(model_dir_or_file: str) -> str:
     return model_dir_or_file
 
 
+def _resolve_target_time_frames(
+    run_config: dict,
+    level_name: str,
+    explicit_target_time_frames: Optional[int],
+) -> int:
+    if explicit_target_time_frames is not None:
+        return int(explicit_target_time_frames)
+
+    model_cfg = run_config.get('model', {})
+    level_profiles = model_cfg.get('level_profiles', {})
+    level_profile = level_profiles.get(level_name, {})
+    target_time_frames = level_profile.get('target_time_frames')
+    if target_time_frames is None:
+        dataset_cfg = run_config.get('dataset', {})
+        target_time_frames = dataset_cfg.get('target_time_frames', TARGET_TIME_FRAMES)
+
+    return int(target_time_frames)
+
+
+
 def _load_min_max_values(path: str) -> dict:
     if not os.path.exists(path):
         raise FileNotFoundError(f'min_max_values.pkl not found at {path}')
@@ -42,29 +63,53 @@ def _load_min_max_values(path: str) -> dict:
 
 def _extract_code_indices(model, x: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
-        z = model.encoder(x)
-        z = model.pre_vq_conv(z)
-        _, idx, _, _, _ = model.vq(z)
-    return idx.long()
+        return model.encode_to_indices(x)
+
+
+def _crop_or_pad_spectrogram(spectrogram: np.ndarray, target_time_frames: int) -> np.ndarray:
+    if spectrogram.ndim != 2:
+        raise ValueError(f'Expected 2D spectrogram, got shape {spectrogram.shape}')
+
+    if spectrogram.shape[1] > target_time_frames:
+        return spectrogram[:, :target_time_frames]
+    if spectrogram.shape[1] < target_time_frames:
+        pad_width = target_time_frames - spectrogram.shape[1]
+        return np.pad(spectrogram, ((0, 0), (0, pad_width)), mode='constant')
+    return spectrogram
+
+
+def _load_selected_spectrograms(file_paths: List[str], target_time_frames: int) -> np.ndarray:
+    specs: List[np.ndarray] = []
+    for file_path in file_paths:
+        try:
+            spectrogram = np.load(file_path)
+        except Exception as exc:
+            raise RuntimeError(f'Failed loading spectrogram {file_path}: {exc}') from exc
+        spectrogram = _crop_or_pad_spectrogram(spectrogram, target_time_frames)
+        specs.append(spectrogram)
+
+    if not specs:
+        raise ValueError('No spectrograms were loaded from selected files.')
+
+    stacked = np.stack(specs, axis=0).astype(np.float32)
+    return stacked[..., np.newaxis]
 
 
 def _select_samples(
-    specs: np.ndarray,
-    file_paths: np.ndarray,
+    all_file_paths: List[str],
     min_max_values: dict,
     spectrograms_path: str,
     n_samples: int,
     seed: int,
-) -> Tuple[np.ndarray, List[str], List[dict]]:
-    if len(specs) == 0:
+) -> Tuple[List[str], List[dict]]:
+    if len(all_file_paths) == 0:
         raise ValueError('No spectrograms found in dataset.')
 
-    n = min(n_samples, len(specs))
+    n = min(n_samples, len(all_file_paths))
     rng = np.random.default_rng(seed)
-    chosen = rng.choice(len(specs), size=n, replace=False)
+    chosen = rng.choice(len(all_file_paths), size=n, replace=False)
 
-    sampled_specs = specs[chosen]
-    sampled_paths = [str(file_paths[i]) for i in chosen]
+    sampled_paths = [str(all_file_paths[i]) for i in chosen]
 
     sampled_min_max: List[dict] = []
     for fp in sampled_paths:
@@ -73,7 +118,7 @@ def _select_samples(
             mm = {'min': -80.0, 'max': 0.0}
         sampled_min_max.append(mm)
 
-    return sampled_specs, sampled_paths, sampled_min_max
+    return sampled_paths, sampled_min_max
 
 
 def _save_audio(signals: List[np.ndarray], out_dir: str, prefix: str) -> None:
@@ -183,7 +228,6 @@ def test_jukebox_vqvae(
         raise FileNotFoundError(f'Config not found at {config_path}')
 
     with open(config_path, 'r') as f:
-        import yaml
         run_config = yaml.safe_load(f)
 
     dataset_cfg = run_config.get('dataset', {})
@@ -196,21 +240,25 @@ def test_jukebox_vqvae(
         'mel' if 'mel' in str(spectrograms_path).lower() else 'linear'
     )
     n_mels = int(dataset_cfg.get('n_mels', N_MELS))
+    if target_time_frames is None:
+        target_time_frames = _resolve_target_time_frames(run_config, level_name, target_time_frames)
+    print(f'Using target_time_frames={target_time_frames} for level {level_name}')
 
     mm_path = _resolve_min_max_values_path(min_max_values_path)
     min_max_values = _load_min_max_values(mm_path)
 
-    print(f'Loading spectrogram dataset from {spectrograms_path}')
-    specs, file_paths = load_maestro(spectrograms_path, target_time_frames)
+    print(f'Scanning spectrogram dataset from {spectrograms_path}')
+    all_file_paths = list_npy_files(spectrograms_path)
 
-    sampled_specs, sampled_paths, sampled_min_max = _select_samples(
-        specs=specs,
-        file_paths=file_paths,
+    sampled_paths, sampled_min_max = _select_samples(
+        all_file_paths=all_file_paths,
         min_max_values=min_max_values,
         spectrograms_path=spectrograms_path,
         n_samples=n_samples,
         seed=seed,
     )
+    print(f'Loading {len(sampled_paths)} sampled spectrograms into memory')
+    sampled_specs = _load_selected_spectrograms(sampled_paths, target_time_frames)
 
     x = torch.from_numpy(sampled_specs).permute(0, 3, 1, 2).float().to(device)
 
@@ -234,7 +282,7 @@ def test_jukebox_vqvae(
     recon_audio = generator.convert_spectrograms_to_audio(recon_specs, sampled_min_max, method=audio_method)
 
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    save_dir = os.path.join('samples', 'jukebox_vqvae_test', level_name, timestamp)
+    save_dir = os.path.join('samples', 'jukebox_vqvae_maestro_test', level_name, timestamp)
     os.makedirs(save_dir, exist_ok=True)
 
     audio_dir = os.path.join(save_dir, 'audio')
@@ -257,7 +305,7 @@ if __name__ == '__main__':
     parser.add_argument('--level', type=str, default='bottom', help='Jukebox level: top, middle, bottom')
     parser.add_argument('--weights_file', type=str, default='best_model.pth', help='Weights file name if model_path is a dir')
     parser.add_argument('--n_samples', type=int, default=5, help='Number of samples to test')
-    parser.add_argument('--target_time_frames', type=int, default=TARGET_TIME_FRAMES, help='Time frames used by load_maestro')
+    parser.add_argument('--target_time_frames', type=int, default=None, help='Time frames used by load_maestro')
     parser.add_argument('--min_max_values', type=str, default=None, help='Optional path to min_max_values.pkl')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for sample selection')
     parser.add_argument('--audio_method', type=str, default='griffinlim', help='Audio inversion: griffinlim or istft')

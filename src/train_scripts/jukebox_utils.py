@@ -1,17 +1,34 @@
 
 import os
+import numpy as np
 from typing import Optional, Tuple
 
+import re
 import torch
 import torch.nn as nn
 
 from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from modeling.torch.pixel_cnn_jukebox_levels import JukeboxLevelPixelCNN
-from utils import load_config
+from utils import load_config, list_npy_files
 
 LEVEL_TO_INT = {'top': 1, 'middle': 2, 'bottom': 3}
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
 
+
+
+def extract_song_prefix(file_path: str) -> str:
+    """!
+    @brief Extract the song-level prefix (everything before `_segment_NNN.npy`).
+
+    @param file_path Path expected to end with `_segment_<int>.npy`.
+    @return String prefix shared by all segments of the same song.
+    @throws ValueError If the expected naming pattern is not found.
+    """
+    # if the song has suffix, it should be grouped
+    match = re.search(r'^(.+)_segment_\d+\.npy$', str(file_path))
+    if match is None:
+        return os.path.basename(file_path)  # fallback to full filename if pattern not found
+    return match.group(1)
 
 def parse_level(level: str) -> str:
     level = str(level).strip().lower()
@@ -187,3 +204,36 @@ def load_jukebox_model(model_dir_or_file: str, level_name: str, device: torch.de
 
     model.eval()
     return model
+
+def split_train_val_paths(
+    all_file_paths: list,
+    dataset_cfg: dict,
+    validation_split: float,
+    seed: Optional[int] = None,
+):
+    all_file_paths = list(all_file_paths)
+    split_rng = np.random.default_rng(seed)
+    split_rng.shuffle(all_file_paths)
+
+    if validation_split < 0 or validation_split >= 1:
+        raise ValueError(f"validation_split must be in the range [0, 1), got {validation_split}")
+    if validation_split == 0:
+        return all_file_paths, None # all data in training
+
+    # Keep whole songs in either train or val to prevent leakage between chunks
+    # from the same piece. We split over unique song prefixes, then map back to files.
+    song_prefixes = sorted({extract_song_prefix(f) for f in all_file_paths})
+    split_rng.shuffle(song_prefixes)
+    num_val_songs = int(round(len(song_prefixes) * validation_split))
+    if len(song_prefixes) > 1:
+        num_val_songs = max(1, min(len(song_prefixes) - 1, num_val_songs))
+    else:
+        num_val_songs = 0
+    val_songs = set(song_prefixes[:num_val_songs])
+
+    train_file_paths = [f for f in all_file_paths if extract_song_prefix(f) not in val_songs]
+    val_file_paths = [f for f in all_file_paths if extract_song_prefix(f) in val_songs]
+    
+    print(f"Songs: {len(song_prefixes) - num_val_songs} train, {num_val_songs} val")
+
+    return train_file_paths, val_file_paths

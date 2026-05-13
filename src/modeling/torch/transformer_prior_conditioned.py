@@ -1,6 +1,6 @@
 import os
 import sys
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -49,7 +49,11 @@ class TransformerPriorConditioned(nn.Module):
         max_time_steps: int = 100,
         is_upsampler: bool = False,
         cond_num_embeddings: Optional[int] = None,
-        upsample_stride: Optional[int] = None,
+        cond_block_len: Optional[int] = None,
+        upsample_stride: Optional[Union[int, Tuple[int, int]]] = None,
+        second_cond_num_embeddings: Optional[int] = None,
+        second_cond_block_len: Optional[int] = None,
+        second_upsample_stride: Optional[Union[int, Tuple[int, int]]] = None,
         use_bos_token: bool = False,
         conditioner_residual_block_width: int = 1024,
         conditioner_residual_blocks: int = 16,
@@ -59,6 +63,14 @@ class TransformerPriorConditioned(nn.Module):
         conditioner_dilation_cycle: int = 8,
         dropout: float = 0.1,
         attention_qkv_ratio: float = 1.0,
+        use_timing_conditioning: bool = True,
+        timing_num_bins: int = 1024,
+        duration_num_bins: int = 256,
+        timing_window_seconds: Optional[float] = None,
+        timing_max_duration_seconds: float = 3600.0,
+        timing_embedding_init_std: float = 0.02,
+        timing_embedding_scale: float = 1.0,
+        use_2d_conditioner: bool = True,
     ):
         """!
         @brief Initializes the TransformerPrior model.
@@ -93,6 +105,7 @@ class TransformerPriorConditioned(nn.Module):
         @param conditioner_dilation_growth_rate The rate at which the dilation factor grows in the WaveNet conditioner. Defaults to 3.
         @param conditioner_dilation_cycle The cycle length for the dilation factors in the WaveNet conditioner. Defaults to 8.
         @param dropout The dropout probability. Defaults to 0.1.
+        @param use_timing_conditioning Whether to add learned timing metadata to every token embedding.
         """
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -106,6 +119,13 @@ class TransformerPriorConditioned(nn.Module):
         self.max_time_steps = max_time_steps
         self.use_bos_token = use_bos_token
         self.attention_qkv_ratio = float(attention_qkv_ratio)
+        self.use_timing_conditioning = bool(use_timing_conditioning)
+        self.timing_num_bins = int(timing_num_bins)
+        self.duration_num_bins = int(duration_num_bins)
+        self.timing_window_seconds = float(timing_window_seconds) if timing_window_seconds is not None else None
+        self.timing_max_duration_seconds = float(timing_max_duration_seconds)
+        self.timing_embedding_scale = float(timing_embedding_scale)
+        self.use_2d_conditioner = bool(use_2d_conditioner)
         self.bos_token_id = num_embeddings if use_bos_token else None
         self.input_vocab_size = num_embeddings + (1 if use_bos_token else 0)
 
@@ -114,11 +134,15 @@ class TransformerPriorConditioned(nn.Module):
         if self.is_upsampler:
             if cond_num_embeddings is None or upsample_stride is None:
                 raise ValueError('cond_num_embeddings and upsample_stride must be provided for upsampler priors')
+            if self.use_2d_conditioner and cond_block_len is None:
+                raise ValueError('cond_block_len must be provided for 2D upsampler priors')
         
+            # To instantiate a WaveNet conditioner that resamples a 2D sequence, we must know the conditioning `block_len` (freq dimension length)
             # instantiate the WaveNet Conditioner for processing the conditioning input
             self.conditioner = WaveNetConditioner(
                 num_embeddings=cond_num_embeddings,
                 embedding_dim=model_dim,
+                cond_freq_bins=cond_block_len if self.use_2d_conditioner else None,
                 num_layers=conditioner_residual_blocks,
                 num_channels=conditioner_residual_block_width,
                 kernel_size=conditioner_kernel_size,
@@ -127,17 +151,65 @@ class TransformerPriorConditioned(nn.Module):
                 dilation_cycle=conditioner_dilation_cycle,
                 upsample_stride=upsample_stride,
                 dropout=dropout,
+                use_2d_conditioner=self.use_2d_conditioner,
             )
 
-        # Embedding layers for tokens and positions        
+            self.second_conditioner = None
+            has_second_conditioner = (
+                second_cond_num_embeddings is not None
+                and second_upsample_stride is not None
+                and (not self.use_2d_conditioner or second_cond_block_len is not None)
+            )
+            if has_second_conditioner:
+                self.second_conditioner = WaveNetConditioner(
+                    num_embeddings=second_cond_num_embeddings,
+                    embedding_dim=model_dim,
+                    cond_freq_bins=second_cond_block_len if self.use_2d_conditioner else None,
+                    num_layers=conditioner_residual_blocks,
+                    num_channels=conditioner_residual_block_width,
+                    kernel_size=conditioner_kernel_size,
+                    conv_channels=conditioner_conv_channels,
+                    dilation_growth=conditioner_dilation_growth_rate,
+                    dilation_cycle=conditioner_dilation_cycle,
+                    upsample_stride=second_upsample_stride,
+                    dropout=dropout,
+                    use_2d_conditioner=self.use_2d_conditioner,
+                )
+        else:
+            self.second_conditioner = None
+
+        # Embedding layers for tokens and positions
         self.token_embedding = nn.Embedding(self.input_vocab_size, model_dim)
         self.pos_embedding = nn.Embedding(max_seq_len, model_dim)
-        self.time_embedding = nn.Embedding(max_time_steps, model_dim)
+        self.absolute_timing_embedding = None
+        self.relative_timing_embedding = None
+        self.duration_timing_embedding = None
+        if self.use_timing_conditioning:
+            if self.timing_num_bins < 2:
+                raise ValueError(f"timing_num_bins must be >= 2, got {self.timing_num_bins}")
+            if self.duration_num_bins < 2:
+                raise ValueError(f"duration_num_bins must be >= 2, got {self.duration_num_bins}")
+            self.absolute_timing_embedding = nn.Embedding(self.timing_num_bins, model_dim)
+            self.relative_timing_embedding = nn.Embedding(self.timing_num_bins, model_dim)
+            self.duration_timing_embedding = nn.Embedding(self.duration_num_bins, model_dim)
+            self._init_learned_timing_embeddings(float(timing_embedding_init_std))
 
         # Initialize the transformer layers
         self._init_factored_transformer_layers()
         self.norm = nn.LayerNorm(model_dim)
         self.to_logits = nn.Linear(model_dim, num_embeddings, bias=False)
+
+    def _init_learned_timing_embeddings(self, init_std: float):
+        """!
+        @brief Initialize timing embeddings gently so they start as a cue, not a dominant signal.
+        @param init_std Standard deviation used for normal initialization.
+        """
+        for emb in (
+            self.absolute_timing_embedding,
+            self.relative_timing_embedding,
+            self.duration_timing_embedding,
+        ):
+            nn.init.normal_(emb.weight, mean=0.0, std=init_std)
 
     def _init_factored_transformer_layers(self):
         """!
@@ -161,21 +233,28 @@ class TransformerPriorConditioned(nn.Module):
         self,
         indices: torch.Tensor,
         upper_indices: Optional[torch.Tensor] = None,
-        time_ids: torch.Tensor = None
+        second_upper_indices: Optional[torch.Tensor] = None,
+        timing: Optional[torch.Tensor] = None,
+        conditioning_emb: Optional[torch.Tensor] = None,
+        second_conditioning_emb: Optional[torch.Tensor] = None,
+        timing_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Forward pass for the TransformerPriorConditioned model.
+        """!
+        @brief Forward pass for the TransformerPriorConditioned model.
 
-        Architecture adapted from jukebox. We pass the input token indices through token and position embeddings, add
+        @details Architecture adapted from jukebox. We pass the input token indices through token and position embeddings, add
         conditioning information if this is an upsampler prior, and then pass through a series of factored transformer
         layers before projecting to logits over the vocabulary.
 
-        @param indices The input token indices for the current level (shape: [batch_size, seq_len]).
-        @param upper_indices The input token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
-        This is used as conditioning information for upsampler priors. Defaults to None (no conditioning).
-        @param time_ids Optional time step IDs used for temporal conditioning. Temporal conditioning is applied per
-        batch element. Accepts shape [batch_size] or [batch_size, 1].
-        @return Logits over the vocabulary for the next token prediction (shape: [batch_size, seq_len, num_embeddings]).
+        @param indices Input token indices for the current level (shape: [batch_size, seq_len]).
+        @param upper_indices Upper-level token indices for upsampler priors (shape: [batch_size, upper_seq_len]).
+        @param second_upper_indices Second upper-level token indices for dual-conditioning priors.
+        @param timing Optional timing tensor (shape: [batch_size, 3]) with
+        [start_time_seconds, total_duration_seconds, fraction_elapsed].
+        @param conditioning_emb Optional precomputed conditioning embedding (shape: [batch_size, T, D]).
+        @param second_conditioning_emb Optional second conditioning embedding (shape: [batch_size, T, D]).
+        @param timing_emb Optional precomputed timing embedding (shape: [batch_size, T, D]).
+        @return Logits over the vocabulary (shape: [batch_size, seq_len, num_embeddings]).
         """
         if indices.ndim != 2:
             raise ValueError(f"indices must have shape (B, T), got {tuple(indices.shape)}")
@@ -194,61 +273,49 @@ class TransformerPriorConditioned(nn.Module):
         # base embeddings (tokens + position)
         x = self.token_embedding(indices) + self.pos_embedding(pos)
 
-        # Add time embeddings if time_ids are provided
-        if time_ids is not None:
-            time_ids = time_ids.to(device=device, dtype=torch.long)
-
-            if time_ids.ndim == 1:
-                if time_ids.shape[0] != batch_size:
-                    raise ValueError(
-                        f"time_ids with shape {tuple(time_ids.shape)} must match batch_size={batch_size}"
-                    )
-                time_ids = time_ids.unsqueeze(1).expand(-1, seq_len)
-            elif time_ids.ndim == 2:
-                if time_ids.shape == (batch_size, 1):
-                    time_ids = time_ids.expand(-1, seq_len)
-                elif time_ids.shape != (batch_size, seq_len):
-                    raise ValueError(
-                        f"time_ids must have shape (B,), (B,1), or (B,T). Got {tuple(time_ids.shape)}"
-                    )
-                # else case is already (B, seq_len)
-            else:
+        # Add learned timing embeddings if provided.
+        # timing shape: (B, 3) with [start_time_s, total_duration_s, fraction_elapsed].
+        if self.use_timing_conditioning and timing_emb is not None:
+            t_emb = self._align_cached_embedding(timing_emb, batch_size, seq_len, device, 'timing_emb')
+            x = x + self.timing_embedding_scale * t_emb
+        elif self.use_timing_conditioning and timing is not None:
+            timing = timing.to(device=device, dtype=torch.float32)
+            if timing.ndim == 1:
+                timing = timing.unsqueeze(0)
+            if timing.shape[0] == 1 and batch_size > 1:
+                timing = timing.expand(batch_size, -1)
+            if timing.shape != (batch_size, 3):
                 raise ValueError(
-                    f"time_ids must have shape (B,), (B,1), or (B,T). Got {tuple(time_ids.shape)}"
+                    f"timing must have shape (B, 3) or (1, 3), got {tuple(timing.shape)}"
                 )
-
-            if torch.any(time_ids < 0) or torch.any(time_ids >= self.max_time_steps):
-                raise ValueError(
-                    f"time_ids values must be in [0, {self.max_time_steps - 1}]"
-                )
-
-            t_emb = self.time_embedding(time_ids)   # (batch, seq_len, model_dim)
-            x = x + t_emb
+            t_emb = self._learned_timing_embedding(timing, seq_len, device)
+            x = x + self.timing_embedding_scale * t_emb
 
         if self.is_upsampler:
-            if upper_indices is None:
-                raise ValueError('upper_indices must be provided for upsampler priors')
-            upper_indices = upper_indices.to(device=device, dtype=torch.long)
-            # Conditioning embedding vocabulary comes from the upper level codebook size
-            cond_vocab = self.conditioner.token_embedding.weight.shape[0]
+            if conditioning_emb is None:
+                cond_emb = self._compute_conditioning_embedding(
+                    upper_indices,
+                    self.conditioner,
+                    device,
+                    'upper_indices',
+                )
+            else:
+                cond_emb = conditioning_emb
+            cond_emb = self._align_cached_embedding(cond_emb, batch_size, seq_len, device, 'conditioning_emb')
+            x = x + cond_emb    # add the conditioning embeddings to the token embeddings before feeding into the transformer layers.
 
-            if torch.any(upper_indices < 0):
-                raise ValueError("upper_indices contains negative values")
-
-            # Allow exactly one out-of-range ID for BOS from an upper prior with BOS enabled
-            # BOS id is expected to be exactly equal to cond_vocab and is mapped to a neutral token
-            if torch.any(upper_indices >= cond_vocab):
-                if torch.any(upper_indices > cond_vocab):
-                    raise ValueError(
-                        f"upper_indices contains values above conditioning vocab (max allowed={cond_vocab})"
+            if self.second_conditioner is not None:
+                if second_conditioning_emb is None:
+                    cond_emb_2 = self._compute_conditioning_embedding(
+                        second_upper_indices,
+                        self.second_conditioner,
+                        device,
+                        'second_upper_indices',
                     )
-                upper_indices = upper_indices.clone()
-                upper_indices[upper_indices == cond_vocab] = 0
-
-            # Process the conditioning input through the WaveNet conditioner
-            cond_emb = self.conditioner(upper_indices)  # [batch_size, upper_seq_len, model_dim]
-            # Add the conditioning embeddings to the token embeddings
-            x = x + cond_emb[:, :seq_len, :]  # Ensure the conditioning embeddings are added only up to the current sequence length (in case of any length mismatch)
+                else:
+                    cond_emb_2 = second_conditioning_emb
+                cond_emb_2 = self._align_cached_embedding(cond_emb_2, batch_size, seq_len, device, 'second_conditioning_emb')
+                x = x + cond_emb_2  # add the second conditioning embeddings if present (e.g., for the bottom prior conditioned on both middle and top)
 
         # pass through transformer layers
         # FactoredAttention requires seq_len to be a multiple of block_len
@@ -272,19 +339,132 @@ class TransformerPriorConditioned(nn.Module):
         
         return logits
 
+    def _compute_conditioning_embedding(
+        self,
+        indices: Optional[torch.Tensor],
+        conditioner: nn.Module,
+        device: torch.device,
+        name: str,
+    ) -> torch.Tensor:
+        """!
+        @brief Compute a WaveNet conditioner embedding from upper-level indices.
+        @param indices Conditioning token indices from the upper level.
+        @param conditioner WaveNet conditioner module to apply.
+        @param device Target device for conditioning tensors.
+        @param name Label used in validation errors.
+        @return Conditioning embeddings shaped `(B, T, D)`.
+        @throws ValueError If indices are missing or out of range.
+        """
+        if indices is None:
+            raise ValueError(f'{name} must be provided for upsampler priors')
+
+        indices = indices.to(device=device, dtype=torch.long)
+        cond_vocab = conditioner.token_embedding.weight.shape[0] # cond vocabulary comes from the upper level codebook size
+
+        if torch.any(indices < 0):
+            raise ValueError(f"{name} contains negative values")
+
+        # Allow exactly one out-of-range ID for BOS from an upper prior with BOS enabled
+        # BOS id is expected to be exactly equal to cond_vocab and is mapped to a neutral token
+        if torch.any(indices >= cond_vocab):
+            if torch.any(indices > cond_vocab):
+                raise ValueError(
+                    f"{name} contains values above conditioning vocab (max allowed={cond_vocab})"
+                )
+            indices = indices.clone()
+            indices[indices == cond_vocab] = 0
+
+        # Process the conditioning input through the WaveNet conditioner
+        return conditioner(indices)
+
+    @staticmethod
+    def _align_cached_embedding(
+        embedding: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        name: str,
+    ) -> torch.Tensor:
+        """!
+        @brief Align a cached embedding to the requested batch and sequence length.
+        @param embedding Cached embedding tensor shaped `(B, T, D)`.
+        @param batch_size Expected batch size for the current request.
+        @param seq_len Required sequence length.
+        @param device Target device for the embedding.
+        @param name Label used in validation errors.
+        @return Embedding tensor cropped to `(batch_size, seq_len, D)`.
+        @throws ValueError If the embedding shape is incompatible.
+        """
+        if embedding.ndim != 3:
+            raise ValueError(f'{name} must have shape (B, T, D), got {tuple(embedding.shape)}')
+        embedding = embedding.to(device=device)
+        if embedding.shape[0] == 1 and batch_size > 1:
+            embedding = embedding.expand(batch_size, -1, -1)
+        if embedding.shape[0] != batch_size:
+            raise ValueError(f'{name} batch size {embedding.shape[0]} does not match indices batch size {batch_size}')
+        if embedding.shape[1] < seq_len:
+            raise ValueError(f'{name} length {embedding.shape[1]} is shorter than requested seq_len={seq_len}')
+        return embedding[:, :seq_len, :]
+
+    def _learned_timing_embedding(
+        self,
+        timing: torch.Tensor,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """!
+        @brief Build bounded learned timing embeddings from song position and duration.
+        @param timing Timing tensor shaped `(B, 3)`.
+        @param seq_len Sequence length to generate embeddings for.
+        @param device Target device for computations.
+        @return Timing embedding tensor shaped `(B, seq_len, D)`.
+        """
+        pos = torch.arange(seq_len, device=device)
+        token_time_col = torch.div(pos, self.block_len, rounding_mode='floor')
+        window_time_cols = max(1, (self.max_seq_len + self.block_len - 1) // self.block_len)
+        rel_denom = max(1, window_time_cols - 1)
+        rel_fraction = (token_time_col.float() / rel_denom).clamp(0.0, 1.0)
+        rel_idx = torch.round(rel_fraction * (self.timing_num_bins - 1)).long()
+
+        start_s = timing[:, 0:1].clamp_min(0.0)
+        duration_s = timing[:, 1:2].clamp_min(1e-6)
+        window_s = self.timing_window_seconds
+        if window_s is None or window_s <= 0:
+            # Fall back to using the stored segment start fraction only.
+            abs_fraction = timing[:, 2:3].clamp(0.0, 1.0).expand(-1, seq_len)
+        else:
+            token_offset_s = rel_fraction.view(1, seq_len) * float(window_s)
+            abs_fraction = ((start_s + token_offset_s) / duration_s).clamp(0.0, 1.0)
+        abs_idx = torch.round(abs_fraction * (self.timing_num_bins - 1)).long()
+
+        max_duration = max(self.timing_max_duration_seconds, 1.0)
+        duration_clamped = duration_s.clamp(1.0, max_duration)
+        duration_fraction = torch.log1p(duration_clamped) / torch.log1p(
+            torch.tensor(max_duration, device=device, dtype=torch.float32)
+        )
+        duration_idx = torch.round(
+            duration_fraction.clamp(0.0, 1.0) * (self.duration_num_bins - 1)
+        ).long().squeeze(1)
+
+        rel_emb = self.relative_timing_embedding(rel_idx).unsqueeze(0)
+        abs_emb = self.absolute_timing_embedding(abs_idx)
+        dur_emb = self.duration_timing_embedding(duration_idx).unsqueeze(1)
+        return abs_emb + rel_emb + dur_emb
+
     def loss(
         self,
         indices: torch.Tensor,
         upper_indices: Optional[torch.Tensor] = None,
-        time_ids: Optional[torch.Tensor] = None
+        second_upper_indices: Optional[torch.Tensor] = None,
+        timing: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """!
-        Next-token cross-entropy on a full sequence tensor (B, T).
-        
+        @brief Compute next-token cross-entropy on a full sequence tensor (B, T).
         @param indices The input token indices for the current level (shape: [batch_size, seq_len]).
-        @param upper_indices The input token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
-        This is used as conditioning information for upsampler priors. Defaults to None (no conditioning).
-        @param time_ids Optional time step IDs used for temporal conditioning. Accepts shape [batch_size], [batch_size, 1], or [batch_size, seq_len]. Defaults to None.
+        @param upper_indices Upper-level token indices for upsampler priors (shape: [batch_size, upper_seq_len]).
+        @param second_upper_indices Second upper-level token indices for dual-conditioning priors.
+        @param timing Optional timing tensor (shape: [batch_size, 3]) with
+        [start_time_seconds, total_duration_seconds, fraction_elapsed].
         @return The computed cross-entropy loss for next-token prediction.
         """
         if indices.ndim != 2:
@@ -304,37 +484,44 @@ class TransformerPriorConditioned(nn.Module):
             input_tokens = indices[:, :-1]  # Length: T - 1
             target = indices[:, 1:]         # Length: T - 1
         
-        # Pass upper_indices through to forward
         logits = self.forward(
             input_tokens,
             upper_indices=upper_indices,
-            time_ids=time_ids,
+            second_upper_indices=second_upper_indices,
+            timing=timing,
         )
         return F.cross_entropy(logits.reshape(-1, self.num_embeddings), target.reshape(-1))
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(
-        self, 
+        self,
         batch_size: int,
         start_tokens: Optional[torch.Tensor] = None,
         upper_indices: Optional[torch.Tensor] = None,
-        time_id: torch.Tensor = None,
+        second_upper_indices: Optional[torch.Tensor] = None,
+        timing: Optional[torch.Tensor] = None,
         seq_len: int = 64,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         device: Optional[torch.device] = None,
+        progress_label: Optional[str] = None,
+        progress_interval: int = 0,
     ) -> torch.Tensor:
         """!
         @brief Generates a sequence of token indices autoregressively given an initial input and optional conditioning.
         @param batch_size The number of sequences to generate in parallel.
-        @param start_tokens The initial input token indices (shape: [batch_size, initial_seq_len]). Defaults to None (start with a single token).
-        @param upper_indices The input token indices from the upper level prior for conditioning (shape: [batch_size, upper_seq_len]). Defaults to None (no conditioning).
-        @param time_id The time ID for the current generation step. Defaults to None. This is used for time embeddings and should be provided when generating from an upsampler prior to help the model learn temporal structure.
-        @param seq_len The length of the generated sequence (including the initial input). Defaults to 64.
-        @param top_k The number of top logits to keep for sampling. If None or <= 0, no filtering is applied. Defaults to None.
-        @paramm temperature The sampling temperature. Must be > 0. Defaults to 1.0.
-        @param device The device to perform generation on. If None, uses the same device as the model's parameters. Defaults to None.
-        @return A tensor of generated token indices (shape: [batch_size, generated_seq_len]) where generated_seq_len <= seq_len.
+        @param start_tokens The initial input token indices (shape: [batch_size, initial_seq_len]). Defaults to None.
+        @param upper_indices Conditioning token indices from the upper level prior (shape: [batch_size, upper_seq_len]).
+        @param second_upper_indices Second conditioning indices (bottom prior only). Defaults to None.
+        @param timing Global timing tensor of shape (batch_size, 3) or (1, 3) with float values
+        [start_time_seconds, total_duration_seconds, fraction_elapsed]. Defaults to None (no timing signal).
+        @param seq_len The length of the generated sequence. Defaults to 64.
+        @param top_k Top-k filtering. If None or <= 0, no filtering is applied. Defaults to None.
+        @param temperature Sampling temperature. Must be > 0. Defaults to 1.0.
+        @param device Device to perform generation on. Defaults to model's device.
+        @param progress_label Optional label used for periodic generation progress prints.
+        @param progress_interval Print every N generated tokens when progress_label is set.
+        @return Generated token indices (shape: [batch_size, seq_len]).
         """
         if temperature <= 0:
             raise ValueError(f"temperature must be > 0, got {temperature}")
@@ -342,18 +529,26 @@ class TransformerPriorConditioned(nn.Module):
             raise ValueError(f"Requested seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}")
         if self.is_upsampler and upper_indices is None:
             raise ValueError("upper_indices must be provided to generate from an upsampler.")
+        if self.second_conditioner is not None and second_upper_indices is None:
+            raise ValueError("second_upper_indices must be provided when second_conditioner is enabled.")
 
         if device is None:
             device = next(self.parameters()).device
         
         bos_prefix_len = 0
-
         if start_tokens is not None:
             if start_tokens.ndim != 2:
                 raise ValueError(f"start_tokens must have shape (B, T), got {tuple(start_tokens.shape)}")
             if start_tokens.shape[0] != batch_size:
                 raise ValueError("start_tokens batch size does not match requested batch_size")
-            tokens = start_tokens.to(device).long()
+            start_tokens = start_tokens.to(device).long()
+            if self.use_bos_token:
+                # Continuation prefixes still need the same BOS-shifted positions used during training.
+                bos = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
+                tokens = torch.cat([bos, start_tokens], dim=1)
+                bos_prefix_len = 1
+            else:
+                tokens = start_tokens
         else:
             if self.use_bos_token:
                 tokens = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
@@ -361,17 +556,53 @@ class TransformerPriorConditioned(nn.Module):
             else:
                 tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
         
-        if tokens.shape[1] > seq_len:
-            raise ValueError("start_tokens length cannot exceed requested seq_len")
-
         target_len = seq_len + bos_prefix_len
 
+        if tokens.shape[1] > target_len:
+            raise ValueError("start_tokens length cannot exceed requested seq_len")
+
+        progress_interval = max(0, int(progress_interval))
+        last_reported = max(0, tokens.shape[1] - bos_prefix_len)
+
+        cached_conditioning_emb = None
+        cached_second_conditioning_emb = None
+        if self.is_upsampler:
+            cached_conditioning_emb = self._compute_conditioning_embedding(
+                upper_indices,
+                self.conditioner,
+                device,
+                'upper_indices',
+            )
+            if self.second_conditioner is not None:
+                cached_second_conditioning_emb = self._compute_conditioning_embedding(
+                    second_upper_indices,
+                    self.second_conditioner,
+                    device,
+                    'second_upper_indices',
+                )
+
+        cached_timing_emb = None
+        if self.use_timing_conditioning and timing is not None:
+            timing_for_cache = timing.to(device=device, dtype=torch.float32)
+            if timing_for_cache.ndim == 1:
+                timing_for_cache = timing_for_cache.unsqueeze(0)
+            if timing_for_cache.shape[0] == 1 and batch_size > 1:
+                timing_for_cache = timing_for_cache.expand(batch_size, -1)
+            if timing_for_cache.shape != (batch_size, 3):
+                raise ValueError(
+                    f"timing must have shape (B, 3) or (1, 3), got {tuple(timing_for_cache.shape)}"
+                )
+            cached_timing_emb = self._learned_timing_embedding(timing_for_cache, self.max_seq_len, device)
+
         while tokens.shape[1] < target_len:
-            # Pass upper_indices during generation
             logits = self.forward(
                 tokens,
-                upper_indices=upper_indices,
-                time_ids=time_id,
+                upper_indices=None if cached_conditioning_emb is not None else upper_indices,
+                second_upper_indices=None if cached_second_conditioning_emb is not None else second_upper_indices,
+                timing=None if cached_timing_emb is not None else timing,
+                conditioning_emb=cached_conditioning_emb,
+                second_conditioning_emb=cached_second_conditioning_emb,
+                timing_emb=cached_timing_emb,
             )
             
             next_logits = logits[:, -1, :] / temperature
@@ -380,6 +611,14 @@ class TransformerPriorConditioned(nn.Module):
             next_token = torch.multinomial(probs, num_samples=1)
             
             tokens = torch.cat([tokens, next_token], dim=1)
+            generated_len = tokens.shape[1] - bos_prefix_len
+            if (
+                progress_label
+                and progress_interval > 0
+                and (generated_len == seq_len or generated_len - last_reported >= progress_interval)
+            ):
+                print(f'{progress_label}: generated {generated_len}/{seq_len} tokens', flush=True)
+                last_reported = generated_len
 
         if bos_prefix_len > 0:
             tokens = tokens[:, bos_prefix_len:]
@@ -402,26 +641,72 @@ class TransformerPriorConditioned(nn.Module):
 
 if __name__ == "__main__":
     torch.manual_seed(42)
-        
-    # Example usage
+
+    # Example usage — reflects the new level-specific window architecture.
+    # All three levels produce 512 tokens; conditioners use sliced upper sequences.
+    #   Top:    8×64 = 512 tokens  (full 2048-frame window)
+    #   Middle: 16×32 = 512 tokens (512-frame window), conditioned on 8×16=128 sliced Top tokens
+    #   Bottom: 32×16 = 512 tokens (128-frame window),  conditioned on 16×8=128 sliced Middle tokens
+    # Bottom Prior (512) is conditioned on:
+    #   Middle slice (128 tokens) -> Stride 4
+    #   Top slice (32 tokens)     -> Stride 16
     batch_size = 4
-    seq_len = 16
-    num_embeddings = 2048 # VQ-VAE codebook size
-    embedding_dim = 1920
+    seq_len_bot = seq_len = 512
+    seq_len_mid_slice = 128
+    seq_len_top_slice = 32
+    cond_seq_len = 128     # sliced upper-level conditioning (stride-4 conditioner)
+    num_embeddings = 2048  # VQ-VAE codebook size
+    embedding_dim = 512
     num_heads = 8
     num_layers = 6
     dim_feedforward = 2048
-    max_seq_len = 64
-    upsample_stride = 4  # Ratio between the upper and lower sequence lengths
+    max_seq_len = 512
+    middle_upsample_stride = (2, 2)  # 8x16 sliced top -> 16x32 middle
+    bottom_middle_upsample_stride = (2, 2)  # 16x8 sliced middle -> 32x16 bottom
+    bottom_top_upsample_stride = (4, 4)  # 8x4 sliced top -> 32x16 bottom
     padding = 0
     kernel_size = 3
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"Batch Size: {batch_size}")
-    print(f"Top Sequence Length: {seq_len}")
-    print(f"Bottom Sequence Length: {seq_len * upsample_stride}")
+    print(f"Target Sequence Length (bottom): {seq_len_bot}")
+    print(f"Target Sequence Length (middle slice): {seq_len_mid_slice}")
+    print(f"Target Sequence Length (top slice): {seq_len_top_slice}")
+    print(f"Conditioning Sequence Length (sliced): {cond_seq_len}")
     print("\n" + "="*40 + "\n")
 
-    print("Testing non-upsampler prior (no conditioning):")
+
+    print("Testing timing Sensitivity (Top Prior)")
+    model_top = TransformerPriorConditioned(
+        num_embeddings=num_embeddings,
+        model_dim=embedding_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        dim_feedforward=dim_feedforward,
+        max_seq_len=seq_len_bot,
+    ).to(device).eval()
+    
+    dummy_tokens = torch.randint(0, num_embeddings, (1, 512)).to(device)
+    
+    # Define two different timing scenarios for the same tokens
+    timing_start = torch.tensor([[0.0, 180.0, 0.0]]).to(device)   # Start of a 3min song
+    timing_end = torch.tensor([[179.0, 180.0, 0.99]]).to(device) # End of a 3min song
+    with torch.no_grad():
+        logits_start = model_top(dummy_tokens, timing=timing_start)
+        logits_end = model_top(dummy_tokens, timing=timing_end)
+
+    # Calculate the difference in predictions
+    diff = (logits_start - logits_end).abs().mean().item()
+    print(f"Logit Mean Absolute Difference (Start vs End): {diff:.6f}")
+    
+    if diff > 1e-7:
+        print("SUCCESS: Model is responsive to timing signal.")
+    else:
+        print("FAILURE: Model is ignoring the timing signal.")
+
+    print("\n" + "="*40 + "\n")
+
+    print("Testing non-upsampler prior (Top — no conditioning):")
     model = TransformerPriorConditioned(
         num_embeddings=num_embeddings,
         model_dim=embedding_dim,
@@ -429,25 +714,22 @@ if __name__ == "__main__":
         num_layers=num_layers,
         dim_feedforward=dim_feedforward,
         max_seq_len=max_seq_len,
+        block_len=8,   # Top grid: 8 freq × 64 time
         is_upsampler=False,
         dropout=0.1,
-    )
-    #print("Model architecture:\n", model)
+    ).to(device)
 
-    # dummy input tokens for the non-upsampler prior
-    input_tokens = torch.randint(0, num_embeddings, (batch_size, seq_len))
-    print("Input tokens shape (non-upsampler):", input_tokens.shape)  # Expected shape: (batch_size, seq_len)
-    output = model(input_tokens)
-    print("Output shape (non-upsampler):", output.shape)  # Expected shape: (batch_size, seq_len, num_embeddings)
-    
+    input_tokens = torch.randint(0, num_embeddings, (batch_size, seq_len)).to(device)
+    print("Input tokens shape (top):", input_tokens.shape)
+    timing = torch.tensor([[0.0, 23.8, 0.0]] * batch_size)
+    output = model(input_tokens, timing=timing)
+    print("Output shape (top):", output.shape)
     assert output.shape == (batch_size, seq_len, num_embeddings), f"Shape mismatch! Expected {(batch_size, seq_len, num_embeddings)}, got {output.shape}"
-    print("Non-upsampler test passed successfully!")
+    print("Top prior test passed successfully!")
 
     print("\n" + "="*40 + "\n")
-    
-    # Upsampler Prior (Transformer + WaveNet Conditioner)
-    print("Testing upsampler prior (with conditioning):")
-    
+
+    print("Testing upsampler prior (Middle — conditioned on 128 sliced Top tokens):")
     model_upsampler = TransformerPriorConditioned(
         num_embeddings=num_embeddings,
         model_dim=embedding_dim,
@@ -455,37 +737,102 @@ if __name__ == "__main__":
         num_layers=num_layers,
         dim_feedforward=dim_feedforward,
         max_seq_len=max_seq_len,
+        block_len=16,  # Middle grid: 16 freq × 32 time
         is_upsampler=True,
         cond_num_embeddings=num_embeddings,
-        upsample_stride=upsample_stride,
+        cond_block_len=8,
+        upsample_stride=middle_upsample_stride,
         dropout=0.1,
-    )
-    #print("Upsampler Model architecture:\n", model_upsampler)
-    
-    # dummy input tokens for the upsampler prior
-    lower_input_tokens = torch.randint(0, num_embeddings, (batch_size, seq_len))
-    upper_input_tokens = torch.randint(0, num_embeddings, (batch_size, seq_len // upsample_stride))  # shorter sequence for the upper level
-    print("Input tokens shape (upsampler):", lower_input_tokens.shape)  # Expected shape: (batch_size, seq_len)
-    print("Upper input tokens shape (conditioning):", upper_input_tokens.shape)  # Expected shape: (batch_size, seq_len // upsample_stride)
-    output = model(indices=lower_input_tokens, upper_indices=upper_input_tokens)
-    print("Output shape (upsampler):", output.shape)  # Expected shape: (batch_size, seq_len, num_embeddings)
-    
+    ).to(device)
+
+    lower_input_tokens = torch.randint(0, num_embeddings, (batch_size, seq_len)).to(device)
+    upper_input_tokens = torch.randint(0, num_embeddings, (batch_size, cond_seq_len)).to(device)  # 128 sliced Top tokens
+    print("Input tokens shape (middle):", lower_input_tokens.shape)
+    print("Conditioning tokens shape (sliced Top):", upper_input_tokens.shape)
+    output = model_upsampler(indices=lower_input_tokens, upper_indices=upper_input_tokens, timing=timing)
+    print("Output shape (middle upsampler):", output.shape)
     assert output.shape == (batch_size, seq_len, num_embeddings), f"Shape mismatch! Expected {(batch_size, seq_len, num_embeddings)}, got {output.shape}"
-    print("Upsampler test passed successfully!")
-    
-    print("\n" + "="*40 + "\n")
+    print("Middle upsampler test passed successfully!")
+
     # loss test
-    print("Testing loss computation for upsampler prior:")
-    loss = model.loss(lower_input_tokens, upper_indices=upper_input_tokens)
-    print(f"Loss computed successfully: {loss.item()}")
+    print("\n" + "="*40 + "\n")
+    print("Testing loss and generation for middle upsampler prior:")
+    loss = model_upsampler.loss(lower_input_tokens, upper_indices=upper_input_tokens, timing=timing)
+    print(f"Loss computed successfully: {loss.item():.4f}")
+
+    print("\n" + "="*40 + "\n")
+    print("Testing generation for middle upsampler prior:")
+    generated_tokens = model_upsampler.generate(
+        batch_size=batch_size,
+        start_tokens=None,
+        upper_indices=upper_input_tokens,
+        seq_len=seq_len,
+        top_k=50,
+        timing=timing,
+    )
+    print("Generated tokens shape:", generated_tokens.shape)
+    assert generated_tokens.shape == (batch_size, seq_len), f"Generated shape mismatch: {generated_tokens.shape}"
+
+    print("\n" + "="*40 + "\n")
+    print("Testing Bottom Prior Simulation (Conditioned on Middle + Top)")
     
-    # test generation
-    print("\nTesting generation for upsampler prior:")
-    
-    generated_tokens = model.generate(batch_size=batch_size, 
-                                      start_tokens=lower_input_tokens,
-                                      upper_indices=upper_input_tokens,
-                                      seq_len=seq_len, top_k=10)
-    print("Generated tokens shape:", generated_tokens.shape)  # Expected shape: (batch_size
-    
+    # Bottom upsampler parameters
+    model_bot = TransformerPriorConditioned(
+        num_embeddings=num_embeddings,
+        model_dim=embedding_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        dim_feedforward=dim_feedforward,
+        max_seq_len=seq_len_bot,
+        block_len=32,
+        is_upsampler=True,
+        cond_num_embeddings=num_embeddings, # Middle level codebook
+        cond_block_len=16,
+        upsample_stride=bottom_middle_upsample_stride,
+        second_cond_num_embeddings=num_embeddings, # Top level codebook
+        second_cond_block_len=8,
+        second_upsample_stride=bottom_top_upsample_stride,
+    ).to(device)
+
+    # Dummy data
+    bot_indices = torch.randint(0, num_embeddings, (batch_size, seq_len_bot)).to(device)
+    mid_cond = torch.randint(0, num_embeddings, (batch_size, seq_len_mid_slice)).to(device)
+    top_cond = torch.randint(0, num_embeddings, (batch_size, seq_len_top_slice)).to(device)
+    timing = torch.tensor([[10.0, 100.0, 0.1]] * batch_size).to(device)
+
+    # Test Forward
+    logits = model_bot(
+        indices=bot_indices, 
+        upper_indices=mid_cond, 
+        second_upper_indices=top_cond, 
+        timing=timing
+    )
+    print(f"Bottom Prior Forward shape: {logits.shape}")
+    assert logits.shape == (batch_size, seq_len_bot, num_embeddings)
+
+    # Test Loss
+    loss_val = model_bot.loss(
+        indices=bot_indices, 
+        upper_indices=mid_cond, 
+        second_upper_indices=top_cond, 
+        timing=timing
+    )
+    print(f"Bottom Prior Loss: {loss_val.item():.4f}")
+    assert not torch.isnan(loss_val)
+
+    # Test Generation
+    print("Testing Bottom Prior Generation...")
+    gen_tokens = model_bot.generate(
+        batch_size=batch_size,
+        upper_indices=mid_cond,
+        second_upper_indices=top_cond,
+        timing=timing,
+        seq_len=16, # Short gen for speed
+        temperature=0.8,
+        top_k=50
+    )
+    print(f"Generated tokens shape: {gen_tokens.shape}")
+    assert gen_tokens.shape == (batch_size, 16)
+
+    print("\n" + "="*40 + "\n")
     print("\nAll tests passed successfully!")
