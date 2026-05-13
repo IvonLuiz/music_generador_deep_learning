@@ -504,6 +504,8 @@ class TransformerPriorConditioned(nn.Module):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         device: Optional[torch.device] = None,
+        progress_label: Optional[str] = None,
+        progress_interval: int = 0,
     ) -> torch.Tensor:
         """!
         @brief Generates a sequence of token indices autoregressively given an initial input and optional conditioning.
@@ -517,6 +519,8 @@ class TransformerPriorConditioned(nn.Module):
         @param top_k Top-k filtering. If None or <= 0, no filtering is applied. Defaults to None.
         @param temperature Sampling temperature. Must be > 0. Defaults to 1.0.
         @param device Device to perform generation on. Defaults to model's device.
+        @param progress_label Optional label used for periodic generation progress prints.
+        @param progress_interval Print every N generated tokens when progress_label is set.
         @return Generated token indices (shape: [batch_size, seq_len]).
         """
         if temperature <= 0:
@@ -556,6 +560,9 @@ class TransformerPriorConditioned(nn.Module):
 
         if tokens.shape[1] > target_len:
             raise ValueError("start_tokens length cannot exceed requested seq_len")
+
+        progress_interval = max(0, int(progress_interval))
+        last_reported = max(0, tokens.shape[1] - bos_prefix_len)
 
         cached_conditioning_emb = None
         cached_second_conditioning_emb = None
@@ -604,6 +611,14 @@ class TransformerPriorConditioned(nn.Module):
             next_token = torch.multinomial(probs, num_samples=1)
             
             tokens = torch.cat([tokens, next_token], dim=1)
+            generated_len = tokens.shape[1] - bos_prefix_len
+            if (
+                progress_label
+                and progress_interval > 0
+                and (generated_len == seq_len or generated_len - last_reported >= progress_interval)
+            ):
+                print(f'{progress_label}: generated {generated_len}/{seq_len} tokens', flush=True)
+                last_reported = generated_len
 
         if bos_prefix_len > 0:
             tokens = tokens[:, bos_prefix_len:]
