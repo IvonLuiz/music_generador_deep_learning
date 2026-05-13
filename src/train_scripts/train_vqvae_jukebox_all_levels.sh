@@ -15,7 +15,7 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   fi
 fi
 
-DEFAULT_LEVELS=(bottom middle top)
+DEFAULT_LEVELS=(top middle bottom)
 LEVELS=("${DEFAULT_LEVELS[@]}")
 FORWARD_ARGS=()
 
