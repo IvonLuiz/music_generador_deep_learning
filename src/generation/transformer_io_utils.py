@@ -228,6 +228,27 @@ def save_level_spectrograms(
     return spectrogram_dir
 
 
+def save_indices_with_visualizations(indices: np.ndarray, save_dir: str, name: str, grid: Optional[list]) -> None:
+    path = os.path.join(save_dir, f'{name}_indices.npy')
+    np.save(path, indices)
+    print(f'Saved generated {name} indices to {path}')
+
+    if not (isinstance(grid, list) and len(grid) == 2 and int(grid[0]) * int(grid[1]) == indices.shape[1]):
+        return
+
+    time_steps, freq_bins = int(grid[0]), int(grid[1])
+    vis_dir = os.path.join(save_dir, 'visualizations', name)
+    os.makedirs(vis_dir, exist_ok=True)
+    for i in range(indices.shape[0]):
+        img = indices[i].reshape(time_steps, freq_bins).T
+        plt.figure(figsize=(5, 4))
+        plt.imshow(img, origin='lower', aspect='auto')
+        plt.colorbar()
+        plt.title(f'Generated {name.capitalize()} Codes {i}')
+        plt.savefig(os.path.join(vis_dir, f'sample_{i}.png'))
+        plt.close()
+
+
 def decode_jukebox_indices(
     vqvae,
     indices: torch.Tensor,
@@ -275,6 +296,68 @@ def decode_jukebox_indices(
             x_hat = vqvae.activation_layer(x_hat)
 
     return x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()         # (B, F, T, 1)
+
+
+def decode_jukebox_token_timeline(
+    vqvae,
+    tokens: torch.Tensor,
+    grid: Optional[list],
+    device: torch.device,
+    chunk_time_cols: Optional[int] = None,
+    context_cols: int = 0,
+    trim_frames: Optional[int] = None,
+) -> np.ndarray:
+    if (
+        chunk_time_cols is None
+        or not (isinstance(grid, list) and len(grid) == 2)
+        or int(grid[0]) <= chunk_time_cols
+    ):
+        decoded_specs = decode_jukebox_indices(vqvae, tokens, grid, device)
+        if trim_frames is not None:
+            decoded_specs = decoded_specs[:, :, :trim_frames, :]
+        return decoded_specs
+
+    total_time_cols, freq_bins = int(grid[0]), int(grid[1])
+    chunk_time_cols = max(1, int(chunk_time_cols))
+    context_cols = max(0, int(context_cols))
+    if context_cols:
+        print(
+            f'Decoding full timeline in {chunk_time_cols}-column chunks '
+            f'with {context_cols} context columns on each side.'
+        )
+
+    tokens_np = tokens.detach().cpu().numpy()
+    tokens_2d = tokens_np.reshape(tokens_np.shape[0], total_time_cols, freq_bins)
+    decoded_chunks = []
+
+    for start_col in range(0, total_time_cols, chunk_time_cols):
+        target_end_col = min(total_time_cols, start_col + chunk_time_cols)
+        ext_start_col = max(0, start_col - context_cols)
+        ext_end_col = min(total_time_cols, target_end_col + context_cols)
+        chunk_tokens = tokens_2d[:, ext_start_col:ext_end_col, :].reshape(tokens_np.shape[0], -1)
+        chunk_grid = [ext_end_col - ext_start_col, freq_bins]
+        chunk_tensor = torch.from_numpy(chunk_tokens).to(device)
+        decoded_chunk = decode_jukebox_indices(vqvae, chunk_tensor, chunk_grid, device)
+
+        decoded_cols = ext_end_col - ext_start_col
+        if decoded_cols <= 0 or decoded_chunk.shape[2] % decoded_cols != 0:
+            raise ValueError(
+                f'Cannot crop decoded chunk: decoded time frames={decoded_chunk.shape[2]}, '
+                f'token columns={decoded_cols}.'
+            )
+        frames_per_token_col = decoded_chunk.shape[2] // decoded_cols
+        crop_start = (start_col - ext_start_col) * frames_per_token_col
+        crop_end = crop_start + (target_end_col - start_col) * frames_per_token_col
+        decoded_chunks.append(decoded_chunk[:, :, crop_start:crop_end, :])
+
+        del chunk_tensor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    decoded_specs = np.concatenate(decoded_chunks, axis=2)
+    if trim_frames is not None:
+        decoded_specs = decoded_specs[:, :, :trim_frames, :]
+    return decoded_specs
 
 
 def save_decoded_spectrograms(specs: np.ndarray, save_dir: str) -> None:
