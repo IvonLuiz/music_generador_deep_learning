@@ -137,6 +137,45 @@ This follows a Jukebox-style cascade during training:
 - `config/config_pixelcnn.yaml`: single-level PixelCNN prior settings.
 - `config/config_pixelcnn_hierarchical.yaml`: hierarchical PixelCNN prior settings.
 
+## Tests
+
+### Jukebox priors
+To test only the bottom prior generation, we have a script that uses middle tokens directly from the VQ-VAE quantization of a real song, and then samples the bottom prior conditioned on the middle codes:
+
+```bash
+python3 src/test_scripts/test_bottom_prior_conditioned.py \
+  --bottom_prior ./models/transformer_prior/jukebox_maestro_bottom_transformer_prior/2026-05-05_23-31-48/ \
+  --data_root /home/ivon/code/datasets/processed/maestro_quantized_dataset_overlap50/ \
+  --bottom_vqvae models/jukebox_vq_vae/jukebox_vqvae_maestro_bottom/2026-04-26_22-26-06 \
+  --file MIDI-UNPROCESSED_01-03_R1_2014_MID--AUDIO_01_R1_2014_wav--1.wav \
+  --full_length
+```
+
+To do the same but add the middle and test it's quality, we have a script that the top tokens directly from the VQ-VAE quantization of a real song, and then samples the middle and bottom in this order conditioned on the top codes:
+
+```bash
+python3 src/test_scripts/test_middle_bottom_prior_conditioned.py  \
+  --bottom_prior ./models/transformer_prior/jukebox_maestro_bottom_transformer_prior/2026-05-05_23-31-48/ --middle_prior ./models/transformer_prior/jukebox_maestro_middle_transformer_prior/2026-05-09_02-11-32/  \
+  --data_root /home/ivon/code/datasets/processed/maestro_quantized_dataset_overlap50/ \
+  --bottom_vqvae models/jukebox_vq_vae/jukebox_vqvae_maestro_bottom/2026-04-26_22-26-06 \
+  --file MIDI-UNPROCESSED_01-03_R1_2014_MID--AUDIO_01_R1_2014_wav--1.wav \
+  --full_length
+```
+
+To test the full cascade of top + middle + bottom priors, we have a script that samples the top prior unconditionally, then samples the middle conditioned on the top, and finally samples the bottom conditioned on the middle:
+
+```bash
+python3 src/test_scripts/test_transformer_prior.py \
+  --top_prior models/transformer_prior/jukebox_maestro_top_transformer_prior/2026-05-04_09-35-13 \
+  --middle_prior models/transformer_prior/jukebox_maestro_middle_transformer_prior/2026-05-09_02-11-32/ \
+  --bottom_prior models/transformer_prior/jukebox_maestro_bottom_transformer_prior/2026-05-05_23-31-48/ \
+  --full_length \
+  --full_length_until bottom \
+  --decode_level bottom \
+  --full_length_overlap_fraction 0.5 \
+  --timing_duration_seconds 240
+```
+
 ## Project Status
 
 - [x] VAE (baseline)
