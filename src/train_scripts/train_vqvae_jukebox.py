@@ -17,7 +17,10 @@ from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from generation.generate import *
 from utils import set_global_seed, load_config, compute_dataset_variance, compute_small_sample_variance
 from datasets.spectrogram_dataset import LazySpectrogramDataset
-from train_scripts.train_vqvae_utils import train_vqvae_jukebox, split_train_val_paths
+from datasets.raw_audio_dataset import RawAudioWindowDataset, collate_audio_windows, list_audio_files
+from processing.gpu_audio_augmentation import GPUAudioToMelSpectrogram
+from train_scripts.train_vqvae_utils import train_vqvae_jukebox
+from train_scripts.jukebox_utils import split_paths_by_maestro_metadata
 from train_scripts.resume_utils import load_resume_artifacts
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -42,6 +45,13 @@ if __name__ == "__main__":
         choices=["bottom", "middle", "top"],
         default=None,
         help="Override config model.selected_level.",
+    )
+    parser.add_argument(
+        "--input-mode",
+        type=str,
+        choices=["spectrogram", "audio"],
+        default=None,
+        help="Override dataset.input_mode. 'audio' reads raw MAESTRO audio and builds mel spectrograms on GPU.",
     )
     args, unknown = parser.parse_known_args()
     if unknown:
@@ -70,7 +80,6 @@ if __name__ == "__main__":
     grad_accum_steps = train_cfg.get('gradient_accumulation_steps', 1)
     learning_rate = train_cfg.get('learning_rate')
     epochs = train_cfg.get('epochs')
-    validation_split = train_cfg.get('validation_split', 0.2)
     early_stopping_patience = train_cfg.get('early_stopping_patience', 20)
     num_workers = train_cfg.get('num_workers', 4)
     pin_memory = train_cfg.get('pin_memory', True)
@@ -81,8 +90,12 @@ if __name__ == "__main__":
 
     # Dataset and model paths
     dataset_cfg = config['dataset']
+    input_mode = str(args.input_mode or dataset_cfg.get('input_mode', 'spectrogram')).strip().lower()
+    if input_mode not in ('spectrogram', 'audio'):
+        raise ValueError("dataset.input_mode must be either 'spectrogram' or 'audio'")
+    raw_audio_path = dataset_cfg.get('raw_path')
     spectrograms_path = dataset_cfg['processed_path']
-    min_max_values_path = dataset_cfg['min_max_values_path']
+    min_max_values_path = dataset_cfg.get('min_max_values_path')
     sample_rate = int(dataset_cfg.get('sample_rate', 22050))
     hop_length = int(dataset_cfg.get('hop_length', 256))
     frame_size = int(dataset_cfg.get('frame_size', 512))
@@ -125,7 +138,7 @@ if __name__ == "__main__":
     print(f"Training parameters: batch_size={batch_size}, grad_accum_steps={grad_accum_steps}, learning_rate={learning_rate}, epochs={epochs}, early_stopping_patience={early_stopping_patience}")
     print(f"Reproducibility seed: {seed}")
     print(f"Data loading parameters: num_workers={num_workers}, pin_memory={pin_memory}, persist_workers={persist_workers}, prefetch_factor={prefetch_factor}")
-    print(f"Dataset target_time_frames={target_time_frames}, validation_split={validation_split}")
+    print(f"Dataset target_time_frames={target_time_frames}, input_mode={input_mode}, split_source=maestro_metadata")
     print(f"Audio inversion settings: spectrogram_type={spectrogram_type}, sample_rate={sample_rate}, hop_length={hop_length}, frame_size={frame_size}, n_mels={n_mels}")
 
     # structure: model_save_dir / formatted_time / model.pth
@@ -163,36 +176,121 @@ if __name__ == "__main__":
     with open(config_file_path, 'w') as f:
         yaml.dump(config_to_save, f)
     
-    # --- LAZY LOADING IMPLEMENTATION ---
-    print(f"Scanning for spectrogram files in {spectrograms_path}...")
-    all_file_paths = glob.glob(os.path.join(spectrograms_path, "**/*.npy"), recursive=True)
-    all_file_paths = sorted(all_file_paths)
-    
-    if not all_file_paths:
-        raise FileNotFoundError(f"No .npy files found in {spectrograms_path}")
-    
-    print(f"Found {len(all_file_paths)} files. Creating lazy datasets...")
+    batch_preprocessor = None
+    data_collate_fn = None
+    min_max_values = None
+    data_variance = None
+    data_variance_samples = int(train_cfg.get('data_variance_samples', 1000))
 
-    # Data variance calculation
-    samples = 1000
-    data_variance = compute_small_sample_variance(all_file_paths, samples=samples)
-    print(f"Computed small sample variance ({samples} samples): {data_variance:.6f}")
-    gc.collect()
+    if input_mode == 'spectrogram':
+        print(f"Scanning for spectrogram files in {spectrograms_path}...")
+        all_file_paths = glob.glob(os.path.join(spectrograms_path, "**/*.npy"), recursive=True)
+        all_file_paths = sorted(all_file_paths)
 
-    train_file_paths, val_file_paths = split_train_val_paths(
-        all_file_paths=all_file_paths,
-        dataset_cfg=dataset_cfg,
-        validation_split=validation_split,
-        target_time_frames=target_time_frames,
-        seed=seed,
-    )
-    x_train = LazySpectrogramDataset(train_file_paths, target_time_frames=target_time_frames)
-    x_val = LazySpectrogramDataset(val_file_paths, target_time_frames=target_time_frames)
-    print(f"Data split samples: {len(x_train)} training, {len(x_val)} validation.")
+        if not all_file_paths:
+            raise FileNotFoundError(f"No .npy files found in {spectrograms_path}")
 
-    # Load min_max_values
-    with open(min_max_values_path, "rb") as f:
-        min_max_values = pickle.load(f)
+        print(f"Found {len(all_file_paths)} files. Creating lazy datasets...")
+        train_file_paths, val_file_paths, test_file_paths = split_paths_by_maestro_metadata(all_file_paths, dataset_cfg)
+
+        data_variance = compute_small_sample_variance(train_file_paths, samples=data_variance_samples)
+        print(f"Computed train-set sample variance ({data_variance_samples} samples max): {data_variance:.6f}")
+        gc.collect()
+
+        x_train = LazySpectrogramDataset(
+            train_file_paths,
+            target_time_frames=target_time_frames,
+            crop_strategy="random",
+        )
+        x_val = LazySpectrogramDataset(
+            val_file_paths,
+            target_time_frames=target_time_frames,
+            crop_strategy="non_overlapping",
+        )
+
+        if not min_max_values_path:
+            raise ValueError("dataset.min_max_values_path is required for spectrogram input mode.")
+        with open(min_max_values_path, "rb") as f:
+            min_max_values = pickle.load(f)
+
+    else:
+        if not raw_audio_path:
+            raise ValueError("dataset.raw_path is required for audio input mode.")
+
+        audio_cfg = dataset_cfg.get('audio', {})
+        print(f"Scanning for raw audio files in {raw_audio_path}...")
+        all_file_paths = list_audio_files(raw_audio_path, extensions=audio_cfg.get('extensions'))
+        if not all_file_paths:
+            raise FileNotFoundError(f"No audio files found in {raw_audio_path}")
+        print(f"Found {len(all_file_paths)} audio files. Creating raw-audio datasets...")
+
+        train_file_paths, val_file_paths, test_file_paths = split_paths_by_maestro_metadata(all_file_paths, dataset_cfg)
+
+        examples_by_level = audio_cfg.get('examples_per_file_by_level', {})
+        examples_per_file = int(examples_by_level.get(selected_level, audio_cfg.get('examples_per_file', 1)))
+
+        downmix_cfg = audio_cfg.get('downmix', {})
+        pitch_cfg = audio_cfg.get('pitch_shift', {})
+        pitch_enabled = bool(pitch_cfg.get('enabled', True))
+        pitch_choices = pitch_cfg.get('semitone_choices')
+        pitch_range = pitch_cfg.get('semitone_range', [-2.0, 2.0])
+        if pitch_choices:
+            pitch_range = [min(pitch_choices), max(pitch_choices)]
+        if not pitch_enabled:
+            pitch_range = [0.0, 0.0]
+
+        target_num_samples = max(1, (target_time_frames - 1) * hop_length)
+        x_train = RawAudioWindowDataset(
+            train_file_paths,
+            target_sample_rate=sample_rate,
+            target_num_samples=target_num_samples,
+            min_pitch_shift_semitones=float(pitch_range[0]),
+            max_pitch_shift_semitones=float(pitch_range[1]),
+            examples_per_file=examples_per_file,
+            crop_strategy="random",
+        )
+        x_val = RawAudioWindowDataset(
+            val_file_paths,
+            target_sample_rate=sample_rate,
+            target_num_samples=target_num_samples,
+            min_pitch_shift_semitones=0.0,
+            max_pitch_shift_semitones=0.0,
+            examples_per_file=1,
+            crop_strategy="non_overlapping",
+        )
+
+        downmix_weight_range = downmix_cfg.get('weight_range', [0.0, 1.0])
+        batch_preprocessor = GPUAudioToMelSpectrogram(
+            sample_rate=sample_rate,
+            target_time_frames=target_time_frames,
+            n_fft=frame_size,
+            hop_length=hop_length,
+            n_mels=n_mels,
+            random_downmix=bool(downmix_cfg.get('enabled', True)),
+            downmix_weight_min=float(downmix_weight_range[0]),
+            downmix_weight_max=float(downmix_weight_range[1]),
+            pitch_shift_enabled=pitch_enabled,
+            min_pitch_shift_semitones=float(pitch_range[0]),
+            max_pitch_shift_semitones=float(pitch_range[1]),
+            pitch_shift_choices=pitch_choices,
+            resample_lowpass_filter_width=int(audio_cfg.get('resample_lowpass_filter_width', 64)),
+            resample_chunk_size=int(audio_cfg.get('resample_chunk_size', 8192)),
+            max_torchaudio_resample_factor=int(audio_cfg.get('max_torchaudio_resample_factor', 256)),
+        )
+        data_collate_fn = collate_audio_windows
+        data_variance = None
+        min_max_values = {}
+        print(
+            "Raw audio augmentation: "
+            f"examples_per_file={examples_per_file}, "
+            f"target_num_samples={target_num_samples}, "
+            f"downmix={bool(downmix_cfg.get('enabled', True))}, "
+            f"pitch_enabled={pitch_enabled}, "
+            f"pitch_choices={pitch_choices if pitch_choices else 'continuous'}, "
+            f"pitch_range={pitch_range}"
+        )
+
+    print(f"Data split samples/windows: {len(x_train)} training, {len(x_val)} validation.")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     activation_name = str(model_cfg.get('activation', '')).lower()
@@ -248,6 +346,9 @@ if __name__ == "__main__":
         hop_length=hop_length,
         frame_size=frame_size,
         n_mels=n_mels,
+        batch_preprocessor=batch_preprocessor,
+        collate_fn=data_collate_fn,
+        data_variance_samples=data_variance_samples,
     )
 
     best_model_path = os.path.join(run_dir, 'best_model.pth')
