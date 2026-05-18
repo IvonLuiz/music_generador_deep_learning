@@ -25,6 +25,84 @@ from callbacks import EarlyStopping, ModelCheckpoint, LossPlotter, SampleGenerat
 EXPECTED_VQ_LEVELS = 2
 
 
+def _move_batch_to_device(batch, device: torch.device):
+    if torch.is_tensor(batch):
+        return batch.to(device, non_blocking=True)
+    if isinstance(batch, dict):
+        return {
+            key: _move_batch_to_device(value, device) if torch.is_tensor(value) else value
+            for key, value in batch.items()
+        }
+    if isinstance(batch, tuple):
+        return tuple(_move_batch_to_device(value, device) for value in batch)
+    if isinstance(batch, list):
+        return [_move_batch_to_device(value, device) for value in batch]
+    return batch
+
+
+def _prepare_model_batch(batch, device: torch.device, batch_preprocessor=None, augment: bool = False):
+    batch = _move_batch_to_device(batch, device)
+    if batch_preprocessor is not None:
+        batch = batch_preprocessor(batch, augment=augment)
+    return batch
+
+
+def _collect_preprocessed_callback_samples(dataset, batch_preprocessor, collate_fn, device: torch.device, sample_count: int = 4):
+    sample_count = min(sample_count, len(dataset))
+    if sample_count <= 0:
+        return np.empty((0, 0, 0, 1), dtype=np.float32), []
+    if collate_fn is None:
+        raise ValueError("A collate_fn is required when collecting preprocessed callback samples.")
+
+    raw_items = [dataset[i] for i in range(sample_count)]
+    batch = collate_fn(raw_items)
+    batch = _move_batch_to_device(batch, device)
+    was_training = batch_preprocessor.training
+    batch_preprocessor.eval()
+    with torch.no_grad():
+        output = batch_preprocessor(batch, augment=False, return_min_max=True)
+    if was_training:
+        batch_preprocessor.train()
+    samples, sample_min_max = output
+    samples = samples.detach().cpu().permute(0, 2, 3, 1).numpy()
+    return samples, sample_min_max
+
+
+def _estimate_preprocessed_variance(
+    dataloader,
+    batch_preprocessor,
+    device: torch.device,
+    max_samples: int = 1000,
+) -> float:
+    if max_samples < 1:
+        raise ValueError(f"max_samples must be >= 1, got {max_samples}")
+    was_training = batch_preprocessor.training
+    batch_preprocessor.eval()
+    values = []
+    total_samples = 0
+    with torch.no_grad():
+        for raw_batch in tqdm(dataloader, desc="Estimating transformed data variance"):
+            batch = _prepare_model_batch(raw_batch, device, batch_preprocessor, augment=False)
+            if not torch.isfinite(batch).all():
+                continue
+            remaining = max_samples - total_samples
+            if remaining <= 0:
+                break
+            batch = batch[:remaining]
+            values.append(batch.detach().float().cpu().reshape(batch.shape[0], -1))
+            total_samples += batch.shape[0]
+            if total_samples >= max_samples:
+                break
+    if was_training:
+        batch_preprocessor.train()
+    if not values:
+        raise ValueError("Could not estimate data variance: no finite preprocessed batches were found.")
+    flattened = torch.cat(values, dim=0)
+    variance = float(torch.var(flattened, unbiased=False).item())
+    print(f"Estimated transformed data variance ({total_samples} samples max): {variance:.6f}")
+    return max(variance, 1e-12)
+
+
 def _split_two_level_vq_losses(vq_losses_details, context: str):
     if len(vq_losses_details) != EXPECTED_VQ_LEVELS:
         raise ValueError(
@@ -394,6 +472,9 @@ def train_vqvae_jukebox(
     hop_length: int = HOP_LENGTH,
     frame_size: int = FRAME_SIZE,
     n_mels: int = 256,
+    batch_preprocessor: Optional[torch.nn.Module] = None,
+    collate_fn=None,
+    data_variance_samples: int = 1000,
 ):
     """
     Train a Jukebox VQ-VAE model.
@@ -420,6 +501,8 @@ def train_vqvae_jukebox(
         prefetch_factor (int, optional): Number of batches to prefetch. Defaults to 4.
     """
     model.to(device)
+    if batch_preprocessor is not None:
+        batch_preprocessor.to(device)
     
     # Setup Validation Data
     early_stopping = None
@@ -457,6 +540,7 @@ def train_vqvae_jukebox(
                 val_dataset = SpectrogramDataset(x_val)
                 val_dataloader = DataLoader(
                     val_dataset, batch_size=batch_size, shuffle=False,
+                    collate_fn=collate_fn,
                     **_loader_kwargs(),
                 )
                 early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True, best_score=initial_best_score, counter=historical_counter)
@@ -466,6 +550,7 @@ def train_vqvae_jukebox(
             val_dataset = x_val
             val_dataloader = DataLoader(
                 val_dataset, batch_size=batch_size, shuffle=False,
+                collate_fn=collate_fn,
                 **_loader_kwargs(),
             )
             early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True, best_score=initial_best_score, counter=historical_counter)
@@ -480,8 +565,19 @@ def train_vqvae_jukebox(
         
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True,
+        collate_fn=collate_fn,
         **_loader_kwargs(),
     )
+
+    if data_variance is None:
+        if batch_preprocessor is None:
+            raise ValueError("data_variance can only be None when a batch_preprocessor is provided.")
+        data_variance = _estimate_preprocessed_variance(
+            dataloader,
+            batch_preprocessor,
+            device,
+            max_samples=int(data_variance_samples),
+        )
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner for potential speedup
@@ -501,9 +597,10 @@ def train_vqvae_jukebox(
             optimizer.load_state_dict(checkpoint['optimizer_state'])
 
         if 'epoch' in checkpoint:
-            start_epoch = int(checkpoint['epoch'])
+            completed_epoch = int(checkpoint['epoch'])
+            start_epoch = completed_epoch + 1
             print(f"Resumed training from checkpoint: {resume_checkpoint_path}")
-            print(f"Starting from epoch index {start_epoch}.")
+            print(f"Checkpoint completed epoch index {completed_epoch}. Starting from epoch index {start_epoch}.")
         else:
             start_epoch = len(resume_history.get('val_total', []) if resume_history else [])
             print(f"Checkpoint did not contain an epoch key. Inferred start_epoch {start_epoch} from history.")
@@ -528,44 +625,61 @@ def train_vqvae_jukebox(
             loss_plotter.set_history(resume_history)
         
         # Prepare samples for visualization
-        if val_dataloader:
-            if isinstance(val_dataset, Dataset):
-                # Fetch samples from dataset and convert to numpy (N, H, W, 1)
-                samples = []
-                for i in range(4):
-                    # Dataset returns (1, H, W) tensor
-                    s = val_dataset[i]
-                    s = s.permute(1, 2, 0).numpy() # (H, W, 1)
-                    samples.append(s)
-                samples = np.stack(samples)
-            else:
-                samples = x_val[:4]
-            sample_paths = val_file_paths[:4] if val_file_paths else None
+        sample_source_dataset = val_dataset if val_dataloader else dataset
+        sample_source_paths = val_file_paths if val_dataloader else train_file_paths
+        if batch_preprocessor is not None:
+            samples, sample_min_max = _collect_preprocessed_callback_samples(
+                sample_source_dataset,
+                batch_preprocessor,
+                collate_fn,
+                device,
+                sample_count=4,
+            )
+            sample_paths = [
+                sample_source_dataset.path_for_index(i)
+                if hasattr(sample_source_dataset, "path_for_index")
+                else sample_source_paths[i]
+                for i in range(min(4, len(sample_source_dataset)))
+            ] if sample_source_paths else None
         else:
-            if isinstance(dataset, Dataset):
-                samples = []
-                for i in range(4):
-                    s = dataset[i]
-                    s = s.permute(1, 2, 0).numpy()
-                    samples.append(s)
-                samples = np.stack(samples)
+            if val_dataloader:
+                if isinstance(val_dataset, Dataset):
+                    # Fetch samples from dataset and convert to numpy (N, H, W, 1)
+                    samples = []
+                    for i in range(4):
+                        # Dataset returns (1, H, W) tensor
+                        s = val_dataset[i]
+                        s = s.permute(1, 2, 0).numpy() # (H, W, 1)
+                        samples.append(s)
+                    samples = np.stack(samples)
+                else:
+                    samples = x_val[:4]
+                sample_paths = val_file_paths[:4] if val_file_paths else None
             else:
-                samples = x_train[:4]
-            sample_paths = train_file_paths[:4] if train_file_paths else None
+                if isinstance(dataset, Dataset):
+                    samples = []
+                    for i in range(4):
+                        s = dataset[i]
+                        s = s.permute(1, 2, 0).numpy()
+                        samples.append(s)
+                    samples = np.stack(samples)
+                else:
+                    samples = x_train[:4]
+                sample_paths = train_file_paths[:4] if train_file_paths else None
 
-        sample_min_max = []
-        if sample_paths and len(sample_paths) > 0:
-            spectrograms_dir = os.path.dirname(sample_paths[0])
-            for fp in sample_paths:
-                mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
-                if mm is None:
-                    print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
-                    mm = {"min": 0.0, "max": 1.0}
-                sample_min_max.append(mm)
-        else:
-            # HDF5 workflows may not have original file paths.
-            sample_min_max = [{"min": 0.0, "max": 1.0} for _ in range(len(samples))]
-            print("Info: sample file paths are unavailable; using default min/max [0, 1] for sample generation.")
+            sample_min_max = []
+            if sample_paths and len(sample_paths) > 0 and min_max_values:
+                spectrograms_dir = os.path.dirname(sample_paths[0])
+                for fp in sample_paths:
+                    mm = find_min_max_for_path(fp, min_max_values, spectrograms_dir)
+                    if mm is None:
+                        print(f"Warning: Could not find min/max for {fp}. Using default 0-1.")
+                        mm = {"min": 0.0, "max": 1.0}
+                    sample_min_max.append(mm)
+            else:
+                # HDF5 workflows may not have original file paths.
+                sample_min_max = [{"min": 0.0, "max": 1.0} for _ in range(len(samples))]
+                print("Info: sample file paths are unavailable; using default min/max [0, 1] for sample generation.")
             
         sample_generator = SampleGenerator(
             model,
@@ -604,7 +718,7 @@ def train_vqvae_jukebox(
         skipped_non_finite_batches = 0
         
         for i, batch in enumerate(progress_bar):
-            batch = batch.to(device)
+            batch = _prepare_model_batch(batch, device, batch_preprocessor, augment=True)
 
             if not torch.isfinite(batch).all():
                 skipped_non_finite_batches += 1
@@ -687,7 +801,7 @@ def train_vqvae_jukebox(
             
             with torch.no_grad():
                 for batch in tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
-                    batch = batch.to(device)
+                    batch = _prepare_model_batch(batch, device, batch_preprocessor, augment=False)
 
                     if not torch.isfinite(batch).all():
                         skipped_non_finite_val_batches += 1
