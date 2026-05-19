@@ -1,0 +1,106 @@
+dataset:
+  audio:
+    downmix:
+      enabled: true
+      weight_range:
+      - 0.0
+      - 1.0
+    examples_per_file: 1
+    examples_per_file_by_level:
+      bottom: 128
+      middle: 32
+      top: 8
+    max_torchaudio_resample_factor: 256
+    pitch_shift:
+      enabled: true
+      semitone_choices:
+      - -3
+      - -2
+      - -1
+      - 0
+      - 1
+      - 2
+      - 3
+      semitone_range:
+      - -2.0
+      - 2.0
+    resample_chunk_size: 8192
+    resample_lowpass_filter_width: 64
+  frame_size: 2048
+  hop_length: 256
+  input_mode: audio
+  metadata_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/maestro-v3.0.0.csv
+  min_max_values_path: /home/ivon/code/datasets/processed/maestro/min_max_values/min_max_values.pkl
+  n_mels: 256
+  processed_path: /home/ivon/code/datasets/processed/maestro/
+  raw_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/
+  sample_rate: 22050
+  spectrogram_type: mel
+  target_time_frames: 2048
+model:
+  activation: sigmoid
+  beta: 0.1
+  channel_growth: 1
+  conv_type: 2
+  dilation_growth_rate: 3
+  ema_decay: 0.99
+  embedding_dim: 128
+  epsilon: 1e-5
+  input_channels: 1
+  level_profiles:
+    bottom:
+      hidden_dim: 64
+      levels: 3
+      num_residual_layers: 8
+      target_time_frames: 128
+    middle:
+      hidden_dim: 64
+      levels: 4
+      num_residual_layers: 4
+      target_time_frames: 512
+    top:
+      hidden_dim: 64
+      levels: 5
+      num_residual_layers: 4
+      target_time_frames: 2048
+  name: jukebox_vqvae_maestro
+  num_embeddings: 2048
+  restart_threshold: 1.0
+  selected_level: bottom
+testing:
+  specific_run_dir: null
+  weights_file_choice: best_model.pth
+training:
+  bottom:
+    batch_size: 64
+    early_stopping_patience: 40
+    epochs: 1000
+    gradient_accumulation_steps: 4
+    learning_rate: 0.0002
+    pretrained_weights_path: ''
+    retrain: false
+  data_variance_samples: 1000
+  middle:
+    batch_size: 16
+    early_stopping_patience: 40
+    epochs: 1000
+    gradient_accumulation_steps: 16
+    learning_rate: 0.0002
+    pretrained_weights_path: ''
+    retrain: false
+  num_workers: 12
+  persist_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  pretrained_weights_path: ''
+  retrain: false
+  save_dir: ./models/jukebox_vq_vae/
+  seed: 42
+  top:
+    batch_size: 8
+    early_stopping_patience: 40
+    epochs: 1000
+    gradient_accumulation_steps: 32
+    learning_rate: 0.0002
+    pretrained_weights_path: models/jukebox_vq_vae/jukebox_vqvae_maestro_top/2026-05-13_14-49-09/model.pth
+    retrain: true
