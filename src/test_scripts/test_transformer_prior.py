@@ -244,6 +244,12 @@ def load_transformer_prior(
         num_embeddings = inferred_num_embeddings
 
     use_bos_token = bool(prior_cfg.get('use_bos_token', False))
+    use_start_embedding = bool(
+        prior_cfg.get(
+            'use_start_embedding',
+            model_cfg.get('use_start_embedding', 'start_embedding' in state_dict),
+        )
+    )
     token_embedding_weight = state_dict.get('token_embedding.weight')
     if token_embedding_weight is None:
         token_embedding_weight = state_dict.get('token_embedding.weight_orig')
@@ -257,8 +263,14 @@ def load_transformer_prior(
         output_vocab = int(to_logits_weight.shape[0])
         if token_vocab == output_vocab + 1:
             use_bos_token = True
+            use_start_embedding = False
         elif token_vocab == output_vocab:
             use_bos_token = False
+
+    if use_bos_token and use_start_embedding:
+        raise ValueError(
+            f'{model_path} requests both use_bos_token and use_start_embedding; choose one start-token mode.'
+        )
 
     max_time_steps_cfg = int(prior_cfg.get('max_time_steps', 0))
     max_time_steps = max_time_steps_cfg if max_time_steps_cfg > 0 else 100
@@ -436,6 +448,7 @@ def load_transformer_prior(
         conditioner_dilation_growth_rate=conditioner_dilation_growth_rate,
         conditioner_dilation_cycle=conditioner_dilation_cycle,
         use_bos_token=use_bos_token,
+        use_start_embedding=use_start_embedding,
         use_timing_conditioning=use_timing_conditioning,
         timing_num_bins=int(prior_cfg.get('timing_num_bins', 1024)),
         duration_num_bins=int(prior_cfg.get('duration_num_bins', 256)),
