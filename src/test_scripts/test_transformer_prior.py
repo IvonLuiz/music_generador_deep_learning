@@ -89,6 +89,11 @@ def _stride_product(value) -> int:
         return int(value[0]) * int(value[1])
     return int(value)
 
+def _optional_float(value):
+    if value is None:
+        return None
+    return float(value)
+
 def _parse_stride(value, use_2d: bool):
     if value is None:
         return None
@@ -271,6 +276,12 @@ def load_transformer_prior(
         raise ValueError(
             f'{model_path} requests both use_bos_token and use_start_embedding; choose one start-token mode.'
         )
+    tie_input_output_embeddings = bool(
+        prior_cfg.get(
+            'tie_input_output_embeddings',
+            model_cfg.get('tie_input_output_embeddings', False),
+        )
+    )
 
     max_time_steps_cfg = int(prior_cfg.get('max_time_steps', 0))
     max_time_steps = max_time_steps_cfg if max_time_steps_cfg > 0 else 100
@@ -449,6 +460,7 @@ def load_transformer_prior(
         conditioner_dilation_cycle=conditioner_dilation_cycle,
         use_bos_token=use_bos_token,
         use_start_embedding=use_start_embedding,
+        tie_input_output_embeddings=tie_input_output_embeddings,
         use_timing_conditioning=use_timing_conditioning,
         timing_num_bins=int(prior_cfg.get('timing_num_bins', 1024)),
         duration_num_bins=int(prior_cfg.get('duration_num_bins', 256)),
@@ -459,6 +471,13 @@ def load_transformer_prior(
         use_2d_conditioner=use_2d_conditioner,
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
         dropout=float(prior_cfg.get('dropout', 0.1)),
+        initialization_std=_optional_float(
+            prior_cfg.get('initialization_std', model_cfg.get('initialization_std'))
+        ),
+        position_embedding_init_std=_optional_float(
+            prior_cfg.get('position_embedding_init_std', model_cfg.get('position_embedding_init_std'))
+        ),
+        zero_init_biases=bool(prior_cfg.get('zero_init_biases', model_cfg.get('zero_init_biases', True))),
     ).to(device)
 
     load_state = dict(state_dict)

@@ -55,14 +55,10 @@ def _get_prior_cfg(config: dict, name: str) -> dict:
     return config[name]
 
 
-def _compute_stride(lower_len: int, upper_len: int, level_name: str) -> int:
-    if upper_len <= 0:
-        raise ValueError(f'Invalid upper sequence length for {level_name}: {upper_len}')
-    if lower_len % upper_len != 0:
-        raise ValueError(
-            f'Cannot infer upsample_stride for {level_name}: lower_len={lower_len}, upper_len={upper_len}'
-        )
-    return lower_len // upper_len
+def _optional_float(value):
+    if value is None:
+        return None
+    return float(value)
 
 
 def _tensor_grid_shape(name: str, tensor: torch.Tensor) -> Tuple[int, int]:
@@ -146,48 +142,11 @@ def _loader_kwargs(num_workers: int, pin_memory: bool, persist_workers: bool, pr
     return kwargs
 
 
-def _normalize_train_window_parity_mode(mode: str) -> str:
-    mode = str(mode or 'all').strip().lower()
-    aliases = {
-        'none': 'all',
-        'full': 'all',
-        'both': 'all',
-        'random': 'random_global',
-        'random_parity': 'random_global',
-        'per_song': 'random_per_song',
-    }
-    mode = aliases.get(mode, mode)
-    allowed = {'all', 'alternate', 'random_global', 'random_per_song'}
-    if mode not in allowed:
-        raise ValueError(f"train_window_parity_mode must be one of {sorted(allowed)}, got {mode!r}")
-    return mode
-
-
-def _normalize_validation_window_parity(parity: str) -> str:
-    parity = str(parity or 'even').strip().lower()
-    aliases = {
-        'none': 'all',
-        'full': 'all',
-        'both': 'all',
-        'non_overlapping': 'even',
-        'non-overlapping': 'even',
-        'fixed': 'even',
-        'first': 'even',
-    }
-    parity = aliases.get(parity, parity)
-    if parity not in {'all', 'even', 'odd'}:
-        raise ValueError(f"validation_window_parity must be all/even/odd, got {parity!r}")
-    return parity
-
-
 def _select_global_train_parity(mode: str, epoch: int, seed: int) -> str:
     if mode == 'all':
         return 'all'
     if mode == 'alternate':
         return 'even' if epoch % 2 == 0 else 'odd'
-    if mode == 'random_global':
-        rng = np.random.default_rng(seed + epoch)
-        return 'even' if int(rng.integers(0, 2)) == 0 else 'odd'
     if mode == 'random_per_song':
         return 'random_per_song'
     raise ValueError(f"Unsupported train window parity mode: {mode}")
@@ -205,7 +164,7 @@ def _indices_for_train_epoch(dataset, mode: str, epoch: int, seed: int) -> Tuple
 def _max_train_examples_per_epoch(dataset, mode: str, seed: int) -> int:
     if mode == 'all' or not hasattr(dataset, 'indices_for_window_parity'):
         return len(dataset)
-    if mode in {'alternate', 'random_global', 'random_per_song'}:
+    if mode in {'alternate', 'random_per_song'}:
         return max(
             len(dataset.indices_for_window_parity('even')),
             len(dataset.indices_for_window_parity('odd')),
@@ -219,7 +178,7 @@ class WindowParityEpochSampler(Sampler):
 
     def __init__(self, dataset, mode: str, seed: int):
         self.dataset = dataset
-        self.mode = _normalize_train_window_parity_mode(mode)
+        self.mode = mode
         self.seed = int(seed)
         self.epoch = 0
         self.current_parity = 'all'
@@ -271,13 +230,10 @@ def train_transformer_prior(
     quantized_data_path = dataset_cfg.get('quantized_data_path', './data/processed/maestro_quantized/')
     sample_rate = int(dataset_cfg.get('sample_rate', 22050))
     hop_length = int(dataset_cfg.get('hop_length', 256))
-    segment_overlap = float(dataset_cfg.get('segment_overlap', 0.0))
-    train_window_parity_mode = _normalize_train_window_parity_mode(
-        dataset_cfg.get('train_window_parity_mode', 'alternate')
-    )
-    validation_window_parity = _normalize_validation_window_parity(
-        dataset_cfg.get('validation_window_parity', 'even')
-    )
+    train_window_parity_mode = dataset_cfg.get('train_window_parity_mode', 'alternate')
+    validation_window_parity = dataset_cfg.get('validation_window_parity', 'even')
+    if validation_window_parity not in {'all', 'even', 'odd'}:
+        raise ValueError(f"validation_window_parity must be all/even/odd, got {validation_window_parity!r}")
 
     # Codebook size: use explicit config value or sensible default (Jukebox uses 2048)
     vqvae_codebook_size = int(vqvae_cfg.get('codebook_size', 2048))
@@ -301,6 +257,7 @@ def train_transformer_prior(
     )
 
     # Load precomputed quantized dataset
+    ## training
     print(f"--- Loading Precomputed Quantized Dataset for {selected_level} ---")
     train_dataset = JukeboxQuantizedDataset(
         quantized_path=quantized_data_path,
@@ -331,6 +288,7 @@ def train_transformer_prior(
         sampler=train_sampler,
         **_loader_kwargs(num_workers, pin_memory, persist_workers, prefetch_factor),
     )
+    ## validation
     val_loader = None
     if val_file_paths:
         print(f"--- Loading Precomputed Validation Dataset for {selected_level} ---")
@@ -359,12 +317,7 @@ def train_transformer_prior(
     else:
         print(f"No validation dataset configured for {selected_level}; training will use {len(train_dataset)} examples only.")
 
-    # Use explicit codebook size (not inferred from data, which may have smaller max token)
-    num_embeddings_map = {
-        'top': vqvae_codebook_size,
-        'middle': vqvae_codebook_size,
-        'bottom': vqvae_codebook_size,
-    }
+    # Use explicit codebook size
     print(f"Using codebook size: {vqvae_codebook_size}")
 
     sample = train_dataset[0]
@@ -438,13 +391,10 @@ def train_transformer_prior(
 
     is_upsampler = cond_level is not None
     upsample_stride = None
-    cond_num_embeddings = None
     cond_block_len = None
     second_upsample_stride = None
-    second_cond_num_embeddings = None
     second_cond_block_len = None
     if is_upsampler:
-        cond_num_embeddings = num_embeddings_map[cond_level]
         upsample_stride, cond_block_len = _compute_2d_stride_from_tensors(
             target_indices,
             cond_indices_sample,
@@ -452,7 +402,6 @@ def train_transformer_prior(
         )
         print(f"Primary 2D conditioner stride for {cond_level}->{selected_level}: {upsample_stride}")
     if condition_on_top and second_cond_level is not None:
-        second_cond_num_embeddings = num_embeddings_map[second_cond_level]
         second_upsample_stride, second_cond_block_len = _compute_2d_stride_from_tensors(
             target_indices,
             second_cond_indices_sample,
@@ -463,7 +412,7 @@ def train_transformer_prior(
     max_time_steps = int(prior_cfg.get('max_time_steps', 500))
 
     prior = TransformerPriorConditioned(
-        num_embeddings=num_embeddings_map[selected_level],
+        num_embeddings=vqvae_codebook_size,
         model_dim=int(prior_cfg['model_dim']),
         num_heads=int(prior_cfg['num_heads']),
         num_layers=int(prior_cfg['num_layers']),
@@ -472,10 +421,10 @@ def train_transformer_prior(
         block_len=int(prior_cfg.get('block_len', 16)),
         max_time_steps=max_time_steps,
         is_upsampler=is_upsampler,
-        cond_num_embeddings=cond_num_embeddings,
+        cond_num_embeddings=vqvae_codebook_size,
         cond_block_len=cond_block_len,
         upsample_stride=upsample_stride,
-        second_cond_num_embeddings=second_cond_num_embeddings,
+        second_cond_num_embeddings=vqvae_codebook_size,
         second_cond_block_len=second_cond_block_len,
         second_upsample_stride=second_upsample_stride,
         conditioner_residual_block_width=int(prior_cfg.get('conditioner_residual_block_width', 1024)),
@@ -497,11 +446,21 @@ def train_transformer_prior(
         timing_embedding_init_std=float(prior_cfg.get('timing_embedding_init_std', 0.02)),
         timing_embedding_scale=float(prior_cfg.get('timing_embedding_scale', 1.0)),
         use_2d_conditioner=bool(prior_cfg.get('use_2d_conditioner', True)),
+        initialization_std=_optional_float(prior_cfg.get('initialization_std')),
+        position_embedding_init_std=_optional_float(prior_cfg.get('position_embedding_init_std')),
+        zero_init_biases=bool(prior_cfg.get('zero_init_biases', True)),
     ).to(device)
     print(
         f"Timing conditioning: {'enabled' if prior.use_timing_conditioning else 'disabled'} "
         f"(learned absolute/relative/duration embeddings)"
     )
+    if prior.initialization_std is not None:
+        print(
+            "Jukebox-style initialization: "
+            f"weights/std={prior.initialization_std:g}, "
+            f"position/std={(prior.position_embedding_init_std or 2.0 * prior.initialization_std):g}, "
+            f"zero_biases={prior.zero_init_biases}"
+        )
 
     retrain = bool(train_cfg.get('retrain', False))
     pretrained_weights_path = train_cfg.get('pretrained_weights_path')
@@ -680,6 +639,11 @@ def train_transformer_prior(
     config_to_save['model']['use_bos_token'] = bool(prior_cfg.get('use_bos_token', False))
     config_to_save['model']['use_start_embedding'] = bool(prior_cfg.get('use_start_embedding', False))
     config_to_save['model']['tie_input_output_embeddings'] = bool(prior_cfg.get('tie_input_output_embeddings', False))
+    config_to_save['model']['initialization_std'] = _optional_float(prior_cfg.get('initialization_std'))
+    config_to_save['model']['position_embedding_init_std'] = _optional_float(
+        prior_cfg.get('position_embedding_init_std')
+    )
+    config_to_save['model']['zero_init_biases'] = bool(prior_cfg.get('zero_init_biases', True))
     config_to_save['model']['use_timing_conditioning'] = bool(prior_cfg.get('use_timing_conditioning', True))
     config_to_save['model']['use_2d_conditioner'] = bool(prior_cfg.get('use_2d_conditioner', True))
     config_to_save['model']['timing_window_seconds'] = float(
