@@ -488,6 +488,7 @@ def train_transformer_prior(
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
         use_bos_token=bool(prior_cfg.get('use_bos_token', False)),
         use_start_embedding=bool(prior_cfg.get('use_start_embedding', False)),
+        tie_input_output_embeddings=bool(prior_cfg.get('tie_input_output_embeddings', False)),
         use_timing_conditioning=bool(prior_cfg.get('use_timing_conditioning', True)),
         timing_num_bins=int(prior_cfg.get('timing_num_bins', 1024)),
         duration_num_bins=int(prior_cfg.get('duration_num_bins', 256)),
@@ -678,6 +679,7 @@ def train_transformer_prior(
     }
     config_to_save['model']['use_bos_token'] = bool(prior_cfg.get('use_bos_token', False))
     config_to_save['model']['use_start_embedding'] = bool(prior_cfg.get('use_start_embedding', False))
+    config_to_save['model']['tie_input_output_embeddings'] = bool(prior_cfg.get('tie_input_output_embeddings', False))
     config_to_save['model']['use_timing_conditioning'] = bool(prior_cfg.get('use_timing_conditioning', True))
     config_to_save['model']['use_2d_conditioner'] = bool(prior_cfg.get('use_2d_conditioner', True))
     config_to_save['model']['timing_window_seconds'] = float(

@@ -56,6 +56,7 @@ class TransformerPriorConditioned(nn.Module):
         second_upsample_stride: Optional[Union[int, Tuple[int, int]]] = None,
         use_bos_token: bool = False,
         use_start_embedding: bool = False,
+        tie_input_output_embeddings: bool = False,
         conditioner_residual_block_width: int = 1024,
         conditioner_residual_blocks: int = 16,
         conditioner_kernel_size: int = 3,
@@ -101,6 +102,8 @@ class TransformerPriorConditioned(nn.Module):
         When enabled, token embeddings accept IDs in [0, num_embeddings] and generation starts from bos_token_id.
         @param use_start_embedding Whether to use a learned Jukebox-style start vector before the first code token.
         Unlike use_bos_token, this does not add an extra vocabulary ID.
+        @param tie_input_output_embeddings Whether the input token embedding and output classifier share weights.
+        This follows Jukebox's shared input/output embedding, and requires input_vocab_size == num_embeddings.
         @param conditioner_residual_block_width The number of channels in the residual blocks of the WaveNet conditioner. Defaults to 1024.
         @param conditioner_residual_blocks The number of residual blocks in the WaveNet conditioner. Defaults to 16.
         @param conditioner_kernel_size The kernel size for the WaveNet conditioner. Defaults to 3.
@@ -124,6 +127,7 @@ class TransformerPriorConditioned(nn.Module):
         self.use_start_embedding = bool(use_start_embedding)
         if self.use_bos_token and self.use_start_embedding:
             raise ValueError("use_bos_token and use_start_embedding are mutually exclusive")
+        self.tie_input_output_embeddings = bool(tie_input_output_embeddings)
         self.attention_qkv_ratio = float(attention_qkv_ratio)
         self.use_timing_conditioning = bool(use_timing_conditioning)
         self.timing_num_bins = int(timing_num_bins)
@@ -208,6 +212,13 @@ class TransformerPriorConditioned(nn.Module):
         self._init_factored_transformer_layers()
         self.norm = nn.LayerNorm(model_dim)
         self.to_logits = nn.Linear(model_dim, num_embeddings, bias=False)
+        if self.tie_input_output_embeddings:
+            if self.input_vocab_size != num_embeddings:
+                raise ValueError(
+                    "tie_input_output_embeddings requires input_vocab_size == num_embeddings; "
+                    "disable use_bos_token or disable tying."
+                )
+            self.to_logits.weight = self.token_embedding.weight
 
     def _init_learned_timing_embeddings(self, init_std: float):
         """!
