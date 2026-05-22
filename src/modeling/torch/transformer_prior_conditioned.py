@@ -73,6 +73,9 @@ class TransformerPriorConditioned(nn.Module):
         timing_embedding_init_std: float = 0.02,
         timing_embedding_scale: float = 1.0,
         use_2d_conditioner: bool = True,
+        initialization_std: Optional[float] = None,
+        position_embedding_init_std: Optional[float] = None,
+        zero_init_biases: bool = True,
     ):
         """!
         @brief Initializes the TransformerPrior model.
@@ -112,6 +115,9 @@ class TransformerPriorConditioned(nn.Module):
         @param conditioner_dilation_cycle The cycle length for the dilation factors in the WaveNet conditioner. Defaults to 8.
         @param dropout The dropout probability. Defaults to 0.1.
         @param use_timing_conditioning Whether to add learned timing metadata to every token embedding.
+        @param initialization_std Optional Jukebox-style normal initialization std for matmul, embedding, and conv weights.
+        @param position_embedding_init_std Optional position embedding init std. Defaults to 2 * initialization_std.
+        @param zero_init_biases Whether to zero Linear/Conv biases when Jukebox-style initialization is enabled.
         """
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -136,6 +142,13 @@ class TransformerPriorConditioned(nn.Module):
         self.timing_max_duration_seconds = float(timing_max_duration_seconds)
         self.timing_embedding_scale = float(timing_embedding_scale)
         self.use_2d_conditioner = bool(use_2d_conditioner)
+        self.initialization_std = float(initialization_std) if initialization_std is not None else None
+        self.position_embedding_init_std = (
+            float(position_embedding_init_std)
+            if position_embedding_init_std is not None
+            else None
+        )
+        self.zero_init_biases = bool(zero_init_biases)
         self.bos_token_id = num_embeddings if self.use_bos_token else None
         self.input_vocab_size = num_embeddings + (1 if self.use_bos_token else 0)
 
@@ -219,6 +232,16 @@ class TransformerPriorConditioned(nn.Module):
                     "disable use_bos_token or disable tying."
                 )
             self.to_logits.weight = self.token_embedding.weight
+        if self.initialization_std is not None:
+            self._init_small_normal_weights(
+                init_std=self.initialization_std,
+                position_init_std=(
+                    self.position_embedding_init_std
+                    if self.position_embedding_init_std is not None
+                    else 2.0 * self.initialization_std
+                ),
+                zero_biases=self.zero_init_biases,
+            )
 
     def _init_learned_timing_embeddings(self, init_std: float):
         """!
@@ -231,6 +254,62 @@ class TransformerPriorConditioned(nn.Module):
             self.duration_timing_embedding,
         ):
             nn.init.normal_(emb.weight, mean=0.0, std=init_std)
+
+    def _init_param_once(self, param: Optional[nn.Parameter], std: float, initialized_params: set):
+        if param is None:
+            return
+        param_id = id(param)
+        if param_id in initialized_params:
+            return
+        nn.init.normal_(param, mean=0.0, std=std)
+        initialized_params.add(param_id)
+
+    @staticmethod
+    def _zero_param(param: Optional[nn.Parameter]):
+        if param is not None:
+            nn.init.zeros_(param)
+
+    def _init_small_normal_weights(
+        self,
+        init_std: float,
+        position_init_std: float,
+        zero_biases: bool = True,
+    ):
+        """Initialize matmul/embedding/conv weights with small normal scales."""
+        if init_std <= 0:
+            raise ValueError(f"initialization_std must be positive, got {init_std}")
+        if position_init_std <= 0:
+            raise ValueError(f"position_embedding_init_std must be positive, got {position_init_std}")
+
+        initialized_params = set()
+
+        timing_embeddings = {
+            id(emb) for emb in (
+                self.absolute_timing_embedding,
+                self.relative_timing_embedding,
+                self.duration_timing_embedding,
+            ) if emb is not None
+        }
+        weight_bias_modules = (
+            nn.Linear,
+            nn.Conv1d,
+            nn.Conv2d,
+            nn.ConvTranspose1d,
+            nn.ConvTranspose2d,
+        )
+
+        for module in self.modules():
+            if isinstance(module, nn.Embedding):
+                if module is self.pos_embedding:
+                    self._init_param_once(module.weight, position_init_std, initialized_params)
+                elif id(module) not in timing_embeddings:
+                    self._init_param_once(module.weight, init_std, initialized_params)
+            elif isinstance(module, weight_bias_modules):
+                self._init_param_once(module.weight, init_std, initialized_params)
+                if zero_biases:
+                    self._zero_param(module.bias)
+
+        self._init_param_once(self.start_embedding, init_std, initialized_params)
 
     def _init_factored_transformer_layers(self):
         """!
