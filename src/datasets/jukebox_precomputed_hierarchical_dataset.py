@@ -35,6 +35,7 @@ class JukeboxQuantizedDataset(Dataset):
         selected_level: str = 'top',
         sample_rate: int = 22050,
         hop_length: int = 256,
+        window_parity: str = 'all',
     ):
         """
         Args:
@@ -46,6 +47,7 @@ class JukeboxQuantizedDataset(Dataset):
             selected_level:           Which prior is being trained ('top'/'middle'/'bottom').
             sample_rate:              Audio sample rate (used for timing metadata).
             hop_length:               STFT hop length (used for timing metadata).
+            window_parity:            Window subset for windowed datasets: all/even/odd.
         """
         self.selected_level = selected_level
         self.sample_rate = sample_rate
@@ -53,13 +55,16 @@ class JukeboxQuantizedDataset(Dataset):
         self.quantized_path = quantized_path
         self.mode = 'legacy_full_song'
         self.window_entries = []
+        self.window_parity = self._normalize_window_parity(window_parity)
 
         lvl = level_target_time_frames or {}
         self.top_tf    = int(lvl.get('top',    target_time_frames))
         self.middle_tf = int(lvl.get('middle', target_time_frames))
         self.bottom_tf = int(lvl.get('bottom', target_time_frames))
 
-        if not self._init_windowed_files(file_paths=file_paths):
+        if self._init_windowed_files(file_paths=file_paths):
+            self.set_window_parity(self.window_parity)
+        else:
             if file_paths:
                 self.files = [
                     os.path.join(quantized_path, os.path.basename(f).replace('.npy', '_full_quantized.pt'))
@@ -100,10 +105,106 @@ class JukeboxQuantizedDataset(Dataset):
         if not entries:
             return False
 
+        entries.sort(key=lambda record: (
+            record.get('source_stem', ''),
+            int(record.get('start_frame', 0)),
+            record.get('file', ''),
+        ))
+        current_source = None
+        window_index = -1
+        for record in entries:
+            source_stem = record.get('source_stem', '')
+            if source_stem != current_source:
+                current_source = source_stem
+                window_index = 0
+            else:
+                window_index += 1
+            record['window_index_in_song'] = int(window_index)
+            record['window_parity'] = 'even' if window_index % 2 == 0 else 'odd'
+
         self.mode = 'windowed'
         self.window_entries = entries
         self.files = [os.path.join(self.quantized_path, entry['file']) for entry in entries]
         return True
+
+    @staticmethod
+    def _normalize_window_parity(window_parity: str) -> str:
+        parity = str(window_parity or 'all').strip().lower()
+        aliases = {
+            'none': 'all',
+            'full': 'all',
+            'both': 'all',
+            'non_overlapping': 'even',
+            'non-overlapping': 'even',
+            'fixed': 'even',
+            'first': 'even',
+        }
+        parity = aliases.get(parity, parity)
+        if parity not in ('all', 'even', 'odd'):
+            raise ValueError("window_parity must be one of: all, even, odd")
+        return parity
+
+    def set_window_parity(self, window_parity: str) -> None:
+        """
+        Keep only one overlap parity active for windowed datasets.
+
+        The parity is based on each window's order within its source song after
+        sorting by start frame. With 50% overlap, even windows are effectively
+        the non-overlapping 0, 2, 4... anchors; odd windows are the shifted view.
+        """
+        self.window_parity = self._normalize_window_parity(window_parity)
+        if self.mode != 'windowed':
+            return
+
+        if self.window_parity == 'all':
+            active_entries = list(self.window_entries)
+        else:
+            active_entries = [
+                entry for entry in self.window_entries
+                if entry.get('window_parity') == self.window_parity
+            ]
+        if not active_entries:
+            raise ValueError(
+                f"No windowed quantized entries remain after applying window_parity={self.window_parity!r}."
+            )
+        self.files = [os.path.join(self.quantized_path, entry['file']) for entry in active_entries]
+        self.active_window_entries = active_entries
+
+    def indices_for_window_parity(self, window_parity: str) -> List[int]:
+        """Return dataset indices for a fixed overlap parity without mutating the dataset."""
+        parity = self._normalize_window_parity(window_parity)
+        if self.mode != 'windowed' or parity == 'all':
+            return list(range(len(self.files)))
+        return [
+            idx for idx, entry in enumerate(self.window_entries)
+            if entry.get('window_parity') == parity
+        ]
+
+    def indices_for_random_window_parity_per_song(self, seed: int) -> List[int]:
+        """Choose even or odd windows independently for each song."""
+        if self.mode != 'windowed':
+            return list(range(len(self.files)))
+
+        rng = np.random.default_rng(seed)
+        available_parities = {}
+        for entry in self.window_entries:
+            source_stem = entry.get('source_stem', '')
+            available_parities.setdefault(source_stem, set()).add(entry.get('window_parity', 'even'))
+        chosen = {
+            source_stem: sorted(parities)[int(rng.integers(0, len(parities)))]
+            for source_stem, parities in sorted(available_parities.items())
+        }
+        return [
+            idx for idx, entry in enumerate(self.window_entries)
+            if entry.get('window_parity') == chosen.get(entry.get('source_stem', ''), 'even')
+        ]
+
+    def window_parity_counts(self) -> Dict[str, int]:
+        if self.mode != 'windowed':
+            return {'all': len(self.files), 'even': len(self.files), 'odd': len(self.files)}
+        even = sum(1 for entry in self.window_entries if entry.get('window_parity') == 'even')
+        odd = sum(1 for entry in self.window_entries if entry.get('window_parity') == 'odd')
+        return {'all': len(self.window_entries), 'even': even, 'odd': odd}
 
     def _init_grids(self):
         """Read one payload to discover both full-song and fixed-window token grids."""

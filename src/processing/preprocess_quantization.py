@@ -404,31 +404,31 @@ def main():
     parser.add_argument(
         '--source_path',
         type=str,
-        default='./data/processed/maestro/',
+        default='/home/ivon/code/datasets/processed/maestro/',
         help='Path to directory containing .npy spectrogram files'
     )
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='./data/processed/maestro_quantized/',
+        default='/home/ivon/code/datasets/processed/maestro_quantized_dataset/',
         help='Output directory for quantized .pt files'
     )
     parser.add_argument(
         '--top_model_dir',
         type=str,
-        default='./models/jukebox_vq_vae/jukebox_vqvae_maestro_top/2026-04-26_02-13-14',
+        default='./models/jukebox_vq_vae/jukebox_vqvae_maestro_top/2026-05-14_10-01-43',
         help='Path to trained top-level VQ-VAE model'
     )
     parser.add_argument(
         '--middle_model_dir',
         type=str,
-        default='./models/jukebox_vq_vae/jukebox_vqvae_maestro_middle/2026-04-26_17-30-30',
+        default='./models/jukebox_vq_vae/jukebox_vqvae_maestro_middle/2026-05-15_16-56-29',
         help='Path to trained middle-level VQ-VAE model'
     )
     parser.add_argument(
         '--bottom_model_dir',
         type=str,
-        default='./models/jukebox_vq_vae/jukebox_vqvae_maestro_bottom/2026-04-26_22-26-06',
+        default='./models/jukebox_vq_vae/jukebox_vqvae_maestro_bottom/2026-05-16_03-35-41',
         help='Path to trained bottom-level VQ-VAE model'
     )
     parser.add_argument(
@@ -470,7 +470,7 @@ def main():
         default=None,
         help='Bottom-level anchor step. Omit to derive from --overlap_fraction; with defaults this is 64.',
     )
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for windowed quantization.')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for windowed quantization.')
     parser.add_argument('--sample_rate', type=int, default=22050, help='Sample rate used in preprocess_audio')
     parser.add_argument('--hop_length', type=int, default=256, help='Hop length used in preprocess_audio')
     parser.add_argument(

@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Sampler, Subset
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -22,7 +22,7 @@ from datasets.jukebox_precomputed_hierarchical_dataset import JukeboxQuantizedDa
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
 from utils import set_global_seed, list_npy_files, load_config
 from callbacks import EarlyStopping
-from train_scripts.jukebox_utils import parse_level, split_train_val_paths
+from train_scripts.jukebox_utils import parse_level, split_paths_by_maestro_metadata
 from train_scripts.resume_utils import load_resume_artifacts
 
 LEVEL_TO_PRIOR_CFG = {'top': 'top_prior', 'middle': 'middle_prior', 'bottom': 'bottom_prior'}
@@ -55,14 +55,10 @@ def _get_prior_cfg(config: dict, name: str) -> dict:
     return config[name]
 
 
-def _compute_stride(lower_len: int, upper_len: int, level_name: str) -> int:
-    if upper_len <= 0:
-        raise ValueError(f'Invalid upper sequence length for {level_name}: {upper_len}')
-    if lower_len % upper_len != 0:
-        raise ValueError(
-            f'Cannot infer upsample_stride for {level_name}: lower_len={lower_len}, upper_len={upper_len}'
-        )
-    return lower_len // upper_len
+def _optional_float(value):
+    if value is None:
+        return None
+    return float(value)
 
 
 def _tensor_grid_shape(name: str, tensor: torch.Tensor) -> Tuple[int, int]:
@@ -146,6 +142,64 @@ def _loader_kwargs(num_workers: int, pin_memory: bool, persist_workers: bool, pr
     return kwargs
 
 
+def _select_global_train_parity(mode: str, epoch: int, seed: int) -> str:
+    if mode == 'all':
+        return 'all'
+    if mode == 'alternate':
+        return 'even' if epoch % 2 == 0 else 'odd'
+    if mode == 'random_per_song':
+        return 'random_per_song'
+    raise ValueError(f"Unsupported train window parity mode: {mode}")
+
+
+def _indices_for_train_epoch(dataset, mode: str, epoch: int, seed: int) -> Tuple[list, str]:
+    parity = _select_global_train_parity(mode, epoch, seed)
+    if parity == 'random_per_song' and hasattr(dataset, 'indices_for_random_window_parity_per_song'):
+        return dataset.indices_for_random_window_parity_per_song(seed + epoch), parity
+    if hasattr(dataset, 'indices_for_window_parity'):
+        return dataset.indices_for_window_parity(parity), parity
+    return list(range(len(dataset))), 'all'
+
+
+def _max_train_examples_per_epoch(dataset, mode: str, seed: int) -> int:
+    if mode == 'all' or not hasattr(dataset, 'indices_for_window_parity'):
+        return len(dataset)
+    if mode in {'alternate', 'random_per_song'}:
+        return max(
+            len(dataset.indices_for_window_parity('even')),
+            len(dataset.indices_for_window_parity('odd')),
+        )
+    indices, _ = _indices_for_train_epoch(dataset, mode, 0, seed)
+    return len(indices)
+
+
+class WindowParityEpochSampler(Sampler):
+    """Shuffle a fixed overlap-parity subset, changing that subset each epoch."""
+
+    def __init__(self, dataset, mode: str, seed: int):
+        self.dataset = dataset
+        self.mode = mode
+        self.seed = int(seed)
+        self.epoch = 0
+        self.current_parity = 'all'
+        self.indices = []
+        self.set_epoch(0)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        indices, parity = _indices_for_train_epoch(self.dataset, self.mode, self.epoch, self.seed)
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self.indices = list(indices)
+        rng.shuffle(self.indices)
+        self.current_parity = parity
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+
 def train_transformer_prior(
     config_path: str,
     level_override: Optional[str] = None,
@@ -176,7 +230,10 @@ def train_transformer_prior(
     quantized_data_path = dataset_cfg.get('quantized_data_path', './data/processed/maestro_quantized/')
     sample_rate = int(dataset_cfg.get('sample_rate', 22050))
     hop_length = int(dataset_cfg.get('hop_length', 256))
-    segment_overlap = float(dataset_cfg.get('segment_overlap', 0.0))
+    train_window_parity_mode = dataset_cfg.get('train_window_parity_mode', 'alternate')
+    validation_window_parity = dataset_cfg.get('validation_window_parity', 'even')
+    if validation_window_parity not in {'all', 'even', 'odd'}:
+        raise ValueError(f"validation_window_parity must be all/even/odd, got {validation_window_parity!r}")
 
     # Codebook size: use explicit config value or sensible default (Jukebox uses 2048)
     vqvae_codebook_size = int(vqvae_cfg.get('codebook_size', 2048))
@@ -187,20 +244,20 @@ def train_transformer_prior(
     print(f'Found {len(all_file_paths)} spectrogram files for quantization.')
     print(f'Level target time frames: {level_target_time_frames}')
 
-    validation_split = float(train_cfg.get('validation_split', 0.1))
-    train_file_paths, val_file_paths = split_train_val_paths(
-        all_file_paths=all_file_paths,
-        dataset_cfg=dataset_cfg,
-        validation_split=validation_split,
-        seed=seed,
+    official_train_paths, val_file_paths, test_file_paths = split_paths_by_maestro_metadata(
+        all_file_paths,
+        dataset_cfg,
     )
+    train_file_paths = sorted(official_train_paths + test_file_paths)
     print(
-        f"Using {len(train_file_paths)} training files and "
-        f"{len(val_file_paths) if val_file_paths else 0} validation files "
-        f"(validation_split={validation_split:.3f})."
+        f"Using official MAESTRO splits for prior training: "
+        f"train={len(official_train_paths)}, test={len(test_file_paths)} "
+        f"combined into {len(train_file_paths)} training files; "
+        f"validation={len(val_file_paths)} files."
     )
 
     # Load precomputed quantized dataset
+    ## training
     print(f"--- Loading Precomputed Quantized Dataset for {selected_level} ---")
     train_dataset = JukeboxQuantizedDataset(
         quantized_path=quantized_data_path,
@@ -214,12 +271,24 @@ def train_transformer_prior(
         f"(loader workers={num_workers}, pin_memory={pin_memory}, "
         f"persistent_workers={persist_workers if num_workers > 0 else False}, prefetch_factor={prefetch_factor})"
     )
+    if hasattr(train_dataset, 'window_parity_counts'):
+        counts = train_dataset.window_parity_counts()
+        print(
+            f"Training window parity mode: {train_window_parity_mode} "
+            f"(all={counts['all']}, even={counts['even']}, odd={counts['odd']})"
+        )
+    train_sampler = WindowParityEpochSampler(
+        train_dataset,
+        mode=train_window_parity_mode,
+        seed=seed,
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_cfg['batch_size'],
-        shuffle=True,
+        sampler=train_sampler,
         **_loader_kwargs(num_workers, pin_memory, persist_workers, prefetch_factor),
     )
+    ## validation
     val_loader = None
     if val_file_paths:
         print(f"--- Loading Precomputed Validation Dataset for {selected_level} ---")
@@ -230,9 +299,17 @@ def train_transformer_prior(
             level_target_time_frames=level_target_time_frames,
             selected_level=selected_level,
         )
-        print(f"Validation dataset examples for {selected_level}: {len(val_dataset)}")
+        if hasattr(val_dataset, 'indices_for_window_parity'):
+            val_indices = val_dataset.indices_for_window_parity(validation_window_parity)
+        else:
+            val_indices = list(range(len(val_dataset)))
+        val_dataset_for_loader = Subset(val_dataset, val_indices)
+        print(
+            f"Validation dataset examples for {selected_level}: {len(val_dataset_for_loader)} "
+            f"(fixed window_parity={validation_window_parity}, full={len(val_dataset)})"
+        )
         val_loader = DataLoader(
-            val_dataset,
+            val_dataset_for_loader,
             batch_size=train_cfg['batch_size'],
             shuffle=False,
             **_loader_kwargs(num_workers, pin_memory, persist_workers, prefetch_factor),
@@ -240,12 +317,7 @@ def train_transformer_prior(
     else:
         print(f"No validation dataset configured for {selected_level}; training will use {len(train_dataset)} examples only.")
 
-    # Use explicit codebook size (not inferred from data, which may have smaller max token)
-    num_embeddings_map = {
-        'top': vqvae_codebook_size,
-        'middle': vqvae_codebook_size,
-        'bottom': vqvae_codebook_size,
-    }
+    # Use explicit codebook size
     print(f"Using codebook size: {vqvae_codebook_size}")
 
     sample = train_dataset[0]
@@ -319,13 +391,10 @@ def train_transformer_prior(
 
     is_upsampler = cond_level is not None
     upsample_stride = None
-    cond_num_embeddings = None
     cond_block_len = None
     second_upsample_stride = None
-    second_cond_num_embeddings = None
     second_cond_block_len = None
     if is_upsampler:
-        cond_num_embeddings = num_embeddings_map[cond_level]
         upsample_stride, cond_block_len = _compute_2d_stride_from_tensors(
             target_indices,
             cond_indices_sample,
@@ -333,7 +402,6 @@ def train_transformer_prior(
         )
         print(f"Primary 2D conditioner stride for {cond_level}->{selected_level}: {upsample_stride}")
     if condition_on_top and second_cond_level is not None:
-        second_cond_num_embeddings = num_embeddings_map[second_cond_level]
         second_upsample_stride, second_cond_block_len = _compute_2d_stride_from_tensors(
             target_indices,
             second_cond_indices_sample,
@@ -344,7 +412,7 @@ def train_transformer_prior(
     max_time_steps = int(prior_cfg.get('max_time_steps', 500))
 
     prior = TransformerPriorConditioned(
-        num_embeddings=num_embeddings_map[selected_level],
+        num_embeddings=vqvae_codebook_size,
         model_dim=int(prior_cfg['model_dim']),
         num_heads=int(prior_cfg['num_heads']),
         num_layers=int(prior_cfg['num_layers']),
@@ -353,10 +421,10 @@ def train_transformer_prior(
         block_len=int(prior_cfg.get('block_len', 16)),
         max_time_steps=max_time_steps,
         is_upsampler=is_upsampler,
-        cond_num_embeddings=cond_num_embeddings,
+        cond_num_embeddings=vqvae_codebook_size,
         cond_block_len=cond_block_len,
         upsample_stride=upsample_stride,
-        second_cond_num_embeddings=second_cond_num_embeddings,
+        second_cond_num_embeddings=vqvae_codebook_size,
         second_cond_block_len=second_cond_block_len,
         second_upsample_stride=second_upsample_stride,
         conditioner_residual_block_width=int(prior_cfg.get('conditioner_residual_block_width', 1024)),
@@ -368,6 +436,8 @@ def train_transformer_prior(
         dropout=float(prior_cfg.get('dropout', 0.1)),
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
         use_bos_token=bool(prior_cfg.get('use_bos_token', False)),
+        use_start_embedding=bool(prior_cfg.get('use_start_embedding', False)),
+        tie_input_output_embeddings=bool(prior_cfg.get('tie_input_output_embeddings', False)),
         use_timing_conditioning=bool(prior_cfg.get('use_timing_conditioning', True)),
         timing_num_bins=int(prior_cfg.get('timing_num_bins', 1024)),
         duration_num_bins=int(prior_cfg.get('duration_num_bins', 256)),
@@ -376,11 +446,21 @@ def train_transformer_prior(
         timing_embedding_init_std=float(prior_cfg.get('timing_embedding_init_std', 0.02)),
         timing_embedding_scale=float(prior_cfg.get('timing_embedding_scale', 1.0)),
         use_2d_conditioner=bool(prior_cfg.get('use_2d_conditioner', True)),
+        initialization_std=_optional_float(prior_cfg.get('initialization_std')),
+        position_embedding_init_std=_optional_float(prior_cfg.get('position_embedding_init_std')),
+        zero_init_biases=bool(prior_cfg.get('zero_init_biases', True)),
     ).to(device)
     print(
         f"Timing conditioning: {'enabled' if prior.use_timing_conditioning else 'disabled'} "
         f"(learned absolute/relative/duration embeddings)"
     )
+    if prior.initialization_std is not None:
+        print(
+            "Jukebox-style initialization: "
+            f"weights/std={prior.initialization_std:g}, "
+            f"position/std={(prior.position_embedding_init_std or 2.0 * prior.initialization_std):g}, "
+            f"zero_biases={prior.zero_init_biases}"
+        )
 
     retrain = bool(train_cfg.get('retrain', False))
     pretrained_weights_path = train_cfg.get('pretrained_weights_path')
@@ -482,7 +562,16 @@ def train_transformer_prior(
     )
 
     scheduler_name = str(train_cfg.get('scheduler', 'onecycle')).strip().lower()
-    optimizer_steps_per_epoch = max(1, math.ceil(len(train_loader) / grad_accum_steps))
+    max_train_examples_per_epoch = _max_train_examples_per_epoch(
+        train_dataset,
+        train_window_parity_mode,
+        seed,
+    )
+    max_train_batches_per_epoch = max(
+        1,
+        math.ceil(max_train_examples_per_epoch / int(train_cfg['batch_size'])),
+    )
+    optimizer_steps_per_epoch = max(1, math.ceil(max_train_batches_per_epoch / grad_accum_steps))
     total_steps = optimizer_steps_per_epoch * epochs
     scheduler = None
     if scheduler_name in ('none', 'off', 'disabled'):
@@ -548,6 +637,13 @@ def train_transformer_prior(
         'bottom': [int(bottom_rows), int(bottom_cols)],
     }
     config_to_save['model']['use_bos_token'] = bool(prior_cfg.get('use_bos_token', False))
+    config_to_save['model']['use_start_embedding'] = bool(prior_cfg.get('use_start_embedding', False))
+    config_to_save['model']['tie_input_output_embeddings'] = bool(prior_cfg.get('tie_input_output_embeddings', False))
+    config_to_save['model']['initialization_std'] = _optional_float(prior_cfg.get('initialization_std'))
+    config_to_save['model']['position_embedding_init_std'] = _optional_float(
+        prior_cfg.get('position_embedding_init_std')
+    )
+    config_to_save['model']['zero_init_biases'] = bool(prior_cfg.get('zero_init_biases', True))
     config_to_save['model']['use_timing_conditioning'] = bool(prior_cfg.get('use_timing_conditioning', True))
     config_to_save['model']['use_2d_conditioner'] = bool(prior_cfg.get('use_2d_conditioner', True))
     config_to_save['model']['timing_window_seconds'] = float(
@@ -588,11 +684,18 @@ def train_transformer_prior(
             return
 
     for epoch in range(start_epoch, epochs):
+        train_sampler.set_epoch(epoch)
         prior.train()
         running_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
 
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs} [Train:{selected_level}]')
+        pbar = tqdm(
+            train_loader,
+            desc=(
+                f'Epoch {epoch + 1}/{epochs} '
+                f'[Train:{selected_level}:{train_sampler.current_parity}]'
+            ),
+        )
         for batch_idx, batch in enumerate(pbar):
             # dataset now returns (target, cond, second_cond, timing) for all levels.
             # 'cond' is the temporally-aligned upper-level slice (None for top).

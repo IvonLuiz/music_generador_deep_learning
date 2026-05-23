@@ -1,4 +1,5 @@
 
+import csv
 import os
 import numpy as np
 from typing import Optional, Tuple
@@ -237,3 +238,110 @@ def split_train_val_paths(
     print(f"Songs: {len(song_prefixes) - num_val_songs} train, {num_val_songs} val")
 
     return train_file_paths, val_file_paths
+
+
+def _default_maestro_metadata_path(raw_path: str) -> str:
+    raw_path = os.path.abspath(os.path.expanduser(raw_path))
+    basename = os.path.basename(os.path.normpath(raw_path))
+    if basename:
+        candidate = os.path.join(raw_path, f"{basename}.csv")
+        if os.path.isfile(candidate):
+            return candidate
+    return os.path.join(raw_path, "maestro-v3.0.0.csv")
+
+
+def _load_maestro_split_metadata(dataset_cfg: dict):
+    metadata_path = dataset_cfg.get("metadata_path")
+    if not metadata_path:
+        metadata_path = _default_maestro_metadata_path(dataset_cfg.get("raw_path", ""))
+    metadata_path = os.path.abspath(os.path.expanduser(metadata_path))
+    if not os.path.isfile(metadata_path):
+        raise FileNotFoundError(
+            f"MAESTRO metadata CSV not found at {metadata_path}. "
+            "Set dataset.metadata_path or dataset.raw_path in the config."
+        )
+
+    by_relative_path = {}
+    by_basename = {}
+    with open(metadata_path, newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"audio_filename", "split"}
+        missing = required.difference(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"MAESTRO metadata is missing columns: {', '.join(sorted(missing))}")
+
+        for row in reader:
+            audio_filename = row["audio_filename"].replace("\\", "/")
+            split = row["split"].strip().lower()
+            if split not in {"train", "validation", "test"}:
+                continue
+            by_relative_path[os.path.normpath(audio_filename)] = row
+            by_basename[os.path.basename(audio_filename)] = row
+
+    return by_relative_path, by_basename, metadata_path
+
+
+def _processed_audio_basename_from_path(file_path: str) -> str:
+    basename = os.path.basename(file_path)
+    if basename.endswith(".npy"):
+        basename = basename[:-4]
+    match = re.match(r"^(.+)_segment_\d+$", basename)
+    if match:
+        basename = match.group(1)
+    return basename
+
+
+def _maestro_row_for_path(file_path: str, dataset_cfg: dict, by_relative_path: dict, by_basename: dict):
+    raw_path = dataset_cfg.get("raw_path")
+    if raw_path:
+        raw_abs = os.path.abspath(os.path.expanduser(raw_path))
+        file_abs = os.path.abspath(os.path.expanduser(file_path))
+        try:
+            rel_path = os.path.relpath(file_abs, raw_abs)
+            if not rel_path.startswith(".."):
+                row = by_relative_path.get(os.path.normpath(rel_path))
+                if row is not None:
+                    return row
+        except ValueError:
+            pass
+
+    basename = os.path.basename(file_path)
+    row = by_basename.get(basename)
+    if row is not None:
+        return row
+
+    processed_base = _processed_audio_basename_from_path(file_path)
+    for ext in (".wav", ".flac", ".aiff", ".aif"):
+        row = by_basename.get(processed_base + ext)
+        if row is not None:
+            return row
+    return None
+
+
+def split_paths_by_maestro_metadata(all_file_paths: list, dataset_cfg: dict):
+    by_relative_path, by_basename, metadata_path = _load_maestro_split_metadata(dataset_cfg)
+    splits = {"train": [], "validation": [], "test": []}
+    unmatched = []
+
+    for path in sorted(all_file_paths):
+        row = _maestro_row_for_path(path, dataset_cfg, by_relative_path, by_basename)
+        if row is None:
+            unmatched.append(path)
+            continue
+        splits[row["split"].strip().lower()].append(path)
+
+    if unmatched:
+        preview = "\n".join(f"  - {path}" for path in unmatched[:10])
+        extra = "" if len(unmatched) <= 10 else f"\n  ... and {len(unmatched) - 10} more"
+        raise ValueError(
+            f"Could not match {len(unmatched)} files to MAESTRO metadata at {metadata_path}:\n"
+            f"{preview}{extra}"
+        )
+
+    print(
+        "Data split files: "
+        f"train={len(splits['train'])}, "
+        f"validation={len(splits['validation'])}, "
+        f"test={len(splits['test'])}"
+    )
+    return splits["train"], splits["validation"], splits["test"]

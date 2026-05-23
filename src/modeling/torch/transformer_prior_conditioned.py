@@ -55,6 +55,8 @@ class TransformerPriorConditioned(nn.Module):
         second_cond_block_len: Optional[int] = None,
         second_upsample_stride: Optional[Union[int, Tuple[int, int]]] = None,
         use_bos_token: bool = False,
+        use_start_embedding: bool = False,
+        tie_input_output_embeddings: bool = False,
         conditioner_residual_block_width: int = 1024,
         conditioner_residual_blocks: int = 16,
         conditioner_kernel_size: int = 3,
@@ -71,6 +73,9 @@ class TransformerPriorConditioned(nn.Module):
         timing_embedding_init_std: float = 0.02,
         timing_embedding_scale: float = 1.0,
         use_2d_conditioner: bool = True,
+        initialization_std: Optional[float] = None,
+        position_embedding_init_std: Optional[float] = None,
+        zero_init_biases: bool = True,
     ):
         """!
         @brief Initializes the TransformerPrior model.
@@ -98,6 +103,10 @@ class TransformerPriorConditioned(nn.Module):
         input and output sequences of the conditioner. Defaults to None (no upsampling).
         @param use_bos_token Whether to reserve an extra input token ID for beginning-of-sequence conditioning.
         When enabled, token embeddings accept IDs in [0, num_embeddings] and generation starts from bos_token_id.
+        @param use_start_embedding Whether to use a learned Jukebox-style start vector before the first code token.
+        Unlike use_bos_token, this does not add an extra vocabulary ID.
+        @param tie_input_output_embeddings Whether the input token embedding and output classifier share weights.
+        This follows Jukebox's shared input/output embedding, and requires input_vocab_size == num_embeddings.
         @param conditioner_residual_block_width The number of channels in the residual blocks of the WaveNet conditioner. Defaults to 1024.
         @param conditioner_residual_blocks The number of residual blocks in the WaveNet conditioner. Defaults to 16.
         @param conditioner_kernel_size The kernel size for the WaveNet conditioner. Defaults to 3.
@@ -106,6 +115,9 @@ class TransformerPriorConditioned(nn.Module):
         @param conditioner_dilation_cycle The cycle length for the dilation factors in the WaveNet conditioner. Defaults to 8.
         @param dropout The dropout probability. Defaults to 0.1.
         @param use_timing_conditioning Whether to add learned timing metadata to every token embedding.
+        @param initialization_std Optional Jukebox-style normal initialization std for matmul, embedding, and conv weights.
+        @param position_embedding_init_std Optional position embedding init std. Defaults to 2 * initialization_std.
+        @param zero_init_biases Whether to zero Linear/Conv biases when Jukebox-style initialization is enabled.
         """
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -117,7 +129,11 @@ class TransformerPriorConditioned(nn.Module):
         self.block_len = block_len
         self.dropout = dropout
         self.max_time_steps = max_time_steps
-        self.use_bos_token = use_bos_token
+        self.use_bos_token = bool(use_bos_token)
+        self.use_start_embedding = bool(use_start_embedding)
+        if self.use_bos_token and self.use_start_embedding:
+            raise ValueError("use_bos_token and use_start_embedding are mutually exclusive")
+        self.tie_input_output_embeddings = bool(tie_input_output_embeddings)
         self.attention_qkv_ratio = float(attention_qkv_ratio)
         self.use_timing_conditioning = bool(use_timing_conditioning)
         self.timing_num_bins = int(timing_num_bins)
@@ -126,8 +142,15 @@ class TransformerPriorConditioned(nn.Module):
         self.timing_max_duration_seconds = float(timing_max_duration_seconds)
         self.timing_embedding_scale = float(timing_embedding_scale)
         self.use_2d_conditioner = bool(use_2d_conditioner)
-        self.bos_token_id = num_embeddings if use_bos_token else None
-        self.input_vocab_size = num_embeddings + (1 if use_bos_token else 0)
+        self.initialization_std = float(initialization_std) if initialization_std is not None else None
+        self.position_embedding_init_std = (
+            float(position_embedding_init_std)
+            if position_embedding_init_std is not None
+            else None
+        )
+        self.zero_init_biases = bool(zero_init_biases)
+        self.bos_token_id = num_embeddings if self.use_bos_token else None
+        self.input_vocab_size = num_embeddings + (1 if self.use_bos_token else 0)
 
         # Initialize the conditioner if this is an upsampling prior
         self.is_upsampler = is_upsampler
@@ -180,6 +203,10 @@ class TransformerPriorConditioned(nn.Module):
 
         # Embedding layers for tokens and positions
         self.token_embedding = nn.Embedding(self.input_vocab_size, model_dim)
+        self.start_embedding = None
+        if self.use_start_embedding:
+            self.start_embedding = nn.Parameter(torch.empty(1, 1, model_dim))
+            nn.init.normal_(self.start_embedding, mean=0.0, std=0.01)
         self.pos_embedding = nn.Embedding(max_seq_len, model_dim)
         self.absolute_timing_embedding = None
         self.relative_timing_embedding = None
@@ -198,6 +225,23 @@ class TransformerPriorConditioned(nn.Module):
         self._init_factored_transformer_layers()
         self.norm = nn.LayerNorm(model_dim)
         self.to_logits = nn.Linear(model_dim, num_embeddings, bias=False)
+        if self.tie_input_output_embeddings:
+            if self.input_vocab_size != num_embeddings:
+                raise ValueError(
+                    "tie_input_output_embeddings requires input_vocab_size == num_embeddings; "
+                    "disable use_bos_token or disable tying."
+                )
+            self.to_logits.weight = self.token_embedding.weight
+        if self.initialization_std is not None:
+            self._init_small_normal_weights(
+                init_std=self.initialization_std,
+                position_init_std=(
+                    self.position_embedding_init_std
+                    if self.position_embedding_init_std is not None
+                    else 2.0 * self.initialization_std
+                ),
+                zero_biases=self.zero_init_biases,
+            )
 
     def _init_learned_timing_embeddings(self, init_std: float):
         """!
@@ -210,6 +254,62 @@ class TransformerPriorConditioned(nn.Module):
             self.duration_timing_embedding,
         ):
             nn.init.normal_(emb.weight, mean=0.0, std=init_std)
+
+    def _init_param_once(self, param: Optional[nn.Parameter], std: float, initialized_params: set):
+        if param is None:
+            return
+        param_id = id(param)
+        if param_id in initialized_params:
+            return
+        nn.init.normal_(param, mean=0.0, std=std)
+        initialized_params.add(param_id)
+
+    @staticmethod
+    def _zero_param(param: Optional[nn.Parameter]):
+        if param is not None:
+            nn.init.zeros_(param)
+
+    def _init_small_normal_weights(
+        self,
+        init_std: float,
+        position_init_std: float,
+        zero_biases: bool = True,
+    ):
+        """Initialize matmul/embedding/conv weights with small normal scales."""
+        if init_std <= 0:
+            raise ValueError(f"initialization_std must be positive, got {init_std}")
+        if position_init_std <= 0:
+            raise ValueError(f"position_embedding_init_std must be positive, got {position_init_std}")
+
+        initialized_params = set()
+
+        timing_embeddings = {
+            id(emb) for emb in (
+                self.absolute_timing_embedding,
+                self.relative_timing_embedding,
+                self.duration_timing_embedding,
+            ) if emb is not None
+        }
+        weight_bias_modules = (
+            nn.Linear,
+            nn.Conv1d,
+            nn.Conv2d,
+            nn.ConvTranspose1d,
+            nn.ConvTranspose2d,
+        )
+
+        for module in self.modules():
+            if isinstance(module, nn.Embedding):
+                if module is self.pos_embedding:
+                    self._init_param_once(module.weight, position_init_std, initialized_params)
+                elif id(module) not in timing_embeddings:
+                    self._init_param_once(module.weight, init_std, initialized_params)
+            elif isinstance(module, weight_bias_modules):
+                self._init_param_once(module.weight, init_std, initialized_params)
+                if zero_biases:
+                    self._zero_param(module.bias)
+
+        self._init_param_once(self.start_embedding, init_std, initialized_params)
 
     def _init_factored_transformer_layers(self):
         """!
@@ -238,13 +338,14 @@ class TransformerPriorConditioned(nn.Module):
         conditioning_emb: Optional[torch.Tensor] = None,
         second_conditioning_emb: Optional[torch.Tensor] = None,
         timing_emb: Optional[torch.Tensor] = None,
+        prepend_start_embedding: bool = False,
     ) -> torch.Tensor:
         """!
         @brief Forward pass for the TransformerPriorConditioned model.
 
-        @details Architecture adapted from jukebox. We pass the input token indices through token and position embeddings, add
-        conditioning information if this is an upsampler prior, and then pass through a series of factored transformer
-        layers before projecting to logits over the vocabulary.
+        @details Architecture adapted from jukebox. We pass the input token indices through token and position
+        embeddings, add conditioning information if this is an upsampler prior, and then pass through a series of
+        factored transformer layers before projecting to logits over the vocabulary.
 
         @param indices Input token indices for the current level (shape: [batch_size, seq_len]).
         @param upper_indices Upper-level token indices for upsampler priors (shape: [batch_size, upper_seq_len]).
@@ -254,12 +355,18 @@ class TransformerPriorConditioned(nn.Module):
         @param conditioning_emb Optional precomputed conditioning embedding (shape: [batch_size, T, D]).
         @param second_conditioning_emb Optional second conditioning embedding (shape: [batch_size, T, D]).
         @param timing_emb Optional precomputed timing embedding (shape: [batch_size, T, D]).
+        @param prepend_start_embedding Whether to prepend the learned start vector before embedded indices.
+        Used for Jukebox-style shifted autoregressive training/generation without adding a BOS token ID.
         @return Logits over the vocabulary (shape: [batch_size, seq_len, num_embeddings]).
         """
         if indices.ndim != 2:
             raise ValueError(f"indices must have shape (B, T), got {tuple(indices.shape)}")
 
-        batch_size, seq_len = indices.shape
+        if prepend_start_embedding and not self.use_start_embedding:
+            raise ValueError("prepend_start_embedding=True requires use_start_embedding=True")
+
+        batch_size, input_seq_len = indices.shape
+        seq_len = input_seq_len + (1 if prepend_start_embedding else 0)
         if seq_len > self.max_seq_len:
             raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}")
         if torch.any(indices < 0) or torch.any(indices >= self.input_vocab_size):
@@ -271,7 +378,11 @@ class TransformerPriorConditioned(nn.Module):
         pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
         # base embeddings (tokens + position)
-        x = self.token_embedding(indices) + self.pos_embedding(pos)
+        token_emb = self.token_embedding(indices)
+        if prepend_start_embedding:
+            start_emb = self.start_embedding.to(device=device, dtype=token_emb.dtype).expand(batch_size, -1, -1)
+            token_emb = torch.cat([start_emb, token_emb], dim=1)
+        x = token_emb + self.pos_embedding(pos)
 
         # Add learned timing embeddings if provided.
         # timing shape: (B, 3) with [start_time_s, total_duration_s, fraction_elapsed].
@@ -469,12 +580,20 @@ class TransformerPriorConditioned(nn.Module):
         """
         if indices.ndim != 2:
             raise ValueError(f"indices must have shape (B, T), got {tuple(indices.shape)}")
-        min_seq_len = 1 if self.use_bos_token else 2
+        min_seq_len = 1 if (self.use_bos_token or self.use_start_embedding) else 2
         if indices.shape[1] < min_seq_len:
             raise ValueError(f"Need sequence length >= {min_seq_len} for next-token training")
         
-        # For next-token prediction, prepend BOS when enabled so the model learns to start from an empty prefix.
-        if self.use_bos_token:
+        # For next-token prediction, prepend the configured start signal so the model learns an empty prefix.
+        prepend_start_embedding = False
+        if self.use_start_embedding:
+            # predict every target token from a right-shifted embedding stream
+            # whose first position is a learned start vector, not a codebook/BOS ID.
+            input_tokens = indices[:, :-1]
+            target = indices
+            prepend_start_embedding = True
+        elif self.use_bos_token:
+            # predict every target token from a right-shifted stream that starts with a reserved BOS token ID.
             bos = torch.full((indices.shape[0], 1), self.bos_token_id, dtype=indices.dtype, device=indices.device)
             input_tokens = torch.cat([bos, indices[:, :-1]], dim=1)
             target = indices
@@ -489,6 +608,7 @@ class TransformerPriorConditioned(nn.Module):
             upper_indices=upper_indices,
             second_upper_indices=second_upper_indices,
             timing=timing,
+            prepend_start_embedding=prepend_start_embedding,
         )
         return F.cross_entropy(logits.reshape(-1, self.num_embeddings), target.reshape(-1))
 
@@ -535,34 +655,38 @@ class TransformerPriorConditioned(nn.Module):
         if device is None:
             device = next(self.parameters()).device
         
-        bos_prefix_len = 0
+        hidden_prefix_len = 0
         if start_tokens is not None:
             if start_tokens.ndim != 2:
                 raise ValueError(f"start_tokens must have shape (B, T), got {tuple(start_tokens.shape)}")
             if start_tokens.shape[0] != batch_size:
                 raise ValueError("start_tokens batch size does not match requested batch_size")
             start_tokens = start_tokens.to(device).long()
-            if self.use_bos_token:
+            if self.use_start_embedding:
+                tokens = start_tokens
+            elif self.use_bos_token:
                 # Continuation prefixes still need the same BOS-shifted positions used during training.
                 bos = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
                 tokens = torch.cat([bos, start_tokens], dim=1)
-                bos_prefix_len = 1
+                hidden_prefix_len = 1
             else:
                 tokens = start_tokens
         else:
-            if self.use_bos_token:
+            if self.use_start_embedding:
+                tokens = torch.empty((batch_size, 0), dtype=torch.long, device=device)
+            elif self.use_bos_token:
                 tokens = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
-                bos_prefix_len = 1
+                hidden_prefix_len = 1
             else:
                 tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
         
-        target_len = seq_len + bos_prefix_len
+        target_len = seq_len + hidden_prefix_len
 
         if tokens.shape[1] > target_len:
             raise ValueError("start_tokens length cannot exceed requested seq_len")
 
         progress_interval = max(0, int(progress_interval))
-        last_reported = max(0, tokens.shape[1] - bos_prefix_len)
+        last_reported = max(0, tokens.shape[1] - hidden_prefix_len)
 
         cached_conditioning_emb = None
         cached_second_conditioning_emb = None
@@ -603,6 +727,7 @@ class TransformerPriorConditioned(nn.Module):
                 conditioning_emb=cached_conditioning_emb,
                 second_conditioning_emb=cached_second_conditioning_emb,
                 timing_emb=cached_timing_emb,
+                prepend_start_embedding=self.use_start_embedding,
             )
             
             next_logits = logits[:, -1, :] / temperature
@@ -611,7 +736,7 @@ class TransformerPriorConditioned(nn.Module):
             next_token = torch.multinomial(probs, num_samples=1)
             
             tokens = torch.cat([tokens, next_token], dim=1)
-            generated_len = tokens.shape[1] - bos_prefix_len
+            generated_len = tokens.shape[1] - hidden_prefix_len
             if (
                 progress_label
                 and progress_interval > 0
@@ -620,8 +745,8 @@ class TransformerPriorConditioned(nn.Module):
                 print(f'{progress_label}: generated {generated_len}/{seq_len} tokens', flush=True)
                 last_reported = generated_len
 
-        if bos_prefix_len > 0:
-            tokens = tokens[:, bos_prefix_len:]
+        if hidden_prefix_len > 0:
+            tokens = tokens[:, hidden_prefix_len:]
 
         return tokens
 

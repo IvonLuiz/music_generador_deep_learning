@@ -23,7 +23,7 @@ from generation.transformer_io_utils import (
     save_level_spectrograms,
 )
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
-from generation.soundgenerator import SoundGenerator
+from generation.soundgenerator import SUPPORTED_AUDIO_METHODS, SoundGenerator
 from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH, FRAME_SIZE, N_MELS
 from train_scripts.jukebox_utils import load_jukebox_model
 from windowed_data_utils import (
@@ -88,6 +88,11 @@ def _stride_product(value) -> int:
             raise ValueError(f'Expected stride tuple/list of length 2, got {value}')
         return int(value[0]) * int(value[1])
     return int(value)
+
+def _optional_float(value):
+    if value is None:
+        return None
+    return float(value)
 
 def _parse_stride(value, use_2d: bool):
     if value is None:
@@ -244,6 +249,12 @@ def load_transformer_prior(
         num_embeddings = inferred_num_embeddings
 
     use_bos_token = bool(prior_cfg.get('use_bos_token', False))
+    use_start_embedding = bool(
+        prior_cfg.get(
+            'use_start_embedding',
+            model_cfg.get('use_start_embedding', 'start_embedding' in state_dict),
+        )
+    )
     token_embedding_weight = state_dict.get('token_embedding.weight')
     if token_embedding_weight is None:
         token_embedding_weight = state_dict.get('token_embedding.weight_orig')
@@ -257,8 +268,20 @@ def load_transformer_prior(
         output_vocab = int(to_logits_weight.shape[0])
         if token_vocab == output_vocab + 1:
             use_bos_token = True
+            use_start_embedding = False
         elif token_vocab == output_vocab:
             use_bos_token = False
+
+    if use_bos_token and use_start_embedding:
+        raise ValueError(
+            f'{model_path} requests both use_bos_token and use_start_embedding; choose one start-token mode.'
+        )
+    tie_input_output_embeddings = bool(
+        prior_cfg.get(
+            'tie_input_output_embeddings',
+            model_cfg.get('tie_input_output_embeddings', False),
+        )
+    )
 
     max_time_steps_cfg = int(prior_cfg.get('max_time_steps', 0))
     max_time_steps = max_time_steps_cfg if max_time_steps_cfg > 0 else 100
@@ -436,6 +459,8 @@ def load_transformer_prior(
         conditioner_dilation_growth_rate=conditioner_dilation_growth_rate,
         conditioner_dilation_cycle=conditioner_dilation_cycle,
         use_bos_token=use_bos_token,
+        use_start_embedding=use_start_embedding,
+        tie_input_output_embeddings=tie_input_output_embeddings,
         use_timing_conditioning=use_timing_conditioning,
         timing_num_bins=int(prior_cfg.get('timing_num_bins', 1024)),
         duration_num_bins=int(prior_cfg.get('duration_num_bins', 256)),
@@ -446,6 +471,13 @@ def load_transformer_prior(
         use_2d_conditioner=use_2d_conditioner,
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
         dropout=float(prior_cfg.get('dropout', 0.1)),
+        initialization_std=_optional_float(
+            prior_cfg.get('initialization_std', model_cfg.get('initialization_std'))
+        ),
+        position_embedding_init_std=_optional_float(
+            prior_cfg.get('position_embedding_init_std', model_cfg.get('position_embedding_init_std'))
+        ),
+        zero_init_biases=bool(prior_cfg.get('zero_init_biases', model_cfg.get('zero_init_biases', True))),
     ).to(device)
 
     load_state = dict(state_dict)
@@ -718,6 +750,11 @@ def _resolve_min_max_values_path(
         raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
     return min_max_values_path
 
+def _fixed_db_min_max_values(count: int, min_db: float, max_db: float) -> List[Dict[str, float]]:
+    if max_db <= min_db:
+        raise ValueError(f'fixed max dB must be > min dB, got min={min_db}, max={max_db}')
+    return [{'min': float(min_db), 'max': float(max_db)} for _ in range(count)]
+
 def _decode_level_to_audio(
     level: str,
     tokens: torch.Tensor,
@@ -731,15 +768,17 @@ def _decode_level_to_audio(
     decode_context_cols: int = 0,
     trim_frames: Optional[int] = None,
     min_max_values_path_override: Optional[str] = None,
+    use_fixed_db_scale: bool = False,
+    fixed_min_db: float = -80.0,
+    fixed_max_db: float = 0.0,
 ) -> None:
     vqvae_config_path = resolve_vqvae_config_path(vqvae_path)
     vqvae_config = load_config(vqvae_config_path)
     resolved_dataset_cfg = vqvae_config.get('dataset', {}) if isinstance(vqvae_config, dict) else {}
-
-    min_max_values_path = _resolve_min_max_values_path(
-        resolved_dataset_cfg=resolved_dataset_cfg,
-        vqvae_config_path=vqvae_config_path,
-        override_path=min_max_values_path_override,
+    input_mode = str(resolved_dataset_cfg.get('input_mode', '')).strip().lower()
+    should_use_fixed_db = (
+        use_fixed_db_scale
+        or (input_mode == 'audio' and min_max_values_path_override is None)
     )
 
     sample_rate = int(resolved_dataset_cfg.get('sample_rate', SAMPLE_RATE))
@@ -754,9 +793,6 @@ def _decode_level_to_audio(
 
     print(f'Loading {level} VQ-VAE from {vqvae_path}')
     vqvae = load_jukebox_model(vqvae_path, level, device, weights_file)
-
-    with open(min_max_values_path, 'rb') as f:
-        min_max_values = pickle.load(f)
 
     print(f'Decoding {level} indices into spectrograms and audio...')
     decoded_specs = decode_jukebox_token_timeline(
@@ -779,7 +815,21 @@ def _decode_level_to_audio(
         cmap='magma',
         figsize=(10, 4),
     )
-    min_max_list = prepare_min_max_values(min_max_values, decoded_specs.shape[0])
+    if should_use_fixed_db:
+        min_max_list = _fixed_db_min_max_values(decoded_specs.shape[0], fixed_min_db, fixed_max_db)
+        print(
+            f'Using fixed dB denormalization for {level}: '
+            f'normalized [0, 1] -> [{fixed_min_db:.1f}, {fixed_max_db:.1f}] dB'
+        )
+    else:
+        min_max_values_path = _resolve_min_max_values_path(
+            resolved_dataset_cfg=resolved_dataset_cfg,
+            vqvae_config_path=vqvae_config_path,
+            override_path=min_max_values_path_override,
+        )
+        with open(min_max_values_path, 'rb') as f:
+            min_max_values = pickle.load(f)
+        min_max_list = prepare_min_max_values(min_max_values, decoded_specs.shape[0])
 
     sound_generator = SoundGenerator(
         vqvae,
@@ -823,6 +873,9 @@ def test_transformer_prior(
     progress_interval: int = 128,
     decode_context_cols: int = -1,
     min_max_values_path: Optional[str] = None,
+    use_fixed_db_scale: bool = False,
+    fixed_min_db: float = -80.0,
+    fixed_max_db: float = 0.0,
     disable_timing_conditioning: bool = False,
     full_length_overlap_fraction: float = 0.5,
     timing_duration_seconds: float = 240.0,
@@ -1270,6 +1323,9 @@ def test_transformer_prior(
                 decode_context_cols=effective_context_cols,
                 trim_frames=trim_frames,
                 min_max_values_path_override=min_max_values_path,
+                use_fixed_db_scale=use_fixed_db_scale,
+                fixed_min_db=fixed_min_db,
+                fixed_max_db=fixed_max_db,
             )
         return
     transformer_dataset_cfg = bottom_config.get('dataset', {}) if isinstance(bottom_config, dict) else {}
@@ -1417,6 +1473,9 @@ def test_transformer_prior(
             save_dir=save_dir,
             device=device,
             min_max_values_path_override=min_max_values_path,
+            use_fixed_db_scale=use_fixed_db_scale,
+            fixed_min_db=fixed_min_db,
+            fixed_max_db=fixed_max_db,
         )
 
 if __name__ == '__main__':
@@ -1428,8 +1487,26 @@ if __name__ == '__main__':
             help=f'Path to Transformer {n} prior run directory, config, or .pth',
         )
     parser.add_argument('--bottom_vqvae', type=str, default=None, help='Path to bottom VQ-VAE run directory, config, or .pth')
-    parser.add_argument('--audio_method', type=str, default='griffinlim', help='Audio inversion: griffinlim or istft')
+    parser.add_argument(
+        '--audio_method',
+        type=str,
+        default='griffinlim',
+        help='Audio inversion: griffinlim or istft',
+    )
     parser.add_argument('--weights_file', type=str, default='best_model.pth')
+    parser.add_argument(
+        '--min_max_values_path',
+        type=str,
+        default=None,
+        help='Optional legacy min_max_values.pkl path. Raw-audio VQ-VAEs default to fixed dB scale when omitted.',
+    )
+    parser.add_argument(
+        '--use_fixed_db_scale',
+        action='store_true',
+        help='Force fixed dB denormalization instead of min_max_values.pkl.',
+    )
+    parser.add_argument('--fixed_min_db', type=float, default=-80.0, help='Fixed dB value mapped from normalized 0.0.')
+    parser.add_argument('--fixed_max_db', type=float, default=0.0, help='Fixed dB value mapped from normalized 1.0.')
     parser.add_argument('--n_samples', type=int, default=6, help='Number of samples to generate (default: 6)')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (default: 1.0)')
     parser.add_argument('--top_k', type=int, default=None, help='Top-k filtering for sampling (0 or negative for no filtering)')
@@ -1471,7 +1548,7 @@ if __name__ == '__main__':
     )
     parser.add_argument('--real_top_quantized', help='Path to real top quantized audio')
     parser.add_argument('--real_top_start_frame', type=int,default=0, help='Start frame for real top quantized audio')
-
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     args = parser.parse_args()
 
     if args.temperature <= 0:
@@ -1485,8 +1562,11 @@ if __name__ == '__main__':
     if args.timing_duration_seconds <= 0:
         raise ValueError(f'--timing_duration_seconds must be > 0, got {args.timing_duration_seconds}')
 
-    if args.audio_method not in ('griffinlim', 'istft'):
-        raise ValueError("--audio_method must be 'griffinlim' or 'istft'")
+    args.audio_method = args.audio_method.strip().lower()
+    if args.audio_method not in SUPPORTED_AUDIO_METHODS:
+        raise ValueError(f"--audio_method must be one of: {', '.join(SUPPORTED_AUDIO_METHODS)}")
+    if args.fixed_max_db <= args.fixed_min_db:
+        raise ValueError('--fixed_max_db must be greater than --fixed_min_db')
 
     test_transformer_prior(
         top_prior_path=args.top_prior,
@@ -1503,7 +1583,12 @@ if __name__ == '__main__':
         full_length=args.full_length,
         full_length_until=args.full_length_until,
         full_length_overlap_fraction=args.full_length_overlap_fraction,
+        seed=args.seed,
         timing_duration_seconds=args.timing_duration_seconds,
+        min_max_values_path=args.min_max_values_path,
+        use_fixed_db_scale=args.use_fixed_db_scale,
+        fixed_min_db=args.fixed_min_db,
+        fixed_max_db=args.fixed_max_db,
         disable_timing_conditioning=args.disable_timing_conditioning,
         real_top_quantized_path=args.real_top_quantized,
         real_top_start_frame=args.real_top_start_frame

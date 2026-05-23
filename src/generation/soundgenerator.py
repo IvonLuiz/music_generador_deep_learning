@@ -1,16 +1,21 @@
+from typing import Any
+
 import librosa
 import numpy as np
-from typing import Any
 
 import torch
 from torch import nn as _nn
 
 from processing.preprocess_audio import MinMaxNormalizer
 
+
+SUPPORTED_AUDIO_METHODS = ("griffinlim", "istft")
+
+
 class SoundGenerator:
 
     def __init__(self, autoencoder, hop_length, sample_rate=22050, n_fft=512, spectrogram_type="linear", n_mels=256):
-        self.autoencoder = autoencoder 
+        self.autoencoder = autoencoder
         self.hop_length = hop_length
         self.sample_rate = sample_rate
         self.n_fft = n_fft
@@ -20,8 +25,7 @@ class SoundGenerator:
             raise ValueError(f"Unsupported spectrogram_type '{spectrogram_type}'. Expected 'linear' or 'mel'.")
         self.__min_max_normalizer = MinMaxNormalizer(0, 1)
 
-    
-    def generate(self, spectrograms, min_max_values):
+    def generate(self, spectrograms, min_max_values, method="griffinlim"):
         """
         Generate audio signals from normalized log-spectrograms using the underlying autoencoder.
 
@@ -63,11 +67,10 @@ class SoundGenerator:
             # Fallback: assume the object implements reconstruct on numpy batches
             generated_spectrograms, latent_representations = self.autoencoder.reconstruct(spectrograms)
 
-        signals = self.convert_spectrograms_to_audio(generated_spectrograms, min_max_values)
+        signals = self.convert_spectrograms_to_audio(generated_spectrograms, min_max_values, method=method)
 
         return signals, latent_representations
-    
-    
+
     def convert_spectrograms_to_audio(self, spectrograms, min_max_values, method="griffinlim"):
         """
         Convert normalized log-spectrograms to audio signals.
@@ -77,7 +80,12 @@ class SoundGenerator:
         Returns:
             List of audio signals as numpy arrays
         """
-        assert method in ("griffinlim", "istft"), "Unsupported inversion method. Use 'griffinlim' or 'istft'."
+        method = str(method).strip().lower()
+        if method not in SUPPORTED_AUDIO_METHODS:
+            raise ValueError(
+                f"Unsupported inversion method '{method}'. "
+                f"Use one of: {', '.join(SUPPORTED_AUDIO_METHODS)}."
+            )
 
         signals = []
 
@@ -85,7 +93,7 @@ class SoundGenerator:
             # Reshape the log spectrogram to remove the third dimension (channels) used for the autoencoder
             log_spectrogram = spectrogram[:, :, 0]
             log_spectrogram = np.nan_to_num(log_spectrogram, nan=0.0, posinf=1.0, neginf=0.0)
-            
+
             denorm_log_spec = self.__min_max_normalizer.denormalize(
                 log_spectrogram, min_max_value["min"], min_max_value["max"]
             )
@@ -95,7 +103,6 @@ class SoundGenerator:
             signals.append(signal)
 
         return signals
-    
 
     def __invert_log_spectrogram_to_audio(self, log_spectrogram, method="griffinlim"):
         """
@@ -119,7 +126,7 @@ class SoundGenerator:
                     hop_length=self.hop_length,
                     power=2.0,
                 )
-            elif method == "istft":
+            elif method == 'istft':
                 magnitude_stft = librosa.feature.inverse.mel_to_stft(
                     M=mel_power,
                     sr=self.sample_rate,
@@ -141,11 +148,11 @@ class SoundGenerator:
 
             if method == 'griffinlim':
                 audio_signal = librosa.griffinlim(amplitude_spectrogram, hop_length=self.hop_length, n_fft=self.n_fft)
-            elif method == "istft":
+            elif method == 'istft':
                 audio_signal = librosa.istft(amplitude_spectrogram, hop_length=self.hop_length, n_fft=self.n_fft)
             else:
                 raise ValueError(f"Unsupported inversion method: {method}")
 
         audio_signal = np.nan_to_num(audio_signal, nan=0.0, posinf=0.0, neginf=0.0)
-        
+
         return audio_signal
