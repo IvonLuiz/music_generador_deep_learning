@@ -23,7 +23,7 @@ from generation.transformer_io_utils import (
     save_level_spectrograms,
 )
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
-from generation.soundgenerator import SoundGenerator
+from generation.soundgenerator import SUPPORTED_AUDIO_METHODS, SoundGenerator
 from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH, FRAME_SIZE, N_MELS
 from train_scripts.jukebox_utils import load_jukebox_model
 from windowed_data_utils import (
@@ -750,6 +750,11 @@ def _resolve_min_max_values_path(
         raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
     return min_max_values_path
 
+def _fixed_db_min_max_values(count: int, min_db: float, max_db: float) -> List[Dict[str, float]]:
+    if max_db <= min_db:
+        raise ValueError(f'fixed max dB must be > min dB, got min={min_db}, max={max_db}')
+    return [{'min': float(min_db), 'max': float(max_db)} for _ in range(count)]
+
 def _decode_level_to_audio(
     level: str,
     tokens: torch.Tensor,
@@ -763,15 +768,17 @@ def _decode_level_to_audio(
     decode_context_cols: int = 0,
     trim_frames: Optional[int] = None,
     min_max_values_path_override: Optional[str] = None,
+    use_fixed_db_scale: bool = False,
+    fixed_min_db: float = -80.0,
+    fixed_max_db: float = 0.0,
 ) -> None:
     vqvae_config_path = resolve_vqvae_config_path(vqvae_path)
     vqvae_config = load_config(vqvae_config_path)
     resolved_dataset_cfg = vqvae_config.get('dataset', {}) if isinstance(vqvae_config, dict) else {}
-
-    min_max_values_path = _resolve_min_max_values_path(
-        resolved_dataset_cfg=resolved_dataset_cfg,
-        vqvae_config_path=vqvae_config_path,
-        override_path=min_max_values_path_override,
+    input_mode = str(resolved_dataset_cfg.get('input_mode', '')).strip().lower()
+    should_use_fixed_db = (
+        use_fixed_db_scale
+        or (input_mode == 'audio' and min_max_values_path_override is None)
     )
 
     sample_rate = int(resolved_dataset_cfg.get('sample_rate', SAMPLE_RATE))
@@ -786,9 +793,6 @@ def _decode_level_to_audio(
 
     print(f'Loading {level} VQ-VAE from {vqvae_path}')
     vqvae = load_jukebox_model(vqvae_path, level, device, weights_file)
-
-    with open(min_max_values_path, 'rb') as f:
-        min_max_values = pickle.load(f)
 
     print(f'Decoding {level} indices into spectrograms and audio...')
     decoded_specs = decode_jukebox_token_timeline(
@@ -811,7 +815,21 @@ def _decode_level_to_audio(
         cmap='magma',
         figsize=(10, 4),
     )
-    min_max_list = prepare_min_max_values(min_max_values, decoded_specs.shape[0])
+    if should_use_fixed_db:
+        min_max_list = _fixed_db_min_max_values(decoded_specs.shape[0], fixed_min_db, fixed_max_db)
+        print(
+            f'Using fixed dB denormalization for {level}: '
+            f'normalized [0, 1] -> [{fixed_min_db:.1f}, {fixed_max_db:.1f}] dB'
+        )
+    else:
+        min_max_values_path = _resolve_min_max_values_path(
+            resolved_dataset_cfg=resolved_dataset_cfg,
+            vqvae_config_path=vqvae_config_path,
+            override_path=min_max_values_path_override,
+        )
+        with open(min_max_values_path, 'rb') as f:
+            min_max_values = pickle.load(f)
+        min_max_list = prepare_min_max_values(min_max_values, decoded_specs.shape[0])
 
     sound_generator = SoundGenerator(
         vqvae,
@@ -855,6 +873,9 @@ def test_transformer_prior(
     progress_interval: int = 128,
     decode_context_cols: int = -1,
     min_max_values_path: Optional[str] = None,
+    use_fixed_db_scale: bool = False,
+    fixed_min_db: float = -80.0,
+    fixed_max_db: float = 0.0,
     disable_timing_conditioning: bool = False,
     full_length_overlap_fraction: float = 0.5,
     timing_duration_seconds: float = 240.0,
@@ -1302,6 +1323,9 @@ def test_transformer_prior(
                 decode_context_cols=effective_context_cols,
                 trim_frames=trim_frames,
                 min_max_values_path_override=min_max_values_path,
+                use_fixed_db_scale=use_fixed_db_scale,
+                fixed_min_db=fixed_min_db,
+                fixed_max_db=fixed_max_db,
             )
         return
     transformer_dataset_cfg = bottom_config.get('dataset', {}) if isinstance(bottom_config, dict) else {}
@@ -1449,6 +1473,9 @@ def test_transformer_prior(
             save_dir=save_dir,
             device=device,
             min_max_values_path_override=min_max_values_path,
+            use_fixed_db_scale=use_fixed_db_scale,
+            fixed_min_db=fixed_min_db,
+            fixed_max_db=fixed_max_db,
         )
 
 if __name__ == '__main__':
@@ -1460,8 +1487,26 @@ if __name__ == '__main__':
             help=f'Path to Transformer {n} prior run directory, config, or .pth',
         )
     parser.add_argument('--bottom_vqvae', type=str, default=None, help='Path to bottom VQ-VAE run directory, config, or .pth')
-    parser.add_argument('--audio_method', type=str, default='griffinlim', help='Audio inversion: griffinlim or istft')
+    parser.add_argument(
+        '--audio_method',
+        type=str,
+        default='griffinlim',
+        help='Audio inversion: griffinlim or istft',
+    )
     parser.add_argument('--weights_file', type=str, default='best_model.pth')
+    parser.add_argument(
+        '--min_max_values_path',
+        type=str,
+        default=None,
+        help='Optional legacy min_max_values.pkl path. Raw-audio VQ-VAEs default to fixed dB scale when omitted.',
+    )
+    parser.add_argument(
+        '--use_fixed_db_scale',
+        action='store_true',
+        help='Force fixed dB denormalization instead of min_max_values.pkl.',
+    )
+    parser.add_argument('--fixed_min_db', type=float, default=-80.0, help='Fixed dB value mapped from normalized 0.0.')
+    parser.add_argument('--fixed_max_db', type=float, default=0.0, help='Fixed dB value mapped from normalized 1.0.')
     parser.add_argument('--n_samples', type=int, default=6, help='Number of samples to generate (default: 6)')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (default: 1.0)')
     parser.add_argument('--top_k', type=int, default=None, help='Top-k filtering for sampling (0 or negative for no filtering)')
@@ -1503,7 +1548,7 @@ if __name__ == '__main__':
     )
     parser.add_argument('--real_top_quantized', help='Path to real top quantized audio')
     parser.add_argument('--real_top_start_frame', type=int,default=0, help='Start frame for real top quantized audio')
-
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     args = parser.parse_args()
 
     if args.temperature <= 0:
@@ -1517,8 +1562,11 @@ if __name__ == '__main__':
     if args.timing_duration_seconds <= 0:
         raise ValueError(f'--timing_duration_seconds must be > 0, got {args.timing_duration_seconds}')
 
-    if args.audio_method not in ('griffinlim', 'istft'):
-        raise ValueError("--audio_method must be 'griffinlim' or 'istft'")
+    args.audio_method = args.audio_method.strip().lower()
+    if args.audio_method not in SUPPORTED_AUDIO_METHODS:
+        raise ValueError(f"--audio_method must be one of: {', '.join(SUPPORTED_AUDIO_METHODS)}")
+    if args.fixed_max_db <= args.fixed_min_db:
+        raise ValueError('--fixed_max_db must be greater than --fixed_min_db')
 
     test_transformer_prior(
         top_prior_path=args.top_prior,
@@ -1535,7 +1583,12 @@ if __name__ == '__main__':
         full_length=args.full_length,
         full_length_until=args.full_length_until,
         full_length_overlap_fraction=args.full_length_overlap_fraction,
+        seed=args.seed,
         timing_duration_seconds=args.timing_duration_seconds,
+        min_max_values_path=args.min_max_values_path,
+        use_fixed_db_scale=args.use_fixed_db_scale,
+        fixed_min_db=args.fixed_min_db,
+        fixed_max_db=args.fixed_max_db,
         disable_timing_conditioning=args.disable_timing_conditioning,
         real_top_quantized_path=args.real_top_quantized,
         real_top_start_frame=args.real_top_start_frame

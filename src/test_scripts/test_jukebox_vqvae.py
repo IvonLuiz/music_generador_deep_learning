@@ -14,7 +14,7 @@ import torch
 # Add 'src' to sys.path to allow imports from sibling directories
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from generation.soundgenerator import SoundGenerator
+from generation.soundgenerator import SUPPORTED_AUDIO_METHODS, SoundGenerator
 from processing.preprocess_audio import HOP_LENGTH, MIN_MAX_VALUES_SAVE_DIR, SAMPLE_RATE, TARGET_TIME_FRAMES, FRAME_SIZE, N_MELS
 from train_scripts.jukebox_utils import parse_level, load_jukebox_model
 from utils import find_min_max_for_path, list_npy_files
@@ -308,13 +308,19 @@ if __name__ == '__main__':
     parser.add_argument('--target_time_frames', type=int, default=None, help='Time frames used by load_maestro')
     parser.add_argument('--min_max_values', type=str, default=None, help='Optional path to min_max_values.pkl')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for sample selection')
-    parser.add_argument('--audio_method', type=str, default='griffinlim', help='Audio inversion: griffinlim or istft')
+    parser.add_argument(
+        '--audio_method',
+        type=str,
+        default='griffinlim',
+        help='Audio inversion: griffinlim or istft',
+    )
     args = parser.parse_args()
 
     if args.n_samples <= 0:
         raise ValueError(f'--n_samples must be > 0, got {args.n_samples}')
-    if args.audio_method not in ('griffinlim', 'istft'):
-        raise ValueError("--audio_method must be 'griffinlim' or 'istft'")
+    args.audio_method = args.audio_method.strip().lower()
+    if args.audio_method not in SUPPORTED_AUDIO_METHODS:
+        raise ValueError(f"--audio_method must be one of: {', '.join(SUPPORTED_AUDIO_METHODS)}")
 
     test_jukebox_vqvae(
         model_dir_or_file=args.model_path,

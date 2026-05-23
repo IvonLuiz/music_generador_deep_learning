@@ -17,7 +17,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils import load_config, set_global_seed
 from train_scripts.jukebox_utils import load_jukebox_model
 from test_scripts.test_transformer_prior import load_transformer_prior
-from generation.soundgenerator import SoundGenerator
+from generation.soundgenerator import SUPPORTED_AUDIO_METHODS, SoundGenerator
 from generation.transformer_io_utils import (
     decode_jukebox_indices,
     prepare_min_max_values,
@@ -673,7 +673,13 @@ def main():
         help='Extra latent token columns to include on each side when timeline-decoding bottom chunks.',
     )
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible generation (set to negative to disable)')
-    parser.add_argument('--audio_method', type=str, default='griffinlim', choices=['griffinlim', 'istft'], help='Spectrogram inversion method')
+    parser.add_argument(
+        '--audio_method',
+        type=str,
+        default='griffinlim',
+        choices=SUPPORTED_AUDIO_METHODS,
+        help='Spectrogram inversion method',
+    )
     parser.add_argument(
         '--save_middle_audio',
         action='store_true',
