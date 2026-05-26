@@ -470,6 +470,7 @@ def load_transformer_prior(
         timing_embedding_scale=float(prior_cfg.get('timing_embedding_scale', 1.0)),
         use_2d_conditioner=use_2d_conditioner,
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
+        attention_pattern=prior_cfg.get('attention_pattern', model_cfg.get('attention_pattern')),
         dropout=float(prior_cfg.get('dropout', 0.1)),
         initialization_std=_optional_float(
             prior_cfg.get('initialization_std', model_cfg.get('initialization_std'))

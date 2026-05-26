@@ -20,11 +20,11 @@ class FactoredAttention(nn.Module):
         @param model_dim: The dimensionality of the input and output features.
         @param num_heads: The number of attention heads.
         @param block_len: The length of the blocks for factored attention.
-        @param attention_type: The type of attention to use ('row', 'column', or 'previous_row').
+        @param attention_type: The type of attention to use ('row', 'column', 'previous_row', or 'full').
         @param qkv_ratio: The ratio of the model dimension to use for Q, K, V projections. Default is 1.0 (i.e., no reduction).
         """
         super().__init__()
-        assert attention_type in ['row', 'column', 'previous_row'], "attention_type must be one of 'row', 'column', or 'previous_row'"
+        assert attention_type in ['row', 'column', 'previous_row', 'full'], "attention_type must be one of 'row', 'column', 'previous_row', or 'full'"
         assert model_dim % num_heads == 0, "model_dim must be divisible by num_heads"
         assert qkv_ratio > 0, "qkv_ratio must be > 0"
 
@@ -56,6 +56,17 @@ class FactoredAttention(nn.Module):
 
         # project input to Q, K, V
         qkv = self.qkv_proj(x)  # (batch_size, seq_len, 3 * qkv_dim_total)
+
+        if self.attention_type == 'full':
+            qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+            q, k, v = qkv.unbind(dim=2)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            out = out.transpose(1, 2).reshape(batch_size, seq_len, self.qkv_dim_total)
+            return self.out_proj(out)
+
         # reshape into 2d grid and split into attention heads
         qkv = qkv.view(batch_size, num_blocks, self.block_len, 3, self.num_heads, self.head_dim) # (batch_size, num_blocks, block_len, 3, num_heads, head_dim)
         # split into q, k, v
@@ -162,5 +173,11 @@ if __name__ == "__main__":
     out_prev_row = prev_row_attn(dummy_x)
     assert out_prev_row.shape == (BATCH_SIZE, SEQ_LEN, MODEL_DIM), "Previous-row attention shape mismatch!"
     print(f"Previous-Row Attention Output Shape: {out_prev_row.shape} - PASSED")
+
+    print("\nTesting Full Causal Attention...")
+    full_attn = FactoredAttention(MODEL_DIM, NUM_HEADS, BLOCK_LEN, 'full')
+    out_full = full_attn(dummy_x)
+    assert out_full.shape == (BATCH_SIZE, SEQ_LEN, MODEL_DIM), "Full attention shape mismatch!"
+    print(f"Full Causal Attention Output Shape: {out_full.shape} - PASSED")
 
     print("\nAll implemented attention patterns passed successfully!")

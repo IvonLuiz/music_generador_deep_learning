@@ -311,6 +311,10 @@ def _maestro_row_for_path(file_path: str, dataset_cfg: dict, by_relative_path: d
         return row
 
     processed_base = _processed_audio_basename_from_path(file_path)
+    row = by_basename.get(processed_base)
+    if row is not None:
+        return row
+
     for ext in (".wav", ".flac", ".aiff", ".aif"):
         row = by_basename.get(processed_base + ext)
         if row is not None:
