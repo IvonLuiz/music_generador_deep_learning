@@ -1,6 +1,6 @@
 import os
 import sys
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -65,6 +65,7 @@ class TransformerPriorConditioned(nn.Module):
         conditioner_dilation_cycle: int = 8,
         dropout: float = 0.1,
         attention_qkv_ratio: float = 1.0,
+        attention_pattern: Optional[Union[str, Sequence[str]]] = None,
         use_timing_conditioning: bool = True,
         timing_num_bins: int = 1024,
         duration_num_bins: int = 256,
@@ -114,6 +115,8 @@ class TransformerPriorConditioned(nn.Module):
         @param conditioner_dilation_growth_rate The rate at which the dilation factor grows in the WaveNet conditioner. Defaults to 3.
         @param conditioner_dilation_cycle The cycle length for the dilation factors in the WaveNet conditioner. Defaults to 8.
         @param dropout The dropout probability. Defaults to 0.1.
+        @param attention_pattern Self-attention pattern. Use None/'factored' for Jukebox-style
+        row, column, previous-row alternation, or 'full' for full causal attention in every layer.
         @param use_timing_conditioning Whether to add learned timing metadata to every token embedding.
         @param initialization_std Optional Jukebox-style normal initialization std for matmul, embedding, and conv weights.
         @param position_embedding_init_std Optional position embedding init std. Defaults to 2 * initialization_std.
@@ -135,6 +138,7 @@ class TransformerPriorConditioned(nn.Module):
             raise ValueError("use_bos_token and use_start_embedding are mutually exclusive")
         self.tie_input_output_embeddings = bool(tie_input_output_embeddings)
         self.attention_qkv_ratio = float(attention_qkv_ratio)
+        self.attention_patterns = self._normalize_attention_pattern(attention_pattern)
         self.use_timing_conditioning = bool(use_timing_conditioning)
         self.timing_num_bins = int(timing_num_bins)
         self.duration_num_bins = int(duration_num_bins)
@@ -315,7 +319,7 @@ class TransformerPriorConditioned(nn.Module):
         """!
         @brief Initializes the factored transformer layers for the model. This is separated into its own method for clarity and potential future customization.
         """
-        attention_patterns = ['row', 'column', 'previous_row']
+        attention_patterns = self.attention_patterns
 
         self.transformer = nn.Sequential(*[
             FactoredTransformerLayer(
@@ -328,6 +332,41 @@ class TransformerPriorConditioned(nn.Module):
                 qkv_ratio=self.attention_qkv_ratio,
             ) for num_layer in range(self.num_layers)
         ])
+
+    @staticmethod
+    def _normalize_attention_pattern(attention_pattern: Optional[Union[str, Sequence[str]]]):
+        """!
+        @brief Normalize the attention pattern input into a list of valid patterns for each layer.
+        
+        @param attention_pattern The raw attention pattern input, which can be None, a string, or a sequence of strings.
+        @return A list of attention patterns corresponding to each transformer layer.
+        """
+        
+        valid_patterns = {'row', 'column', 'previous_row', 'full'}
+        factored_patterns = ['row', 'column', 'previous_row']
+        if attention_pattern is None:
+            return factored_patterns
+
+        if isinstance(attention_pattern, str):
+            pattern = attention_pattern.strip().lower()
+            if pattern == 'factored':
+                return factored_patterns
+            if pattern == 'full':
+                return ['full']
+            if pattern in valid_patterns:
+                return [pattern]
+            raise ValueError(
+                "attention_pattern must be 'full', 'factored', or a list containing "
+                "'row', 'column', 'previous_row', and/or 'full'"
+            )
+
+        patterns = [str(pattern).strip().lower() for pattern in attention_pattern]
+        if not patterns:
+            raise ValueError("attention_pattern list cannot be empty")
+        invalid = [pattern for pattern in patterns if pattern not in valid_patterns]
+        if invalid:
+            raise ValueError(f"Unsupported attention pattern(s): {invalid}")
+        return patterns
 
     def forward(
         self,

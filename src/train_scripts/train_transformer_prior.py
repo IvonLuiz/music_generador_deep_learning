@@ -435,6 +435,7 @@ def train_transformer_prior(
         conditioner_dilation_cycle=int(prior_cfg.get('conditioner_dilation_cycle', 8)),
         dropout=float(prior_cfg.get('dropout', 0.1)),
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
+        attention_pattern=prior_cfg.get('attention_pattern'),
         use_bos_token=bool(prior_cfg.get('use_bos_token', False)),
         use_start_embedding=bool(prior_cfg.get('use_start_embedding', False)),
         tie_input_output_embeddings=bool(prior_cfg.get('tie_input_output_embeddings', False)),
@@ -639,6 +640,7 @@ def train_transformer_prior(
     config_to_save['model']['use_bos_token'] = bool(prior_cfg.get('use_bos_token', False))
     config_to_save['model']['use_start_embedding'] = bool(prior_cfg.get('use_start_embedding', False))
     config_to_save['model']['tie_input_output_embeddings'] = bool(prior_cfg.get('tie_input_output_embeddings', False))
+    config_to_save['model']['attention_pattern'] = prior_cfg.get('attention_pattern', 'factored')
     config_to_save['model']['initialization_std'] = _optional_float(prior_cfg.get('initialization_std'))
     config_to_save['model']['position_embedding_init_std'] = _optional_float(
         prior_cfg.get('position_embedding_init_std')
