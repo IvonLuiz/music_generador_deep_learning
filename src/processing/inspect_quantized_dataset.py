@@ -13,7 +13,7 @@ import torch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from generation.soundgenerator import SoundGenerator
+from generation.soundgenerator import SUPPORTED_AUDIO_METHODS, SoundGenerator
 from generation.transformer_io_utils import (
     decode_jukebox_indices,
     resolve_vqvae_min_max_values_path,
@@ -419,7 +419,13 @@ def main() -> None:
     parser.add_argument('--samples', type=int, default=4, help='How many quantized examples to inspect')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--start_frame', type=int, default=None, help='Legacy full-song mode only: requested raw-frame start to inspect')
-    parser.add_argument('--audio_method', type=str, default='griffinlim', choices=['griffinlim', 'istft'], help='Audio inversion method')
+    parser.add_argument(
+        '--audio_method',
+        type=str,
+        default='griffinlim',
+        choices=SUPPORTED_AUDIO_METHODS,
+        help='Audio inversion method',
+    )
     parser.add_argument('--save_root', type=str, default='samples/quantized_dataset_inspection', help='Root directory for outputs')
     args = parser.parse_args()
 
