@@ -107,9 +107,11 @@ class EMAVectorQuantizer(nn.Module):
                 random_indices = torch.randint(0, z_flat.shape[0], (len(dead_codes_idx),), device=z_flat.device)
                 random_vectors = z_flat[random_indices]  # (num_restarts, D)
                 
-                # Reset EMA buffers for dead codes
-                self.cluster_size.data[dead_codes_idx] = self.restart_threshold
-                self.embedding_avg.data[dead_codes_idx] = (random_vectors * self.restart_threshold).to(self.embedding_avg.dtype)
+                # Reset EMA buffers for dead codes to a safer initial value (e.g., threshold + 1)
+                # so they don't immediately die on the next step if they get 0 uses.
+                safer_cluster_size = max(self.restart_threshold * 2.0, 1.0)
+                self.cluster_size.data[dead_codes_idx] = safer_cluster_size
+                self.embedding_avg.data[dead_codes_idx] = (random_vectors * safer_cluster_size).to(self.embedding_avg.dtype)
             
             # Normalize the updated codebook with Laplace smoothing
             # formula from DeepMind: (N_i + epsilon) / (sum(N) + K * epsilon)
