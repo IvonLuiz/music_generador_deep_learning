@@ -224,7 +224,6 @@ def _load_config_and_checkpoint(model_dir_or_file: str, weights_file: str):
 def load_transformer_prior(
     model_layer: str, model_dir_or_file: str,
     device: torch.device, weights_file: str = 'best_model.pth',
-    disable_timing_conditioning: bool = False,
 ) -> Tuple[TransformerPriorConditioned, dict, str]:
     assert model_layer in ['top', 'middle', 'bottom'], f'model_layer must be one of "top", "middle", or "bottom", got {model_layer}'
 
@@ -248,34 +247,12 @@ def load_transformer_prior(
         print(f'Warning: num_embeddings from config ({num_embeddings}) does not match checkpoint ({inferred_num_embeddings}). Using checkpoint value for loading model.')
         num_embeddings = inferred_num_embeddings
 
-    use_bos_token = bool(prior_cfg.get('use_bos_token', False))
     use_start_embedding = bool(
         prior_cfg.get(
             'use_start_embedding',
             model_cfg.get('use_start_embedding', 'start_embedding' in state_dict),
         )
     )
-    token_embedding_weight = state_dict.get('token_embedding.weight')
-    if token_embedding_weight is None:
-        token_embedding_weight = state_dict.get('token_embedding.weight_orig')
-
-    to_logits_weight = state_dict.get('to_logits.weight')
-    if to_logits_weight is None:
-        to_logits_weight = state_dict.get('to_logits.weight_orig')
-
-    if token_embedding_weight is not None and to_logits_weight is not None:
-        token_vocab = int(token_embedding_weight.shape[0])
-        output_vocab = int(to_logits_weight.shape[0])
-        if token_vocab == output_vocab + 1:
-            use_bos_token = True
-            use_start_embedding = False
-        elif token_vocab == output_vocab:
-            use_bos_token = False
-
-    if use_bos_token and use_start_embedding:
-        raise ValueError(
-            f'{model_path} requests both use_bos_token and use_start_embedding; choose one start-token mode.'
-        )
     tie_input_output_embeddings = bool(
         prior_cfg.get(
             'tie_input_output_embeddings',
@@ -297,17 +274,11 @@ def load_transformer_prior(
         )
         if key in state_dict
     ]
-    if deprecated_timing_keys and not disable_timing_conditioning:
+    if deprecated_timing_keys:
         raise RuntimeError(
             f'Transformer prior checkpoint {model_path} uses deprecated timing parameters: '
             f'{deprecated_timing_keys}. This test/generation path now supports only '
-            f'learned_absolute_relative timing. Retrain this prior with the new timing config, '
-            f'or pass --disable_timing_conditioning to load it without timing.'
-        )
-    if deprecated_timing_keys and disable_timing_conditioning:
-        print(
-            f'Ignoring deprecated timing parameters for {model_layer} prior because '
-            f'--disable_timing_conditioning is set: {deprecated_timing_keys}'
+            f'learned_absolute_relative timing. Retrain this prior with the new timing config.'
         )
 
     checkpoint_has_learned_timing = (
@@ -315,7 +286,7 @@ def load_transformer_prior(
         or 'relative_timing_embedding.weight' in state_dict
         or 'duration_timing_embedding.weight' in state_dict
     )
-    use_timing_conditioning = False if disable_timing_conditioning else bool(
+    use_timing_conditioning = bool(
         prior_cfg.get('use_timing_conditioning', checkpoint_has_learned_timing)
     )
 
@@ -458,7 +429,6 @@ def load_transformer_prior(
         conditioner_conv_channels=conditioner_conv_channels,
         conditioner_dilation_growth_rate=conditioner_dilation_growth_rate,
         conditioner_dilation_cycle=conditioner_dilation_cycle,
-        use_bos_token=use_bos_token,
         use_start_embedding=use_start_embedding,
         tie_input_output_embeddings=tie_input_output_embeddings,
         use_timing_conditioning=use_timing_conditioning,
@@ -877,7 +847,6 @@ def test_transformer_prior(
     use_fixed_db_scale: bool = False,
     fixed_min_db: float = -80.0,
     fixed_max_db: float = 0.0,
-    disable_timing_conditioning: bool = False,
     full_length_overlap_fraction: float = 0.5,
     timing_duration_seconds: float = 240.0,
     seed: Optional[int] = 42,
@@ -899,7 +868,6 @@ def test_transformer_prior(
         top_prior_path,
         device,
         weights_file,
-        disable_timing_conditioning=disable_timing_conditioning,
     )
     top_seq_len = int(top_config['model']['inferred_seq_lens']['top'])
     top_grid = top_config['model'].get('inferred_grids', {}).get('top')
@@ -910,7 +878,6 @@ def test_transformer_prior(
         middle_prior_path,
         device,
         weights_file,
-        disable_timing_conditioning=disable_timing_conditioning,
     )
     middle_seq_len = int(middle_config['model']['inferred_seq_lens']['middle'])
     middle_grid = middle_config['model'].get('inferred_grids', {}).get('middle')
@@ -921,7 +888,6 @@ def test_transformer_prior(
         bottom_prior_path,
         device,
         weights_file,
-        disable_timing_conditioning=disable_timing_conditioning,
     )
     bottom_seq_len = int(bottom_config['model']['inferred_seq_lens']['bottom'])
     bottom_grid = bottom_config['model'].get('inferred_grids', {}).get('bottom')
@@ -1032,9 +998,9 @@ def test_transformer_prior(
         bottom_chunks_per_middle = (mid_tf // bot_tf) if target_depth >= 2 and mid_tf % bot_tf == 0 else None
 
         timing_enabled = {
-            'top': top_prior.use_timing_conditioning and not disable_timing_conditioning,
-            'middle': middle_prior.use_timing_conditioning and not disable_timing_conditioning and target_depth >= 1,
-            'bottom': bottom_prior.use_timing_conditioning and not disable_timing_conditioning and target_depth >= 2,
+            'top': top_prior.use_timing_conditioning,
+            'middle': middle_prior.use_timing_conditioning and target_depth >= 1,
+            'bottom': bottom_prior.use_timing_conditioning and target_depth >= 2,
         }
         top_timing = (
             build_timing_schedule_with_offset(
@@ -1542,11 +1508,6 @@ if __name__ == '__main__':
         default=240.0,
         help='Synthetic song duration for timing conditioning when sampling from the top prior (default: 240s)'
     )
-    parser.add_argument(
-        '--disable_timing_conditioning',
-        action='store_true',
-        help='Load timing-capable priors without passing timing conditioning'
-    )
     parser.add_argument('--real_top_quantized', help='Path to real top quantized audio')
     parser.add_argument('--real_top_start_frame', type=int,default=0, help='Start frame for real top quantized audio')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
@@ -1590,7 +1551,6 @@ if __name__ == '__main__':
         use_fixed_db_scale=args.use_fixed_db_scale,
         fixed_min_db=args.fixed_min_db,
         fixed_max_db=args.fixed_max_db,
-        disable_timing_conditioning=args.disable_timing_conditioning,
         real_top_quantized_path=args.real_top_quantized,
         real_top_start_frame=args.real_top_start_frame
     )

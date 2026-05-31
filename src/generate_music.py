@@ -29,7 +29,6 @@ from generation.transformer_io_utils import (
 from windowed_data_utils import (
     build_level_starts,
     build_timing_schedule,
-    build_windowed_starts,
 )
 from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH, FRAME_SIZE
 
@@ -81,6 +80,13 @@ def _resolve_prior_config_path(
         return explicit_path
 
     return _resolve_latest_config_path(default_run_root, level_name)
+
+
+def _normalize_min_max_values_path(path: str) -> str:
+    candidate = os.path.abspath(os.path.expanduser(path))
+    if os.path.isdir(candidate):
+        candidate = os.path.join(candidate, 'min_max_values.pkl')
+    return candidate
 
 
 def _debug(msg: str) -> None:
@@ -256,6 +262,12 @@ def _compute_windowed_step(
     step_frames = hop_cols * frames_per_token_col
     effective_overlap = overlap_cols / time_cols
     return step_frames, effective_overlap, overlap_cols, hop_cols
+
+
+def _resolve_decode_context_cols(requested_context_cols: int, chunk_time_cols: int) -> int:
+    if requested_context_cols < 0:
+        return max(1, int(chunk_time_cols) // 2)
+    return int(requested_context_cols)
 
 
 def _assemble_token_timeline(
@@ -549,6 +561,9 @@ def _decode_bottom_blocks(
     return reconstructed_spectrograms
 
 
+def _fixed_db_min_max_values(count: int, min_db: float, max_db: float) -> List[Dict[str, float]]:
+    return [{'min': min_db, 'max': max_db} for _ in range(count)]
+
 def _save_audio_from_spectrogram(
     spectrograms: np.ndarray,
     min_max_values,
@@ -560,6 +575,9 @@ def _save_audio_from_spectrogram(
     spectrogram_type: str,
     n_mels: int,
     audio_method: str,
+    use_fixed_db_scale: bool = False,
+    fixed_min_db: float = -80.0,
+    fixed_max_db: float = 0.0,
 ) -> str:
     """!
     @brief Convert decoded normalized spectrograms to audio and save the first sample.
@@ -575,7 +593,11 @@ def _save_audio_from_spectrogram(
     @param audio_method Inversion method accepted by `SoundGenerator`.
     @return Full path of the written waveform file.
     """
-    min_max_list = prepare_min_max_values(min_max_values, spectrograms.shape[0])
+    if use_fixed_db_scale or min_max_values is None:
+        min_max_list = _fixed_db_min_max_values(spectrograms.shape[0], fixed_min_db, fixed_max_db)
+    else:
+        min_max_list = prepare_min_max_values(min_max_values, spectrograms.shape[0])
+
     sound_generator = SoundGenerator(
         None,
         hop_length=hop_length,
@@ -607,18 +629,6 @@ def main():
     parser.add_argument('--bottom_run_root', type=str, default=DEFAULT_BOTTOM_RUN_ROOT, help='Default bottom run root used when --bottom_config is not provided')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature for all priors')
     parser.add_argument('--top_k', type=int, default=None, help='Top-k sampling (None disables top-k)')
-    parser.add_argument(
-        '--bottom_temperature',
-        type=float,
-        default=None,
-        help='Optional bottom-only sampling temperature. Defaults to --temperature.',
-    )
-    parser.add_argument(
-        '--bottom_top_k',
-        type=int,
-        default=None,
-        help='Optional bottom-only top-k. Defaults to --top_k.',
-    )
     parser.add_argument('--weights_file', type=str, default='best_model.pth', help='Checkpoint filename for transformer priors (default: best_model.pth)')
     parser.add_argument(
         '--sampling_mode',
@@ -634,30 +644,17 @@ def main():
         help='Overlap fraction for windowed sampling (default: 0.5).',
     )
     parser.add_argument(
+        '--windowed_prefix_levels',
+        type=str,
+        default='all',
+        choices=['all', 'top'],
+        help='Windowed levels. Use top to make middle/bottom use full-window hops without overlap/prefixes.',
+    )
+    parser.add_argument(
         '--duration_seconds',
         type=float,
         default=30.0,
-        help='Target generated song duration in seconds. This is also the timing conditioning total_duration_s.',
-    )
-    parser.add_argument(
-        '--disable_timing_conditioning',
-        action='store_true',
-        help='Do not pass timing metadata to the priors during generation.',
-    )
-    parser.add_argument(
-        '--disable_top_timing_conditioning',
-        action='store_true',
-        help='Do not pass timing metadata to the top prior during generation.',
-    )
-    parser.add_argument(
-        '--disable_middle_timing_conditioning',
-        action='store_true',
-        help='Do not pass timing metadata to the middle prior during generation.',
-    )
-    parser.add_argument(
-        '--disable_bottom_timing_conditioning',
-        action='store_true',
-        help='Do not pass timing metadata to the bottom prior during generation.',
+        help='Target generated song duration in seconds.',
     )
     parser.add_argument(
         '--bottom_decode_mode',
@@ -669,8 +666,8 @@ def main():
     parser.add_argument(
         '--bottom_decode_context_cols',
         type=int,
-        default=0,
-        help='Extra latent token columns to include on each side when timeline-decoding bottom chunks.',
+        default=-1,
+        help='Extra latent token columns on each side when timeline-decoding bottom chunks. Use -1 for half-window context.',
     )
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible generation (set to negative to disable)')
     parser.add_argument(
@@ -680,6 +677,19 @@ def main():
         choices=SUPPORTED_AUDIO_METHODS,
         help='Spectrogram inversion method',
     )
+    parser.add_argument(
+        '--min_max_values_path',
+        type=str,
+        default=None,
+        help='Optional explicit path to min_max_values.pkl',
+    )
+    parser.add_argument(
+        '--use_fixed_db_scale',
+        action='store_true',
+        help='Force fixed dB denormalization instead of returning a min_max_values.pkl path.',
+    )
+    parser.add_argument('--fixed_min_db', type=float, default=-80.0, help='Fixed dB value mapped from normalized 0.0.')
+    parser.add_argument('--fixed_max_db', type=float, default=0.0, help='Fixed dB value mapped from normalized 1.0.')
     parser.add_argument(
         '--save_middle_audio',
         action='store_true',
@@ -696,21 +706,12 @@ def main():
     args.top_k = args.top_k if (args.top_k is not None and args.top_k > 0) else None
     if not args.weights_file.endswith('.pth'):
         args.weights_file += '.pth'
-    if args.bottom_temperature is None:
-        args.bottom_temperature = args.temperature
-    if args.bottom_temperature <= 0:
-        raise ValueError(f'--bottom_temperature must be > 0, got {args.bottom_temperature}')
-    if args.bottom_top_k is None:
-        args.bottom_top_k = args.top_k
-    if args.bottom_top_k is not None and args.bottom_top_k < 0:
-        raise ValueError(f'--bottom_top_k must be >= 0, got {args.bottom_top_k}')
-    args.bottom_top_k = args.bottom_top_k if (args.bottom_top_k is not None and args.bottom_top_k > 0) else None
     if args.duration_seconds <= 0:
         raise ValueError(f'--duration_seconds must be > 0, got {args.duration_seconds}')
     if not 0.0 <= args.overlap_fraction < 1.0:
         raise ValueError(f'--overlap_fraction must be in [0, 1), got {args.overlap_fraction}')
-    if args.bottom_decode_context_cols < 0:
-        raise ValueError(f'--bottom_decode_context_cols must be >= 0, got {args.bottom_decode_context_cols}')
+    if args.bottom_decode_context_cols < -1:
+        raise ValueError(f'--bottom_decode_context_cols must be >= -1, got {args.bottom_decode_context_cols}')
 
     if args.seed is not None and args.seed < 0:
         args.seed = None
@@ -792,6 +793,10 @@ def generate_hierarchical_music(args) -> str:
     bottom_prior_cfg = bottom_config.get('priors', {}).get('bottom_prior', {}) if isinstance(bottom_config, dict) else {}
     bottom_second_cond_len = int(bottom_model_cfg.get('inferred_second_cond_seq_len', 0))
     bottom_condition_on_top = bool(bottom_prior_cfg.get('condition_on_top', False)) or bottom_second_cond_len > 0
+    bottom_decode_context_cols = _resolve_decode_context_cols(
+        args.bottom_decode_context_cols,
+        int(bottom_grid[0]),
+    )
 
     dataset_cfg = bottom_config.get('dataset', {}) if isinstance(bottom_config, dict) else {}
     quantization_cfg, quantized_path = _load_windowed_quantization_config(bottom_config)
@@ -820,6 +825,15 @@ def generate_hierarchical_music(args) -> str:
         top_step, top_overlap, top_overlap_cols, top_hop_cols = _compute_windowed_step(top_tf, top_grid, args.overlap_fraction)
         mid_step, mid_overlap, mid_overlap_cols, mid_hop_cols = _compute_windowed_step(mid_tf, middle_grid, args.overlap_fraction)
         bot_step, bot_overlap, bot_overlap_cols, bot_hop_cols = _compute_windowed_step(bot_tf, bottom_grid, args.overlap_fraction)
+        if args.windowed_prefix_levels == 'top':
+            mid_step = mid_tf
+            bot_step = bot_tf
+            mid_overlap = 0.0
+            bot_overlap = 0.0
+            mid_overlap_cols = 0
+            bot_overlap_cols = 0
+            mid_hop_cols = int(middle_grid[0])
+            bot_hop_cols = int(bottom_grid[0])
         effective_overlap = {'top': top_overlap, 'middle': mid_overlap, 'bottom': bot_overlap}
         overlap_cols = {'top': top_overlap_cols, 'middle': mid_overlap_cols, 'bottom': bot_overlap_cols}
         hop_cols = {'top': top_hop_cols, 'middle': mid_hop_cols, 'bottom': bot_hop_cols}
@@ -835,8 +849,19 @@ def generate_hierarchical_music(args) -> str:
     else:
         top_step, mid_step, bot_step = training_top_step, training_mid_step, training_bot_step
 
-    _debug('Resolving min_max_values.pkl path...')
-    min_max_values_path = resolve_min_max_values_path(bottom_config, debug_fn=_debug)
+    min_max_values_path = None
+    if not args.use_fixed_db_scale:
+        _debug('Resolving min_max_values.pkl path...')
+        if args.min_max_values_path:
+            min_max_values_path = _normalize_min_max_values_path(args.min_max_values_path)
+            _debug(f'Using explicitly provided min_max_values_path: {min_max_values_path}')
+        else:
+            try:
+                min_max_values_path = resolve_min_max_values_path(bottom_config, debug_fn=_debug)
+            except FileNotFoundError as e:
+                print(f'Warning: {str(e)} Proceeding without it.')
+    else:
+        _debug('Skipping min_max_values.pkl resolution (using fixed dB scale)')
 
     _debug('Loading bottom VQ-VAE config...')
     vqvae_cfg = bottom_config.get('vqvae', {}) if isinstance(bottom_config, dict) else {}
@@ -885,15 +910,17 @@ def generate_hierarchical_music(args) -> str:
     
     base_start_frame = 0
     total_source_frames = max(1, int(math.ceil((args.duration_seconds * sample_rate) / hop_length)))
+    use_top_windowed_prefix = args.sampling_mode == 'windowed'
+    use_child_windowed_prefix = args.sampling_mode == 'windowed' and args.windowed_prefix_levels == 'all'
 
     if args.sampling_mode == 'windowed':
-        top_start_frames = build_windowed_starts(total_source_frames, top_tf, top_step)
-        mid_start_frames = build_windowed_starts(total_source_frames, mid_tf, mid_step)
-        bot_start_frames = build_windowed_starts(total_source_frames, bot_tf, bot_step)
+        top_start_frames = build_level_starts(total_source_frames, top_tf, top_step)
+        mid_start_frames = build_level_starts(total_source_frames, mid_tf, mid_step)
+        bot_start_frames = build_level_starts(total_source_frames, bot_tf, bot_step)
     elif args.sampling_mode == 'no_overlap':
-        top_start_frames = build_windowed_starts(total_source_frames, top_tf, top_step)
-        mid_start_frames = build_windowed_starts(total_source_frames, mid_tf, mid_step)
-        bot_start_frames = build_windowed_starts(total_source_frames, bot_tf, bot_step)
+        top_start_frames = build_level_starts(total_source_frames, top_tf, top_step)
+        mid_start_frames = build_level_starts(total_source_frames, mid_tf, mid_step)
+        bot_start_frames = build_level_starts(total_source_frames, bot_tf, bot_step)
     else:
         top_start_frames = build_level_starts(total_source_frames, top_tf, top_step)
         mid_start_frames = build_level_starts(total_source_frames, mid_tf, mid_step)
@@ -916,6 +943,7 @@ def generate_hierarchical_music(args) -> str:
     print(f"--- Generation Plan ---")
     print(f"Sampling mode: {args.sampling_mode}")
     if args.sampling_mode == 'windowed':
+        print(f"Windowed prefix levels: {args.windowed_prefix_levels}")
         print(
             "Requested/effective overlap: "
             f"{args.overlap_fraction:.2f} / "
@@ -924,16 +952,15 @@ def generate_hierarchical_music(args) -> str:
     print(f"Requested generated duration: {args.duration_seconds:.2f}s")
     print(
         "Sampling controls: "
-        f"top/middle temp={args.temperature:.3f}, top_k={args.top_k}; "
-        f"bottom temp={args.bottom_temperature:.3f}, top_k={args.bottom_top_k}"
+        f"temp={args.temperature:.3f}, top_k={args.top_k}"
     )
     print(f"Timing total duration: {total_source_duration_s:.2f}s ({total_source_frames} frames)")
     print(f"Sampling window steps: Top={top_step}, Mid={mid_step}, Bot={bot_step} frames")
     print(f"Training window steps: Top={training_top_step}, Mid={training_mid_step}, Bot={training_bot_step} frames")
     timing_enabled = {
-        'top': top_prior.use_timing_conditioning and not (args.disable_timing_conditioning or args.disable_top_timing_conditioning),
-        'middle': middle_prior.use_timing_conditioning and not (args.disable_timing_conditioning or args.disable_middle_timing_conditioning),
-        'bottom': bottom_prior.use_timing_conditioning and not (args.disable_timing_conditioning or args.disable_bottom_timing_conditioning),
+        'top': top_prior.use_timing_conditioning,
+        'middle': middle_prior.use_timing_conditioning,
+        'bottom': bottom_prior.use_timing_conditioning,
     }
     print(
         "Timing conditioning during generation: "
@@ -980,9 +1007,9 @@ def generate_hierarchical_music(args) -> str:
         start_frames=top_start_frames,
         level_time_frames=top_tf,
         level_grid=top_grid,
-        use_windowed_prefix=args.sampling_mode == 'windowed',
+        use_windowed_prefix=use_top_windowed_prefix,
     )
-    if args.sampling_mode == 'windowed':
+    if use_top_windowed_prefix:
         _validate_window_prefixes(top_tokens_list, top_start_frames, top_tf, top_grid, 'top')
     full_top_tokens = _assemble_token_timeline(
         tokens_list=top_tokens_list,
@@ -1018,10 +1045,11 @@ def generate_hierarchical_music(args) -> str:
         start_frames=mid_start_frames,
         level_time_frames=mid_tf,
         level_grid=middle_grid,
-        use_windowed_prefix=args.sampling_mode == 'windowed',
+        use_windowed_prefix=use_child_windowed_prefix,
     )
-    if args.sampling_mode == 'windowed':
+    if use_child_windowed_prefix:
         _validate_window_prefixes(middle_tokens_list, mid_start_frames, mid_tf, middle_grid, 'middle')
+
     full_middle_tokens = _assemble_token_timeline(
         tokens_list=middle_tokens_list,
         start_frames=mid_start_frames,
@@ -1063,18 +1091,19 @@ def generate_hierarchical_music(args) -> str:
         seq_len=bottom_seq_len,
         num_chunks=bottom_chunks,
         device=device,
-        temperature=args.bottom_temperature,
-        top_k=args.bottom_top_k,
+        temperature=args.temperature,
+        top_k=args.top_k,
         upper_tokens_list=middle_slices_for_bottom,
         second_upper_tokens_list=top_slices_for_bottom,
         timing_list=bot_timing,
         start_frames=bot_start_frames,
         level_time_frames=bot_tf,
         level_grid=bottom_grid,
-        use_windowed_prefix=args.sampling_mode == 'windowed',
+        use_windowed_prefix=use_child_windowed_prefix,
     )
-    if args.sampling_mode == 'windowed':
+    if use_child_windowed_prefix:
         _validate_window_prefixes(bottom_tokens_list, bot_start_frames, bot_tf, bottom_grid, 'bottom')
+
     full_bottom_tokens = _assemble_token_timeline(
         tokens_list=bottom_tokens_list,
         start_frames=bot_start_frames,
@@ -1098,22 +1127,15 @@ def generate_hierarchical_music(args) -> str:
         timing_source = 'partial_duration_conditioned_window_schedule'
     timing_metadata = {
         'timing_source': timing_source,
-        'disable_timing_conditioning': bool(args.disable_timing_conditioning),
         'timing_conditioning_enabled': dict(timing_enabled),
         'sampling_mode': args.sampling_mode,
+        'windowed_prefix_levels': args.windowed_prefix_levels,
         'spectrogram_assembly': 'full_token_timeline' if args.bottom_decode_mode == 'timeline' else 'linear_crossfade',
         'bottom_decode_mode': args.bottom_decode_mode,
-        'bottom_decode_context_cols': int(args.bottom_decode_context_cols),
-        'sampling_temperature': {
-            'top': float(args.temperature),
-            'middle': float(args.temperature),
-            'bottom': float(args.bottom_temperature),
-        },
-        'sampling_top_k': {
-            'top': args.top_k,
-            'middle': args.top_k,
-            'bottom': args.bottom_top_k,
-        },
+        'bottom_decode_context_cols': int(bottom_decode_context_cols),
+        'requested_bottom_decode_context_cols': int(args.bottom_decode_context_cols),
+        'sampling_temperature': float(args.temperature),
+        'sampling_top_k': args.top_k,
         'requested_overlap_fraction': float(args.overlap_fraction),
         'effective_overlap_fraction': effective_overlap,
         'overlap_time_cols': overlap_cols,
@@ -1208,7 +1230,7 @@ def generate_hierarchical_music(args) -> str:
             device=device,
             weights_file=vqvae_weights_file,
             save_dir=save_dir,
-            context_cols=args.bottom_decode_context_cols,
+            context_cols=bottom_decode_context_cols,
         )
     else:
         print('Decoding bottom tokens into spectrograms...')
@@ -1241,9 +1263,14 @@ def generate_hierarchical_music(args) -> str:
 
     # Step 4: Spectrogram Inversion (The Mastering Engineer)
     ## convert final spectrograms back to audio and save
-    _debug(f'Loading min/max values from: {min_max_values_path}')
-    with open(min_max_values_path, 'rb') as f:
-        min_max_values = pickle.load(f)
+    min_max_values = None
+    if min_max_values_path and os.path.exists(min_max_values_path):
+        _debug(f'Loading min/max values from: {min_max_values_path}')
+        with open(min_max_values_path, 'rb') as f:
+            min_max_values = pickle.load(f)
+    elif not args.use_fixed_db_scale:
+        print('Warning: min_max_values_path not found, falling back to fixed_db_scale.')
+        args.use_fixed_db_scale = True
 
     save_decoded_spectrograms(final_spectrogram, save_dir)
     bottom_audio_path = _save_audio_from_spectrogram(
@@ -1257,6 +1284,9 @@ def generate_hierarchical_music(args) -> str:
         spectrogram_type=spectrogram_type,
         n_mels=n_mels,
         audio_method=args.audio_method,
+        use_fixed_db_scale=args.use_fixed_db_scale,
+        fixed_min_db=args.fixed_min_db,
+        fixed_max_db=args.fixed_max_db,
     )
     print(f'Saved bottom audio to {bottom_audio_path}')
 
@@ -1275,6 +1305,9 @@ def generate_hierarchical_music(args) -> str:
                 spectrogram_type=spectrogram_type,
                 n_mels=n_mels,
                 audio_method=args.audio_method,
+                use_fixed_db_scale=args.use_fixed_db_scale,
+                fixed_min_db=args.fixed_min_db,
+                fixed_max_db=args.fixed_max_db,
             )
             print(f'Saved middle audio to {middle_audio_path}')
 

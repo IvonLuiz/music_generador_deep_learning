@@ -17,7 +17,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from callbacks import EarlyStopping
 from datasets.jukebox_hierarchical_quantized_dataset import JukeboxHierarchicalQuantizedDataset
-from modeling.torch.jukebox_vq_vae import JukeboxVQVAE
 from modeling.torch.pixel_cnn_jukebox_levels import JukeboxLevelPixelCNN
 from utils import load_config, load_maestro
 from .jukebox_utils import (
