@@ -1,13 +1,30 @@
 dataset:
-  raw_path: "./data/raw/maestro-v3.0.0/2011"
-  processed_path: "./data/processed/maestro_spectrograms_test/"
+  input_mode: "audio" # "spectrogram" uses saved .npy files; "audio" reads raw MAESTRO audio and builds mel specs on GPU
+  raw_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/
+  metadata_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/maestro-v3.0.0.csv
+  processed_path: /home/ivon/code/datasets/processed/maestro/
+  spectrogram_type: "mel"
+  n_mels: 256
   sample_rate: 22050
   hop_length: 256
-  frame_size: 512
+  frame_size: 2048
   target_time_frames: 256
+  audio:
+    examples_per_file: 32
+    downmix:
+      enabled: true
+      weight_range: [0.0, 1.0]
+    pitch_shift:
+      enabled: true
+      semitone_choices: [-3, -2, -1, 0, 1, 2, 3]
+      semitone_range: [-3.0, 3.0]
+    resample_lowpass_filter_width: 64
+    resample_chunk_size: 8192
+    max_torchaudio_resample_factor: 256
+    extensions: [".wav", ".flac", ".aiff", ".aif"]
 
 model:
-  name: "vq_vae_maestro2011"
+  name: "vq_vae_maestro_audio_aug"
   use_residual: true
   K: 1024
   D: 512
@@ -17,14 +34,22 @@ model:
   dropout_rate: 0.0
 
 training:
-  batch_size: 64
+  seed: 42
+  batch_size: 128
+  gradient_accumulation_steps: 2
   learning_rate: 0.0001
-  epochs: 100
+  epochs: 500
   validation_split: 0.2
   save_dir: "./models/vq_vae/"
   early_stopping_patience: 20
+  retrain: true
+  pretrained_weights_path: "./models/vq_vae/2026-05-31_04-02-06/model.pth"
+  num_workers: 8
+  pin_memory: true
+  persist_workers: true
+  prefetch_factor: 4
+  data_variance_samples: 1000
 
 testing:
-  # TODO: make a best_model when trained with validation
-  specific_run_dir: 2025-11-24_00-17-34  # date format: YYYY-MM-DD_HH-MM-SS when was trained (merged in code with trained.save_dir)
-  weights_file_choice: "model.pth"  # options: "model.pth", "best_model.pth" ...
+  specific_run_dir: null
+  weights_file_choice: "best_model.pth"  # options: "model.pth", "best_model.pth" ...

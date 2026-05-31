@@ -12,13 +12,18 @@ import torch.optim as optim
 from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
 
-from processing.preprocess_audio import HOP_LENGTH
+from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE, FRAME_SIZE, N_MELS
 from generation.soundgenerator import SoundGenerator
 import soundfile as sf
 
 from modeling.torch.vq_vae import VQ_VAE, vqvae_loss
 from datasets.spectrogram_dataset import SpectrogramDataset
 from callbacks import EarlyStopping, ModelCheckpoint, LossPlotter, SampleGenerator
+from train_scripts.train_vqvae_utils import (
+    _collect_preprocessed_callback_samples,
+    _estimate_preprocessed_variance,
+    _move_batch_to_device,
+)
 
 
 def train_vqvae(x_train: np.ndarray,
@@ -83,7 +88,7 @@ def train_model(model: VQ_VAE,
                 batch_size: int = 64,
                 epochs: int = 50,
                 learning_rate: float = 5e-4,
-                data_variance: float = 1.0,
+                data_variance: Optional[float] = 1.0,
                 early_stopping_patience: int = 20,
                 save_path: Optional[str] = None,
                 amp: bool = True,
@@ -91,7 +96,22 @@ def train_model(model: VQ_VAE,
                 max_grad_norm: Optional[float] = None,
                 model_config: Optional[dict] = None,
                 min_max_values: Optional[list] = None,
-                x_val: Optional[np.ndarray] = None):
+                x_val: Optional[np.ndarray] = None,
+                num_workers: int = 4,
+                pin_memory: bool = True,
+                persist_workers: bool = True,
+                prefetch_factor: Optional[int] = 4,
+                spectrogram_type: str = 'linear',
+                sample_rate: int = SAMPLE_RATE,
+                hop_length: int = HOP_LENGTH,
+                frame_size: int = FRAME_SIZE,
+                n_mels: int = N_MELS,
+                batch_preprocessor: Optional[torch.nn.Module] = None,
+                collate_fn=None,
+                data_variance_samples: int = 1000,
+                resume_checkpoint_path: Optional[str] = None,
+                resume_history: Optional[dict] = None,
+                initial_best_metric: Optional[float] = None):
     """
     Train an existing VQ-VAE model.
     
@@ -107,6 +127,10 @@ def train_model(model: VQ_VAE,
         model_config: Optional dictionary with model configuration to save
         min_max_values: Optional list of min/max values for reconstruction visualization
         x_val: Optional validation data
+        batch_preprocessor: Optional module that converts raw dataloader batches
+            into model-ready spectrogram tensors on the training device.
+        collate_fn: Optional dataloader collate function, required by raw-audio
+            datasets that return dictionaries.
     
     Returns:
         The trained model
@@ -115,39 +139,132 @@ def train_model(model: VQ_VAE,
     print(f"Training on device: {device}")
     
     model = model.to(device)
+    if batch_preprocessor is not None:
+        batch_preprocessor.to(device)
+
+    def _loader_kwargs():
+        kwargs = {
+            'num_workers': num_workers,
+            'pin_memory': pin_memory,
+        }
+        if num_workers > 0:
+            kwargs['persistent_workers'] = persist_workers
+            if prefetch_factor is not None:
+                kwargs['prefetch_factor'] = prefetch_factor
+        return kwargs
+
+    def _prepare_batch(batch, augment: bool):
+        batch = _move_batch_to_device(batch, device)
+        if batch_preprocessor is not None:
+            batch = batch_preprocessor(batch, augment=augment)
+        return batch
     
     if isinstance(x_train, (np.ndarray, list)):
         ds = SpectrogramDataset(x_train)
     else:
         ds = x_train
         
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        **_loader_kwargs(),
+    )
 
     # Setup Validation Data
     early_stopping = None
     val_dataloader = None
     val_dataset = None
 
+    historical_counter = 0
+    if resume_history and initial_best_metric is not None:
+        val_losses_history = resume_history.get('val_total', resume_history.get('val_loss', []))
+        for loss in reversed(val_losses_history):
+            if loss > initial_best_metric:
+                historical_counter += 1
+            else:
+                break
+    initial_best_score = -initial_best_metric if initial_best_metric is not None else None
+
     if x_val is not None:
         if isinstance(x_val, (np.ndarray, list)):
             if len(x_val) > 0:
                 print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
                 val_dataset = SpectrogramDataset(x_val)
-                val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-                early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
+                val_dataloader = DataLoader(
+                    val_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    collate_fn=collate_fn,
+                    **_loader_kwargs(),
+                )
+                early_stopping = EarlyStopping(
+                    patience=early_stopping_patience,
+                    verbose=True,
+                    best_score=initial_best_score,
+                    counter=historical_counter,
+                )
         else:
             # Assume x_val is a Dataset
             print(f"Training with {len(x_train)} samples and validating with {len(x_val)} samples.")
             val_dataset = x_val
-            val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-            early_stopping = EarlyStopping(patience=early_stopping_patience, verbose=True)
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=collate_fn,
+                **_loader_kwargs(),
+            )
+            early_stopping = EarlyStopping(
+                patience=early_stopping_patience,
+                verbose=True,
+                best_score=initial_best_score,
+                counter=historical_counter,
+            )
     
     if val_dataloader is None:
         print(f"Using all {len(x_train)} samples for training (no validation set provided).")
 
+    if data_variance is None:
+        if batch_preprocessor is None:
+            raise ValueError("data_variance can only be None when a batch_preprocessor is provided.")
+        data_variance = _estimate_preprocessed_variance(
+            dl,
+            batch_preprocessor,
+            device,
+            max_samples=int(data_variance_samples),
+        )
+
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     torch.backends.cudnn.benchmark = True
     scaler = GradScaler(enabled=(amp and device.type == 'cuda'))
+    if grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
+    print(f"Using batch size {batch_size} with gradient accumulation over {grad_accum_steps} steps for effective batch size of {batch_size * grad_accum_steps}.")
+
+    start_epoch = 1
+    if resume_checkpoint_path:
+        checkpoint = torch.load(resume_checkpoint_path, map_location=device, weights_only=False)
+        if 'model_state' not in checkpoint:
+            raise KeyError(f"Checkpoint at {resume_checkpoint_path} does not contain 'model_state'.")
+
+        model.load_state_dict(checkpoint['model_state'])
+        if 'optimizer_state' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state'])
+
+        if data_variance is None and 'data_variance' in checkpoint:
+            data_variance = float(checkpoint['data_variance'])
+
+        if 'epoch' in checkpoint:
+            completed_epoch = int(checkpoint['epoch'])
+            start_epoch = completed_epoch + 1
+            print(f"Resumed training from checkpoint: {resume_checkpoint_path}")
+            print(f"Checkpoint completed epoch {completed_epoch}. Starting from epoch {start_epoch}.")
+        else:
+            completed_epochs = len(resume_history.get('val_total', resume_history.get('total', [])) if resume_history else [])
+            start_epoch = completed_epochs + 1
+            print(f"Checkpoint did not contain an epoch key. Inferred start_epoch {start_epoch} from history.")
 
     # Track losses for training progress
     train_losses_dict = {
@@ -164,50 +281,98 @@ def train_model(model: VQ_VAE,
     sample_generator = None
 
     if save_path:
-        model_checkpoint = ModelCheckpoint(save_path, model, optimizer, mode="min")
+        model_checkpoint = ModelCheckpoint(
+            save_path,
+            model,
+            optimizer,
+            mode="min",
+            initial_best_score=initial_best_metric,
+        )
         loss_plotter = LossPlotter(save_path)
+        if resume_history:
+            loss_plotter.set_history(resume_history)
         
         # Prepare samples for visualization
-        if val_dataloader:
+        sample_source = val_dataset if val_dataloader else ds
+        if batch_preprocessor is not None:
+            samples, sample_min_max = _collect_preprocessed_callback_samples(
+                sample_source,
+                batch_preprocessor,
+                collate_fn,
+                device,
+                sample_count=4,
+            )
+        elif val_dataloader:
             if isinstance(val_dataset, Dataset):
                 samples = []
-                for i in range(4):
+                for i in range(min(4, len(val_dataset))):
                     s = val_dataset[i]
                     s = s.permute(1, 2, 0).numpy()
                     samples.append(s)
                 samples = np.stack(samples)
             else:
                 samples = x_val[:4]
+            sample_min_max = min_max_values[:len(samples)] if min_max_values is not None else None
         else:
             if isinstance(ds, Dataset):
                 samples = []
-                for i in range(4):
+                for i in range(min(4, len(ds))):
                     s = ds[i]
                     s = s.permute(1, 2, 0).numpy()
                     samples.append(s)
                 samples = np.stack(samples)
             else:
                 samples = x_train[:4]
+            sample_min_max = min_max_values[:len(samples)] if min_max_values is not None else None
         
-        if min_max_values is None:
+        if sample_min_max is None:
             # Create dummy min_max_values for visualization only (0-1 range)
-            min_max_values = [{"min": 0.0, "max": 1.0} for _ in range(len(samples))]
+            sample_min_max = [{"min": 0.0, "max": 1.0} for _ in range(len(samples))]
         
-        sample_generator = SampleGenerator(model, samples, min_max_values[:4], os.path.dirname(save_path), device)
+        sample_generator = SampleGenerator(
+            model,
+            samples,
+            sample_min_max,
+            os.path.dirname(save_path),
+            device,
+            spectrogram_type=spectrogram_type,
+            hop_length=hop_length,
+            sample_rate=sample_rate,
+            n_fft=frame_size,
+            n_mels=n_mels,
+        )
 
-    for epoch in range(1, epochs + 1):
+    if start_epoch > epochs or (early_stopping is not None and early_stopping.counter >= early_stopping.patience):
+        print(
+            f"Checkpoint epoch ({start_epoch - 1}) is already >= configured epochs ({epochs}) "
+            f"or patience ({early_stopping.patience if early_stopping else 'N/A'}) has been exhausted "
+            f"(counter: {early_stopping.counter if early_stopping else 'N/A'}). Nothing to train."
+        )
+        if loss_plotter:
+            loss_plotter.plot()
+            loss_plotter.save_history()
+        return model
+
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         running_loss, running_codebook_loss, running_commitment_loss, running_recon_loss, running_vq_loss = 0.0, 0.0, 0.0, 0.0, 0.0
         total_samples = 0
         optimizer.zero_grad(set_to_none=True)
 
         progress_bar = tqdm(dl, desc=f"Epoch {epoch:03d}/{epochs}")
+        remainder_batches = len(dl) % grad_accum_steps
+        first_remainder_step = len(dl) - remainder_batches + 1 if remainder_batches else None
         for step, specs in enumerate(progress_bar, start=1):
-            specs = specs.to(device, non_blocking=True)
+            specs = _prepare_batch(specs, augment=True)
+            current_accum_steps = (
+                remainder_batches
+                if first_remainder_step is not None and step >= first_remainder_step
+                else grad_accum_steps
+            )
             with autocast(device_type=device.type, enabled=scaler.is_enabled()):
                 x_hat, _z, vq_loss, codebook_loss, commitment_loss = model(specs)
                 loss_full, recon_loss  = vqvae_loss(specs, x_hat, vq_loss, variance=max(data_variance, 1e-6))
-                loss = loss_full / grad_accum_steps
+                loss = loss_full / current_accum_steps
                 
                 # Accumulate individual losses for logging
                 running_codebook_loss += codebook_loss.item() * specs.size(0)
@@ -217,7 +382,7 @@ def train_model(model: VQ_VAE,
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
-                if step % grad_accum_steps == 0:
+                if step % grad_accum_steps == 0 or step == len(dl):
                     if max_grad_norm is not None:
                         scaler.unscale_(optimizer)
                         clip_grad_norm_(model.parameters(), max_grad_norm)
@@ -226,7 +391,7 @@ def train_model(model: VQ_VAE,
                     optimizer.zero_grad(set_to_none=True)
             else:
                 loss.backward()
-                if step % grad_accum_steps == 0:
+                if step % grad_accum_steps == 0 or step == len(dl):
                     if max_grad_norm is not None:
                         clip_grad_norm_(model.parameters(), max_grad_norm)
                     optimizer.step()
@@ -237,11 +402,11 @@ def train_model(model: VQ_VAE,
             total_samples += batch_size_current
             progress_bar.set_postfix(loss=running_loss / total_samples)
         
-        avg_loss = running_loss / len(ds)
-        avg_codebook = running_codebook_loss / len(ds)
-        avg_commitment = running_commitment_loss / len(ds)
-        avg_recon = running_recon_loss / len(ds)
-        avg_vq = running_vq_loss / len(ds)
+        avg_loss = running_loss / total_samples
+        avg_codebook = running_codebook_loss / total_samples
+        avg_commitment = running_commitment_loss / total_samples
+        avg_recon = running_recon_loss / total_samples
+        avg_vq = running_vq_loss / total_samples
 
         # Validation Loop
         val_loss_str = ""
@@ -254,9 +419,10 @@ def train_model(model: VQ_VAE,
             val_running_vq_loss = 0.0
             val_total_samples = 0
             
+            val_progress_bar = tqdm(val_dataloader, desc=f"Epoch {epoch:03d}/{epochs} [Val]")
             with torch.no_grad():
-                for val_specs in val_dataloader:
-                    val_specs = val_specs.to(device, non_blocking=True)
+                for val_specs in val_progress_bar:
+                    val_specs = _prepare_batch(val_specs, augment=False)
                     x_hat, _z, vq_loss, codebook_loss, commitment_loss = model(val_specs)
                     loss_full, recon_loss = vqvae_loss(val_specs, x_hat, vq_loss, variance=max(data_variance, 1e-6))
                     
@@ -265,6 +431,11 @@ def train_model(model: VQ_VAE,
                     val_running_recon_loss += recon_loss.item() * batch_size_current
                     val_running_vq_loss += vq_loss.item() * batch_size_current
                     val_total_samples += batch_size_current
+
+                    val_progress_bar.set_postfix(
+                        val_loss=val_running_loss / val_total_samples,
+                        val_recon=val_running_recon_loss / val_total_samples,
+                    )
             
             if val_total_samples > 0:
                 avg_val_loss = val_running_loss / val_total_samples
@@ -294,10 +465,20 @@ def train_model(model: VQ_VAE,
         if loss_plotter:
             loss_plotter.update(metrics)
             loss_plotter.plot()
+            loss_plotter.save_history()
             
         if model_checkpoint:
             metric_to_monitor = avg_val_loss if avg_val_loss is not None else avg_loss
-            model_checkpoint.step(epoch, avg_loss, metric_value=metric_to_monitor)
+            model_checkpoint.step(
+                epoch,
+                avg_loss,
+                metric_value=metric_to_monitor,
+                extra_state={
+                    'metric_value': metric_to_monitor,
+                    'history': loss_plotter.history if loss_plotter else {},
+                    'data_variance': data_variance,
+                },
+            )
             
         if sample_generator:
             sample_generator.step(epoch)
