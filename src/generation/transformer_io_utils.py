@@ -157,16 +157,16 @@ def save_spectrogram_image(
     @param vmax Optional upper display bound.
     """
     img = spec[:, :, 0] if spec.ndim == 3 else spec
-    plt.figure(figsize=figsize)
-    plt.imshow(img, origin='lower', aspect='auto', cmap=cmap, vmin=vmin, vmax=vmax)
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(img, origin='lower', aspect='auto', cmap=cmap, vmin=vmin, vmax=vmax)
     if colorbar_label:
-        plt.colorbar(label=colorbar_label)
+        fig.colorbar(im, ax=ax, label=colorbar_label, pad=0.015)
     else:
-        plt.colorbar()
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=dpi)
-    plt.close()
+        fig.colorbar(im, ax=ax, pad=0.015)
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches='tight', pad_inches=0.02)
+    plt.close(fig)
 
 
 def save_level_spectrograms(

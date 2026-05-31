@@ -385,9 +385,9 @@ def train_transformer_prior(
     )
 
     if cond_seq_len > 0:
-        print(f"Conditioning slice for {selected_level}: {cond_time_cols} time-cols × {cond_freq_bins} freq = {cond_seq_len} tokens")
+        print(f"Conditioning slice for {selected_level} from {cond_level} on {selected_level}: {cond_time_cols} time-cols x {cond_freq_bins} freq = {cond_seq_len} tokens")
     if second_cond_seq_len > 0:
-        print(f"Second conditioning slice (Top→Bottom): {second_cond_time_cols} time-cols × {second_cond_freq_bins} freq = {second_cond_seq_len} tokens")
+        print(f"Conditioning slice for {selected_level} from {second_cond_level} on {selected_level}: {second_cond_time_cols} time-cols x {second_cond_freq_bins} freq = {second_cond_seq_len} tokens")
 
     is_upsampler = cond_level is not None
     upsample_stride = None

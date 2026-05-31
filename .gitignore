@@ -1,3 +1,4 @@
+.py310_venv
 .venv
 *env
 # data/raw
@@ -8,7 +9,7 @@ data/GTZAN
 data/raw/maestro-v3.0.0/**/**.wav
 data/raw/maestro-v3.0.0/**/**.midi
 data/raw/maestro-v3.0.0/**/**
-data/raw/backing_tracks/**
+data/processed/maestro
 data/processed
 **visualizations/
 samples/
@@ -18,4 +19,10 @@ samples/
 *.pkl
 __pycache__
 
+*.txt
+*.mp3
 *.mp4
+api*
+*.json
+*.wav
+*.csv
