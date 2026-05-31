@@ -4,7 +4,7 @@ task:
   name: "pixelcnn_maestro_vqvae"
 
 dataset:
-  input_mode: "quantized" # "quantized" reads precomputed VQ-VAE indices; "spectrogram" keeps the legacy on-the-fly path
+  input_mode: "quantized"
   quantized_path: "/home/ivon/code/datasets/processed/maestro_vqvae_quantized"
   manifest_file: "pixelcnn_quantized_manifest.jsonl"
   splits:
@@ -15,8 +15,6 @@ dataset:
     train_mode: "alternate" # "alternate", "random_per_song", or "all"
     validation: "even"
   preload: false
-  processed_path: "/home/ivon/code/datasets/processed/maestro/"
-  target_time_frames: 256
 
 model:
   name: "pixelcnn_maestro_vqvae"

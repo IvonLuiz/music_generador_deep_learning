@@ -47,10 +47,9 @@ Main responsibilities:
 
 - `SpectrogramWindowDataModule`: loads precomputed spectrogram windows for VQ-VAE training.
 - `AudioWindowDataModule`: loads raw audio windows with `RawAudioWindowDataset`, then applies GPU audio-to-mel preprocessing and augmentation.
-- `QuantizedPriorDataModule`: loads quantized code datasets for PixelCNN training, including precomputed manifests, train/test split merging, fixed validation parity, and even/odd train parity changes per epoch.
+- `QuantizedPriorDataModule`: loads precomputed single-level or two-level VQ-VAE code datasets for PixelCNN training, including manifest filtering, train/test split merging, fixed validation parity, and even/odd train parity changes per epoch.
 - `WindowParityEpochSampler`: changes the active train subset each epoch, for example alternating even and odd windows.
 - `build_vqvae_data_module`: chooses audio or spectrogram VQ-VAE data setup from the config.
-- `find_latest_vqvae_model`: helper for legacy PixelCNN workflows that need the latest VQ-VAE checkpoint.
 
 Data modules return a `DataBundle`, which is the common object passed into the engine and adapters.
 
@@ -119,6 +118,8 @@ The refactored scripts under `src/train_scripts/` are now thin CLI wrappers:
 - `train_pixel_cnn.py` calls `run_single_pixelcnn_training`.
 - `train_pixel_cnn_hierarchical.py` calls `run_two_level_pixelcnn_training`.
 - `train_vqvae_jukebox.py` still calls `train_vqvae_jukebox` from `training/jukebox_vqvae.py`.
+
+PixelCNN paths expect indices already precomputed by `src/processing/preprocess_vqvae_quantization.py`. Use `--variant single` for the single VQ-VAE PixelCNN and `--variant two_level` for the hierarchical VQ-VAE PixelCNN. The old PixelCNN path that quantized spectrograms inside the training loop was removed.
 
 The usual flow is:
 

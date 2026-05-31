@@ -14,9 +14,9 @@ def main():
     parser.add_argument(
         '--input-mode',
         type=str,
-        choices=['spectrogram', 'audio'],
+        choices=['audio', 'image', 'spectrogram'],
         default=None,
-        help='Override dataset.input_mode.',
+        help="Override dataset.input_mode. 'image' and 'spectrogram' load processed .npy windows.",
     )
     parser.add_argument(
         '--resume-checkpoint',

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler, Subset
 
-from datasets.quantized_dataset import PixelCNNQuantizedDataset
+from datasets.quantized_dataset import PixelCNNQuantizedDataset, TwoLevelPixelCNNQuantizedDataset
 from datasets.raw_audio_dataset import RawAudioWindowDataset, collate_audio_windows, list_audio_files
 from datasets.spectrogram_dataset import MmapSpectrogramDataset
 from processing.gpu_audio_augmentation import GPUAudioToMelSpectrogram
@@ -101,7 +101,7 @@ class SpectrogramWindowDataModule:
         training_cfg = self.config['training']
         spectrograms_path = dataset_cfg.get('processed_path')
         if not spectrograms_path:
-            raise ValueError('dataset.processed_path is required for spectrogram input mode.')
+            raise ValueError('dataset.processed_path is required for image/spectrogram input mode.')
 
         target_time_frames = int(dataset_cfg.get('target_time_frames', 256))
         x_all, file_paths = load_maestro(spectrograms_path, target_time_frames, debug_print=False)
@@ -149,7 +149,7 @@ class SpectrogramWindowDataModule:
             min_max_values=_load_min_max_values(dataset_cfg),
             train_file_paths=train_file_paths,
             val_file_paths=val_file_paths,
-            metadata={'input_mode': 'spectrogram'},
+            metadata={'input_mode': 'image'},
         )
 
 
@@ -306,19 +306,18 @@ class QuantizedPriorDataModule:
         input_mode = str(
             dataset_cfg.get('input_mode', 'quantized' if dataset_cfg.get('quantized_path') else 'spectrogram')
         ).strip().lower()
-        if self.variant != 'single':
-            raise ValueError(
-                'Two-level PixelCNN legacy on-the-fly quantization was removed. '
-                'Add a precomputed two-level PixelCNN dataset before using this runner.'
-            )
         if input_mode != 'quantized':
             raise ValueError(
                 "PixelCNN training now requires dataset.input_mode='quantized'. "
                 'Run src/processing/preprocess_vqvae_quantization.py first and set dataset.quantized_path.'
             )
-        return self._setup_single_precomputed()
+        if self.variant == 'single':
+            return self._setup_precomputed(PixelCNNQuantizedDataset)
+        if self.variant == 'two_level':
+            return self._setup_precomputed(TwoLevelPixelCNNQuantizedDataset)
+        raise ValueError(f'Unsupported quantized prior variant: {self.variant}')
 
-    def _setup_single_precomputed(self) -> DataBundle:
+    def _setup_precomputed(self, dataset_cls) -> DataBundle:
         dataset_cfg = self.config['dataset']
         training_cfg = self.config['training']
         quantized_path = dataset_cfg.get('quantized_path')
@@ -336,13 +335,13 @@ class QuantizedPriorDataModule:
 
         manifest_file = dataset_cfg.get('manifest_file', 'pixelcnn_quantized_manifest.jsonl')
         preload = bool(dataset_cfg.get('preload', False))
-        train_dataset = PixelCNNQuantizedDataset(
+        train_dataset = dataset_cls(
             quantized_path=quantized_path,
             split=train_splits,
             manifest_file=manifest_file,
             preload=preload,
         )
-        val_dataset = PixelCNNQuantizedDataset(
+        val_dataset = dataset_cls(
             quantized_path=quantized_path,
             split=validation_splits,
             manifest_file=manifest_file,
@@ -383,17 +382,19 @@ class QuantizedPriorDataModule:
             train_dataset=train_dataset,
             val_dataset=val_subset,
             num_embeddings=train_dataset.num_embeddings,
-            metadata={'input_mode': 'quantized'},
+            input_size=train_dataset.input_size,
+            metadata={'input_mode': 'quantized', 'variant': self.variant},
         )
 
 
 def build_vqvae_data_module(config: dict, input_mode_override: Optional[str] = None):
     dataset_cfg = config['dataset']
     input_mode = str(input_mode_override or dataset_cfg.get('input_mode', 'spectrogram')).strip().lower()
+    if input_mode in ('spectrogram', 'spec', 'npy'):
+        input_mode = 'image'
     dataset_cfg['input_mode'] = input_mode
     if input_mode == 'audio':
         return AudioWindowDataModule(config, input_mode_override=input_mode)
-    if input_mode == 'spectrogram':
+    if input_mode == 'image':
         return SpectrogramWindowDataModule(config)
-    raise ValueError("dataset.input_mode must be either 'audio' or 'spectrogram'.")
-
+    raise ValueError("dataset.input_mode must be either 'audio' or 'image' (alias: 'spectrogram').")

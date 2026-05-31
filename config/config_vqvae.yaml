@@ -4,7 +4,7 @@ task:
   name: "vq_vae_maestro_audio_aug"
 
 dataset:
-  input_mode: "audio" # "spectrogram" uses saved .npy files; "audio" reads raw audio and builds mel specs on GPU
+  input_mode: "audio" # "audio" reads raw audio and builds mel specs on GPU; "image" uses saved .npy 2D arrays
   raw_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/
   metadata_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/maestro-v3.0.0.csv
   processed_path: /home/ivon/code/datasets/processed/maestro/
@@ -58,8 +58,8 @@ training:
   data_variance_samples: 1000
 
 resume:
-  enabled: true
-  checkpoint_path: "./models/vq_vae/2026-05-31_04-02-06/model.pth"
+  enabled: false
+  checkpoint_path: null
   reset_optimizer: false
   reset_scheduler: false
 
