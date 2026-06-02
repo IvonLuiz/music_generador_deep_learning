@@ -45,11 +45,11 @@ Adapters are responsible for the parts that vary by model:
 
 Main responsibilities:
 
-- `SpectrogramWindowDataModule`: loads precomputed spectrogram windows for VQ-VAE training.
+- `SpectrogramWindowDataModule`: loads precomputed image-like `.npy` windows for VQ-VAE training. In configs this is `dataset.input_mode: image`; the older `spectrogram` name is still accepted as an alias.
 - `AudioWindowDataModule`: loads raw audio windows with `RawAudioWindowDataset`, then applies GPU audio-to-mel preprocessing and augmentation.
 - `QuantizedPriorDataModule`: loads precomputed single-level or two-level VQ-VAE code datasets for PixelCNN training, including manifest filtering, train/test split merging, fixed validation parity, and even/odd train parity changes per epoch.
 - `WindowParityEpochSampler`: changes the active train subset each epoch, for example alternating even and odd windows.
-- `build_vqvae_data_module`: chooses audio or spectrogram VQ-VAE data setup from the config.
+- `build_vqvae_data_module`: chooses audio or image VQ-VAE data setup from the config.
 
 Data modules return a `DataBundle`, which is the common object passed into the engine and adapters.
 

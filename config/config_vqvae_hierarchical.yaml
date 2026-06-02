@@ -45,7 +45,7 @@ training:
   gradient_accumulation_steps: 4
   learning_rate: 0.0002
   weight_decay: 0.0
-  epochs: 150
+  epochs: 300
   validation_split: 0.2
   save_dir: "./models/vq_vae_hierarchical/"
   num_workers: 4
