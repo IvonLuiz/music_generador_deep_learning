@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
 
 
-class VQVAE2HierarchicalPixelCNN(nn.Module):
+class HierarchicalCondGatedPixelCNN(nn.Module):
     """Hierarchical PixelCNN for standard VQ-VAE2-style top/bottom priors."""
 
     def __init__(
@@ -30,7 +30,7 @@ class VQVAE2HierarchicalPixelCNN(nn.Module):
         self.two_level_conditioning_mode = two_level_conditioning_mode
         self.num_prior_levels = int(num_prior_levels)
         if self.num_prior_levels != 2:
-            raise ValueError('VQVAE2HierarchicalPixelCNN only supports num_prior_levels=2 (top, bottom)')
+            raise ValueError('HierarchicalCondGatedPixelCNN only supports num_prior_levels=2 (top, bottom)')
 
         self.input_size = input_size if input_size is not None else [(32, 32), (64, 64)]
         self.hidden_units = hidden_units if hidden_units is not None else [512, 512]
@@ -145,8 +145,3 @@ class VQVAE2HierarchicalPixelCNN(nn.Module):
         if level is None:
             level = 'top'
         return self._sample_autoregressive(shape, cond=cond, level=level, temperature=temperature, top_k=top_k)
-
-
-# Backward-compatible alias used by existing VQ-VAE2 scripts.
-class HierarchicalCondGatedPixelCNN(VQVAE2HierarchicalPixelCNN):
-    pass

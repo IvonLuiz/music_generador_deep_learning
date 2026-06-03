@@ -12,7 +12,7 @@ def source_stem(file_path: str) -> str:
     @param file_path Path to the source file.
     @return Filename stem without the `.npy` extension.
     """
-    return os.path.basename(file_path).replace('.npy', '')
+    return os.path.splitext(os.path.basename(file_path))[0]
 
 
 def build_level_starts(total_frames: int, window_size: int, step: int) -> List[int]:
