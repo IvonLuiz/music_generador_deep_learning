@@ -16,14 +16,27 @@ from .engine import StepResult, TrainingAdapter
 
 
 class SingleVQVAEAdapter(TrainingAdapter):
+    """!
+    @brief Adapter for the single-level Residual VQ-VAE training script.
+
+    This adapter keeps the old single VQ-VAE loss behavior while delegating the
+    epoch loop, checkpointing and plotting to TrainingEngine.
+    """
+
     latest_filename = 'model.pth'
     checkpoint_prefix = 'model_epoch'
     best_filenames = ('best_model.pth',)
 
     def build_model(self, config: dict, data: DataBundle, device: torch.device) -> torch.nn.Module:
+        """!
+        @brief Build the single VQ-VAE using the existing initialize_vqvae_model helper.
+        """
         return initialize_vqvae_model(config, device)
 
     def build_optimizer(self, model: torch.nn.Module, config: dict) -> torch.optim.Optimizer:
+        """!
+        @brief Build the Adam optimizer with the legacy VQ-VAE weight decay default.
+        """
         training_cfg = get_training_cfg(config)
         return torch.optim.Adam(
             model.parameters(),
@@ -32,6 +45,9 @@ class SingleVQVAEAdapter(TrainingAdapter):
         )
 
     def train_step(self, model: torch.nn.Module, batch, data: DataBundle) -> StepResult:
+        """!
+        @brief Compute reconstruction and vector-quantization losses.
+        """
         x_hat, _z, vq_loss, codebook_loss, commitment_loss = model(batch)
         loss, recon_loss = vqvae_loss(batch, x_hat, vq_loss, variance=max(float(data.data_variance), 1e-6))
         return StepResult(
@@ -47,16 +63,29 @@ class SingleVQVAEAdapter(TrainingAdapter):
         )
 
     def checkpoint_extra_state(self, model: torch.nn.Module, data: DataBundle, config: dict) -> dict:
+        """!
+        @brief Store the variance used to scale the reconstruction loss.
+        """
         return {'data_variance': data.data_variance}
 
     def create_sample_callback(self, model, data: DataBundle, run_dir: str, device: torch.device, config: dict):
+        """!
+        @brief Create VQ-VAE reconstruction samples when callbacks.save_samples is enabled.
+        """
         dataset_cfg = config.get('dataset', {})
         sample_count = int(config.get('callbacks', {}).get('sample_count', 4))
         return make_sample_generator(model, data, run_dir, device, dataset_cfg, sample_count=sample_count)
 
 
 class TwoLevelVQVAEAdapter(SingleVQVAEAdapter):
+    """!
+    @brief Adapter for the two-level hierarchical VQ-VAE.
+    """
+
     def build_model(self, config: dict, data: DataBundle, device: torch.device) -> torch.nn.Module:
+        """!
+        @brief Build a VQ_VAE_Hierarchical model from config.model.
+        """
         model_cfg = config['model']
         dataset_cfg = config.get('dataset', {})
         input_shape = (
@@ -76,6 +105,9 @@ class TwoLevelVQVAEAdapter(SingleVQVAEAdapter):
         return model.to(device)
 
     def train_step(self, model: torch.nn.Module, batch, data: DataBundle) -> StepResult:
+        """!
+        @brief Compute reconstruction plus top and bottom VQ losses.
+        """
         reconstructions, total_vq_loss, vq_losses_details = model(batch)
         if len(vq_losses_details) != 2:
             raise ValueError(f'TwoLevelVQVAEAdapter expected 2 VQ levels, got {len(vq_losses_details)}')
@@ -101,14 +133,24 @@ class TwoLevelVQVAEAdapter(SingleVQVAEAdapter):
 
 
 class SinglePixelCNNAdapter(TrainingAdapter):
+    """!
+    @brief Adapter for PixelCNN priors trained on one quantized VQ-VAE level.
+    """
+
     latest_filename = 'latest_model.pth'
     checkpoint_prefix = 'pixelcnn_epoch'
     best_filenames = ('best_model.pth', 'best_pixelcnn_model.pth')
 
     def run_subdir(self, config: dict):
+        """!
+        @brief Use the model name as an extra run subdirectory.
+        """
         return config.get('model', {}).get('name')
 
     def build_model(self, config: dict, data: DataBundle, device: torch.device) -> torch.nn.Module:
+        """!
+        @brief Build a conditional gated PixelCNN with K inferred from data or config.
+        """
         model_cfg = config['model']
         num_embeddings = _resolve_num_embeddings(model_cfg, data)
         model_cfg['K'] = int(num_embeddings)
@@ -122,10 +164,16 @@ class SinglePixelCNNAdapter(TrainingAdapter):
         ).to(device)
 
     def build_optimizer(self, model: torch.nn.Module, config: dict) -> torch.optim.Optimizer:
+        """!
+        @brief Build the Adam optimizer used by the PixelCNN priors.
+        """
         training_cfg = get_training_cfg(config)
         return torch.optim.Adam(model.parameters(), lr=float(training_cfg['learning_rate']))
 
     def train_step(self, model: torch.nn.Module, batch, data: DataBundle) -> StepResult:
+        """!
+        @brief Compute categorical cross-entropy over discrete codebook indices.
+        """
         indices = _as_index_tensor(batch)
         logits = model(indices).squeeze(2)
         loss = F.cross_entropy(logits, indices.long())
@@ -137,14 +185,24 @@ class SinglePixelCNNAdapter(TrainingAdapter):
 
 
 class TwoLevelPixelCNNAdapter(SinglePixelCNNAdapter):
+    """!
+    @brief Adapter for hierarchical PixelCNN priors over top and bottom codes.
+    """
+
     best_filenames = ('best_model.pth',)
     checkpoint_prefix = 'model_epoch'
 
     def run_subdir(self, config: dict):
+        """!
+        @brief Keep hierarchical PixelCNN runs separated from single-level runs.
+        """
         model_name = config.get('model', {}).get('name', 'pixelcnn')
         return f'{model_name}_hierarchical_pixelcnn'
 
     def build_model(self, config: dict, data: DataBundle, device: torch.device) -> torch.nn.Module:
+        """!
+        @brief Build top and bottom PixelCNN levels with bottom conditioned on top.
+        """
         model_cfg = config.get('model', {})
         prior_cfg = config.get('priors', {})
         top_cfg = prior_cfg.get('top_prior', config.get('top_prior', {}))
@@ -166,6 +224,9 @@ class TwoLevelPixelCNNAdapter(SinglePixelCNNAdapter):
         ).to(device)
 
     def train_step(self, model: torch.nn.Module, batch, data: DataBundle) -> StepResult:
+        """!
+        @brief Compute independent top loss and conditioned bottom loss.
+        """
         top_indices, bottom_indices = _split_two_level_batch(batch)
         logits_top = model(top_indices, level='top').squeeze(2)
         loss_top = F.cross_entropy(logits_top, top_indices.long())
@@ -184,6 +245,9 @@ class TwoLevelPixelCNNAdapter(SinglePixelCNNAdapter):
 
 
 def _resolve_num_embeddings(model_cfg: dict, data: DataBundle) -> int:
+    """!
+    @brief Resolve PixelCNN vocabulary size from config first, then dataset metadata.
+    """
     for key in ('K', 'num_embeddings'):
         if model_cfg.get(key) is not None:
             return int(model_cfg[key])
@@ -193,6 +257,9 @@ def _resolve_num_embeddings(model_cfg: dict, data: DataBundle) -> int:
 
 
 def _as_index_tensor(batch: torch.Tensor) -> torch.Tensor:
+    """!
+    @brief Convert PixelCNN batches to integer tensors shaped as index grids.
+    """
     if isinstance(batch, (tuple, list)):
         batch = batch[0]
     if batch.ndim == 4 and batch.shape[1] == 1:
@@ -201,6 +268,9 @@ def _as_index_tensor(batch: torch.Tensor) -> torch.Tensor:
 
 
 def _split_two_level_batch(batch) -> Tuple[torch.Tensor, torch.Tensor]:
+    """!
+    @brief Unpack a hierarchical PixelCNN batch into top and bottom index grids.
+    """
     if isinstance(batch, (tuple, list)) and len(batch) >= 2:
         top_indices = batch[0]
         bottom_indices = batch[1]

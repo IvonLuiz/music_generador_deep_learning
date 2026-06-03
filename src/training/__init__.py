@@ -1,3 +1,10 @@
+"""!
+@brief Shared training infrastructure for refactored VQ-VAE and PixelCNN scripts.
+
+The package exposes reusable engines, adapters and data modules so individual
+train_scripts files can stay small wrappers around model-specific YAML configs.
+"""
+
 from .adapters import (
     SinglePixelCNNAdapter,
     SingleVQVAEAdapter,

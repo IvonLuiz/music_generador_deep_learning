@@ -20,6 +20,14 @@ from callbacks import SampleGenerator
 
 @dataclass
 class DataBundle:
+    """!
+    @brief Container returned by data modules and consumed by TrainingEngine.
+
+    It groups dataloaders with optional metadata needed by adapters. For
+    example, VQ-VAE adapters use data_variance for reconstruction scaling, while
+    PixelCNN adapters use num_embeddings and input_size from quantized manifests.
+    """
+
     train_loader: DataLoader
     val_loader: Optional[DataLoader] = None
     train_dataset: Any = None
@@ -36,10 +44,16 @@ class DataBundle:
 
 
 def get_training_cfg(config: dict) -> dict:
+    """!
+    @brief Return config.training, creating it when absent.
+    """
     return config.setdefault('training', {})
 
 
 def get_callbacks_cfg(config: dict) -> dict:
+    """!
+    @brief Return callback settings while accepting legacy training keys.
+    """
     training_cfg = get_training_cfg(config)
     callbacks_cfg = config.setdefault('callbacks', {})
     if 'early_stopping_patience' not in callbacks_cfg and 'early_stopping_patience' in training_cfg:
@@ -50,6 +64,9 @@ def get_callbacks_cfg(config: dict) -> dict:
 
 
 def get_resume_cfg(config: dict) -> dict:
+    """!
+    @brief Return resume settings while accepting legacy training keys.
+    """
     training_cfg = get_training_cfg(config)
     resume_cfg = config.setdefault('resume', {})
     if 'enabled' not in resume_cfg and 'retrain' in training_cfg:
@@ -64,6 +81,9 @@ def get_resume_cfg(config: dict) -> dict:
 
 
 def create_run_dir(save_dir: str, run_subdir: Optional[str] = None) -> str:
+    """!
+    @brief Create a timestamped artifact directory for one training run.
+    """
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     parts = [save_dir]
     if run_subdir:
@@ -75,6 +95,9 @@ def create_run_dir(save_dir: str, run_subdir: Optional[str] = None) -> str:
 
 
 def dataloader_kwargs(training_cfg: dict) -> dict:
+    """!
+    @brief Build DataLoader keyword arguments shared by all training scripts.
+    """
     num_workers = int(training_cfg.get('num_workers', 0))
     kwargs = {
         'num_workers': num_workers,
@@ -89,6 +112,9 @@ def dataloader_kwargs(training_cfg: dict) -> dict:
 
 
 def move_to_device(batch, device: torch.device):
+    """!
+    @brief Recursively move tensors in a nested batch structure to device.
+    """
     if torch.is_tensor(batch):
         return batch.to(device, non_blocking=True)
     if isinstance(batch, dict):
@@ -104,6 +130,9 @@ def move_to_device(batch, device: torch.device):
 
 
 def normalize_history(history: Optional[dict]) -> dict:
+    """!
+    @brief Normalize old and new loss-history key names into one dictionary.
+    """
     if not isinstance(history, dict):
         return {}
     normalized = {
@@ -122,6 +151,9 @@ def normalize_history(history: Optional[dict]) -> dict:
 
 
 def load_history_file(run_dir: str) -> dict:
+    """!
+    @brief Load loss_history.json from a run directory if present.
+    """
     path = os.path.join(run_dir, 'loss_history.json')
     if not os.path.isfile(path):
         return {}
@@ -130,6 +162,9 @@ def load_history_file(run_dir: str) -> dict:
 
 
 def best_metric_from_history(history: dict, monitor_key: str, fallback_key: str = 'total') -> Optional[float]:
+    """!
+    @brief Return the best finite metric available in a resumed history.
+    """
     for key in (monitor_key, 'val_loss', fallback_key, 'train_loss'):
         values = history.get(key, [])
         finite_values = [float(value) for value in values if np.isfinite(value)]
@@ -139,6 +174,9 @@ def best_metric_from_history(history: dict, monitor_key: str, fallback_key: str 
 
 
 def historical_patience_counter(history: dict, monitor_key: str, best_metric: Optional[float]) -> int:
+    """!
+    @brief Rebuild the early-stopping counter from historical validation losses.
+    """
     if best_metric is None:
         return 0
     values = history.get(monitor_key, history.get('val_loss', []))
@@ -154,16 +192,25 @@ def historical_patience_counter(history: dict, monitor_key: str, best_metric: Op
 
 
 def save_yaml(data: dict, path: str) -> None:
+    """!
+    @brief Save a YAML file without reordering keys.
+    """
     with open(path, 'w', encoding='utf-8') as f:
         yaml.safe_dump(data, f, sort_keys=False)
 
 
 def save_history(history: dict, run_dir: str) -> None:
+    """!
+    @brief Save loss history as JSON in a run directory.
+    """
     with open(os.path.join(run_dir, 'loss_history.json'), 'w', encoding='utf-8') as f:
         json.dump(history, f, indent=2)
 
 
 def _plot_keys(history: dict, keys: Iterable[str], path: str, title: str) -> None:
+    """!
+    @brief Plot a selected group of history keys when at least one is present.
+    """
     has_any = any(key in history and history[key] for key in keys)
     if not has_any:
         return
@@ -182,6 +229,9 @@ def _plot_keys(history: dict, keys: Iterable[str], path: str, title: str) -> Non
 
 
 def plot_history(history: dict, run_dir: str) -> None:
+    """!
+    @brief Write standard training and validation loss plots.
+    """
     train_keys = [
         key for key in history
         if history.get(key)
@@ -219,6 +269,13 @@ def estimate_preprocessed_variance(
     device: torch.device,
     max_samples: int = 1000,
 ) -> float:
+    """!
+    @brief Estimate variance after GPU preprocessing for VQ-VAE loss scaling.
+
+    Raw-audio training computes Mel spectrograms inside the batch preprocessor,
+    so the variance must be measured after that transformation rather than on
+    waveform samples.
+    """
     if max_samples < 1:
         raise ValueError(f'max_samples must be >= 1, got {max_samples}')
     was_training = batch_preprocessor.training
@@ -255,6 +312,9 @@ def collect_callback_samples(
     device: torch.device,
     sample_count: int = 4,
 ):
+    """!
+    @brief Collect denormalization-ready samples for reconstruction callbacks.
+    """
     sample_count = min(int(sample_count), len(dataset))
     if sample_count <= 0:
         return np.empty((0, 0, 0, 1), dtype=np.float32), []
@@ -297,6 +357,9 @@ def make_sample_generator(
     audio_settings: dict,
     sample_count: int = 4,
 ):
+    """!
+    @brief Build the shared SampleGenerator callback for VQ-VAE adapters.
+    """
     sample_source = data_bundle.val_dataset or data_bundle.train_dataset
     if sample_source is None:
         return None

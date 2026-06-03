@@ -16,6 +16,12 @@ from .engine import TrainingEngine
 
 
 def _prepare_config(config: dict, family: str, variant: str, config_path: str) -> dict:
+    """!
+    @brief Normalize a model-specific YAML into the shared training schema.
+
+    The public interface still keeps one YAML per model, but runners fill the
+    common task/resume/callback defaults expected by TrainingEngine.
+    """
     config = copy.deepcopy(config)
     task_cfg = config.setdefault('task', {})
     task_cfg.setdefault('family', family)
@@ -48,6 +54,9 @@ def run_single_vqvae_training(
     input_mode_override: Optional[str] = None,
     resume_checkpoint: Optional[str] = None,
 ) -> str:
+    """!
+    @brief Train the single-level VQ-VAE using the shared engine.
+    """
     config = _prepare_config(load_config(config_path), 'vqvae', 'single', config_path)
     if input_mode_override:
         config.setdefault('dataset', {})['input_mode'] = input_mode_override
@@ -68,6 +77,9 @@ def run_two_level_vqvae_training(
     input_mode_override: Optional[str] = None,
     resume_checkpoint: Optional[str] = None,
 ) -> str:
+    """!
+    @brief Train the two-level VQ-VAE using the shared engine.
+    """
     config = _prepare_config(load_config(config_path), 'vqvae', 'two_level', config_path)
     if input_mode_override:
         config.setdefault('dataset', {})['input_mode'] = input_mode_override
@@ -87,6 +99,9 @@ def run_single_pixelcnn_training(
     config_path: str,
     resume_checkpoint: Optional[str] = None,
 ) -> str:
+    """!
+    @brief Train a single-level PixelCNN prior on precomputed quantized indices.
+    """
     config = _prepare_config(load_config(config_path), 'pixelcnn', 'single', config_path)
     if resume_checkpoint:
         config['resume']['enabled'] = True
@@ -107,6 +122,9 @@ def run_two_level_pixelcnn_training(
     config_path: str,
     resume_checkpoint: Optional[str] = None,
 ) -> str:
+    """!
+    @brief Train a two-level hierarchical PixelCNN prior on precomputed indices.
+    """
     config = _prepare_config(load_config(config_path), 'pixelcnn', 'two_level', config_path)
     if resume_checkpoint:
         config['resume']['enabled'] = True

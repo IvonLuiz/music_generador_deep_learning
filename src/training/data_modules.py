@@ -19,6 +19,9 @@ from .common import DataBundle, dataloader_kwargs, estimate_preprocessed_varianc
 
 
 def _select_global_train_parity(mode: str, epoch: int, seed: int) -> str:
+    """!
+    @brief Resolve which overlap-parity subset should be active this epoch.
+    """
     mode = str(mode or 'alternate').strip().lower()
     if mode == 'all':
         return 'all'
@@ -30,6 +33,9 @@ def _select_global_train_parity(mode: str, epoch: int, seed: int) -> str:
 
 
 def _indices_for_train_epoch(dataset, mode: str, epoch: int, seed: int):
+    """!
+    @brief Return dataset indices for the selected train parity strategy.
+    """
     parity = _select_global_train_parity(mode, epoch, seed)
     if parity == 'random_per_song' and hasattr(dataset, 'indices_for_random_window_parity_per_song'):
         return dataset.indices_for_random_window_parity_per_song(seed + epoch), parity
@@ -39,7 +45,13 @@ def _indices_for_train_epoch(dataset, mode: str, epoch: int, seed: int):
 
 
 class WindowParityEpochSampler(Sampler):
-    """Shuffle a fixed overlap-parity subset, changing that subset each epoch."""
+    """!
+    @brief Shuffle one overlap-parity subset and change it when set_epoch is called.
+
+    The PixelCNN quantized datasets can contain overlapping even and odd windows.
+    Alternating them by epoch keeps each epoch smaller while still exposing both
+    views of the song over training.
+    """
 
     def __init__(self, dataset, mode: str, seed: int):
         self.dataset = dataset
@@ -51,6 +63,9 @@ class WindowParityEpochSampler(Sampler):
         self.set_epoch(0)
 
     def set_epoch(self, epoch: int) -> None:
+        """!
+        @brief Select and shuffle the active indices for an epoch.
+        """
         self.epoch = int(epoch)
         indices, parity = _indices_for_train_epoch(self.dataset, self.mode, self.epoch, self.seed)
         rng = np.random.default_rng(self.seed + self.epoch)
@@ -66,6 +81,9 @@ class WindowParityEpochSampler(Sampler):
 
 
 def _load_min_max_values(dataset_cfg: dict):
+    """!
+    @brief Load min/max normalization metadata when spectrogram callbacks need it.
+    """
     path = dataset_cfg.get('min_max_values_path')
     if not path:
         return None
@@ -80,6 +98,9 @@ def _load_min_max_values(dataset_cfg: dict):
 
 
 def _split_audio_paths(all_file_paths, dataset_cfg, validation_split, seed):
+    """!
+    @brief Split raw audio paths using Maestro metadata when available.
+    """
     metadata_path = dataset_cfg.get('metadata_path')
     if metadata_path and os.path.isfile(os.path.expanduser(metadata_path)):
         return split_paths_by_maestro_metadata(all_file_paths, dataset_cfg)
@@ -93,10 +114,17 @@ def _split_audio_paths(all_file_paths, dataset_cfg, validation_split, seed):
 
 
 class SpectrogramWindowDataModule:
+    """!
+    @brief Data module for precomputed image/spectrogram VQ-VAE training.
+    """
+
     def __init__(self, config: dict):
         self.config = config
 
     def setup(self, device: torch.device) -> DataBundle:
+        """!
+        @brief Load spectrogram arrays and create train/validation DataLoaders.
+        """
         dataset_cfg = self.config['dataset']
         training_cfg = self.config['training']
         spectrograms_path = dataset_cfg.get('processed_path')
@@ -154,11 +182,22 @@ class SpectrogramWindowDataModule:
 
 
 class AudioWindowDataModule:
+    """!
+    @brief Data module for raw-audio VQ-VAE training with GPU Mel preprocessing.
+
+    The dataset returns waveform windows. GPUAudioToMelSpectrogram converts those
+    windows to normalized Mel spectrograms inside TrainingAdapter.prepare_batch,
+    allowing pitch/downmix augmentation to happen online.
+    """
+
     def __init__(self, config: dict, input_mode_override: Optional[str] = None):
         self.config = config
         self.input_mode_override = input_mode_override
 
     def setup(self, device: torch.device) -> DataBundle:
+        """!
+        @brief Build raw-audio datasets, loaders and the GPU batch preprocessor.
+        """
         dataset_cfg = self.config['dataset']
         training_cfg = self.config['training']
         raw_audio_path = dataset_cfg.get('raw_path')
@@ -187,6 +226,8 @@ class AudioWindowDataModule:
         )
         splits_cfg = dataset_cfg.get('splits', {})
         if bool(splits_cfg.get('include_test_in_train', False)):
+            # Prior-like generation tasks often reserve validation for monitoring
+            # and merge test into train to maximize musical coverage.
             train_file_paths = sorted(train_file_paths + test_file_paths)
         if not train_file_paths:
             raise ValueError('The audio split produced no training files.')
@@ -293,6 +334,14 @@ class AudioWindowDataModule:
 
 
 class QuantizedPriorDataModule:
+    """!
+    @brief Data module for PixelCNN priors trained on precomputed VQ-VAE indices.
+
+    Supports both single-level indices and two-level hierarchical indices. It
+    mirrors the Jukebox parity workflow by alternating even and odd overlapping
+    windows for training while keeping validation fixed.
+    """
+
     def __init__(
         self,
         config: dict,
@@ -302,6 +351,9 @@ class QuantizedPriorDataModule:
         self.variant = variant
 
     def setup(self, device: torch.device) -> DataBundle:
+        """!
+        @brief Select the appropriate quantized dataset variant and create loaders.
+        """
         dataset_cfg = self.config['dataset']
         input_mode = str(
             dataset_cfg.get('input_mode', 'quantized' if dataset_cfg.get('quantized_path') else 'spectrogram')
@@ -318,6 +370,9 @@ class QuantizedPriorDataModule:
         raise ValueError(f'Unsupported quantized prior variant: {self.variant}')
 
     def _setup_precomputed(self, dataset_cls) -> DataBundle:
+        """!
+        @brief Build train/validation loaders from a quantized manifest.
+        """
         dataset_cfg = self.config['dataset']
         training_cfg = self.config['training']
         quantized_path = dataset_cfg.get('quantized_path')
@@ -357,6 +412,8 @@ class QuantizedPriorDataModule:
             seed=int(training_cfg.get('seed', 42)),
         )
         if hasattr(val_dataset, 'indices_for_window_parity'):
+            # Keep validation deterministic so early stopping compares epochs
+            # against the same window subset.
             val_indices = val_dataset.indices_for_window_parity(validation_window_parity)
         else:
             val_indices = list(range(len(val_dataset)))
@@ -388,6 +445,9 @@ class QuantizedPriorDataModule:
 
 
 def build_vqvae_data_module(config: dict, input_mode_override: Optional[str] = None):
+    """!
+    @brief Factory for VQ-VAE data modules based on dataset.input_mode.
+    """
     dataset_cfg = config['dataset']
     input_mode = str(input_mode_override or dataset_cfg.get('input_mode', 'spectrogram')).strip().lower()
     if input_mode in ('spectrogram', 'spec', 'npy'):

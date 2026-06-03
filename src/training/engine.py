@@ -29,13 +29,27 @@ from .common import (
 
 @dataclass
 class StepResult:
+    """!
+    @brief Output returned by a TrainingAdapter for one train or validation batch.
+
+    @param loss Scalar tensor used for backpropagation and finite-value checks.
+    @param metrics Named scalar metrics accumulated into loss_history.json.
+    @param batch_size Number of samples represented by the metrics.
+    """
     loss: torch.Tensor
     metrics: Dict[str, object]
     batch_size: int
 
 
 class TrainingAdapter:
-    """Small per-model contract used by TrainingEngine."""
+    """!
+    @brief Per-model contract used by TrainingEngine.
+
+    The engine owns the generic training lifecycle: epochs, AMP, gradient
+    accumulation, checkpointing, resume, early stopping and history files. Each
+    adapter only describes model-specific behavior such as model construction,
+    optimizer selection and the loss computation for a batch.
+    """
 
     latest_filename = 'model.pth'
     best_filenames = ('best_model.pth',)
@@ -44,12 +58,21 @@ class TrainingAdapter:
     train_monitor_key = 'total'
 
     def run_subdir(self, config: dict) -> Optional[str]:
+        """!
+        @brief Optional subdirectory inserted between training.save_dir and timestamp.
+        """
         return None
 
     def build_model(self, config: dict, data: DataBundle, device: torch.device) -> torch.nn.Module:
+        """!
+        @brief Build the model for this training task.
+        """
         raise NotImplementedError
 
     def build_optimizer(self, model: torch.nn.Module, config: dict) -> torch.optim.Optimizer:
+        """!
+        @brief Build the optimizer used by the shared engine.
+        """
         training_cfg = get_training_cfg(config)
         return torch.optim.Adam(
             model.parameters(),
@@ -58,9 +81,15 @@ class TrainingAdapter:
         )
 
     def build_scheduler(self, optimizer: torch.optim.Optimizer, config: dict, steps_per_epoch: int):
+        """!
+        @brief Optionally build a per-step scheduler.
+        """
         return None
 
     def prepare_batch(self, batch, data: DataBundle, device: torch.device, training: bool):
+        """!
+        @brief Move a batch to device and apply the data module preprocessor.
+        """
         from .common import move_to_device
 
         batch = move_to_device(batch, device)
@@ -69,12 +98,21 @@ class TrainingAdapter:
         return batch
 
     def train_step(self, model: torch.nn.Module, batch, data: DataBundle) -> StepResult:
+        """!
+        @brief Compute the training loss and metrics for one prepared batch.
+        """
         raise NotImplementedError
 
     def val_step(self, model: torch.nn.Module, batch, data: DataBundle) -> StepResult:
+        """!
+        @brief Compute validation metrics for one prepared batch.
+        """
         return self.train_step(model, batch, data)
 
     def checkpoint_extra_state(self, model: torch.nn.Module, data: DataBundle, config: dict) -> dict:
+        """!
+        @brief Return adapter-specific values to store in model checkpoints.
+        """
         return {}
 
     def create_sample_callback(
@@ -85,6 +123,9 @@ class TrainingAdapter:
         device: torch.device,
         config: dict,
     ):
+        """!
+        @brief Optionally create a callback that writes visual/audio samples.
+        """
         return None
 
 
@@ -110,6 +151,17 @@ def _autocast(device: torch.device, enabled: bool):
 
 
 class TrainingEngine:
+    """!
+    @brief Shared training loop for VQ-VAE and PixelCNN style experiments.
+
+    The engine intentionally does not know the model family being trained. It
+    receives a TrainingAdapter plus a data module and handles the repeated
+    training concerns that were duplicated across scripts before the refactor:
+    run directory creation, config copy, train/validation progress bars, AMP,
+    gradient accumulation, clipping, checkpointing, resume, loss JSON, plots and
+    early stopping.
+    """
+
     def __init__(
         self,
         config: dict,
@@ -123,6 +175,9 @@ class TrainingEngine:
         self.config_path = config_path
 
     def run(self) -> str:
+        """!
+        @brief Execute training and return the artifact directory path.
+        """
         training_cfg = get_training_cfg(self.config)
         callbacks_cfg = get_callbacks_cfg(self.config)
         resume_cfg = get_resume_cfg(self.config)
@@ -189,6 +244,8 @@ class TrainingEngine:
         initial_best_metric = None
 
         if resume_enabled:
+            # Resume must restore both model state and historical metrics so
+            # early stopping continues from the previous run instead of reset.
             if not resume_checkpoint:
                 raise ValueError('resume.enabled is true but resume.checkpoint_path is empty.')
             if not os.path.isfile(resume_checkpoint):
@@ -284,6 +341,8 @@ class TrainingEngine:
             save_history(history, run_dir)
             plot_history(history, run_dir)
 
+            # The public monitor key is normalized to "total" here because
+            # _append_history stores validation metrics with a val_ prefix.
             monitored = val_metrics.get('total', train_metrics.get('total'))
             metric_value = float(monitored) if monitored is not None else float('inf')
             checkpoint_payload = {
@@ -342,6 +401,9 @@ class TrainingEngine:
         grad_accum_steps: int,
         max_grad_norm: Optional[float],
     ) -> Dict[str, float]:
+        """!
+        @brief Run one training epoch and return sample-weighted metric means.
+        """
         totals = {}
         total_samples = 0
         skipped = 0
@@ -357,6 +419,8 @@ class TrainingEngine:
 
         for step, raw_batch in enumerate(progress, start=1):
             batch = self.adapter.prepare_batch(raw_batch, data, next(model.parameters()).device, training=True)
+            # Scale the last partial accumulation window by its real size; this
+            # keeps the final optimizer step from being underweighted.
             current_accum_steps = (
                 remainder
                 if first_remainder_step is not None and step >= first_remainder_step
@@ -406,6 +470,9 @@ class TrainingEngine:
         return {key: value / total_samples for key, value in totals.items()}
 
     def _run_val_epoch(self, epoch: int, epochs: int, model, data: DataBundle, use_amp: bool) -> Dict[str, float]:
+        """!
+        @brief Run one validation epoch and return sample-weighted metric means.
+        """
         totals = {}
         total_samples = 0
         skipped = 0
@@ -433,6 +500,9 @@ class TrainingEngine:
 
     @staticmethod
     def _append_history(history: dict, train_metrics: dict, val_metrics: dict) -> None:
+        """!
+        @brief Append epoch metrics using both detailed and legacy-compatible keys.
+        """
         for key, value in train_metrics.items():
             history.setdefault(key, []).append(float(value))
         if 'total' in train_metrics:
@@ -444,6 +514,9 @@ class TrainingEngine:
 
     @staticmethod
     def _print_epoch_summary(epoch: int, epochs: int, train_metrics: dict, val_metrics: dict) -> None:
+        """!
+        @brief Print a compact epoch summary after checkpoints are updated.
+        """
         train_parts = ', '.join(f'{key} {value:.6f}' for key, value in train_metrics.items())
         val_parts = ', '.join(f'val_{key} {value:.6f}' for key, value in val_metrics.items())
         suffix = f'; {val_parts}' if val_parts else ''
