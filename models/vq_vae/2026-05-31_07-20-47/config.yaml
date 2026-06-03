@@ -1,0 +1,83 @@
+dataset:
+  audio:
+    downmix:
+      enabled: true
+      weight_range:
+      - 0.0
+      - 1.0
+    examples_per_file: 32
+    extensions:
+    - .wav
+    - .flac
+    - .aiff
+    - .aif
+    max_torchaudio_resample_factor: 256
+    pitch_shift:
+      enabled: true
+      semitone_choices:
+      - -3
+      - -2
+      - -1
+      - 0
+      - 1
+      - 2
+      - 3
+      semitone_range:
+      - -3.0
+      - 3.0
+    resample_chunk_size: 8192
+    resample_lowpass_filter_width: 64
+  frame_size: 2048
+  hop_length: 256
+  input_mode: audio
+  metadata_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/maestro-v3.0.0.csv
+  n_mels: 256
+  processed_path: /home/ivon/code/datasets/processed/maestro/
+  raw_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/
+  sample_rate: 22050
+  spectrogram_type: mel
+  target_time_frames: 256
+model:
+  D: 512
+  K: 1024
+  conv_filters:
+  - 64
+  - 128
+  - 256
+  - 512
+  conv_kernels:
+  - 3
+  - 3
+  - 3
+  - 3
+  conv_strides:
+  - - 2
+    - 2
+  - - 2
+    - 2
+  - - 2
+    - 2
+  - - 2
+    - 1
+  dropout_rate: 0.0
+  name: vq_vae_maestro_audio_aug
+  use_residual: true
+testing:
+  specific_run_dir: null
+  weights_file_choice: best_model.pth
+training:
+  batch_size: 128
+  data_variance_samples: 1000
+  early_stopping_patience: 20
+  epochs: 500
+  gradient_accumulation_steps: 2
+  learning_rate: 0.0001
+  num_workers: 8
+  persist_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  pretrained_weights_path: ./models/vq_vae/2026-05-31_04-02-06/model.pth
+  retrain: true
+  save_dir: ./models/vq_vae/
+  seed: 42
+  validation_split: 0.2

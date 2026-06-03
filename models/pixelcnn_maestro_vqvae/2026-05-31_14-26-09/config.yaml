@@ -1,0 +1,36 @@
+dataset:
+  input_mode: quantized
+  manifest_file: pixelcnn_quantized_manifest.jsonl
+  preload: false
+  processed_path: /home/ivon/code/datasets/processed/maestro/
+  quantized_path: /home/ivon/code/datasets/processed/maestro_vqvae_quantized
+  target_time_frames: 256
+  train_splits:
+  - train
+  - test
+  train_window_parity_mode: alternate
+  validation_splits:
+  - validation
+  validation_window_parity: even
+model:
+  K: 1024
+  dropout_rate: 0.0
+  hidden_channels: 128
+  kernel_size: 5
+  name: pixelcnn_maestro_vqvae
+  num_layers: 15
+training:
+  amp: true
+  batch_size: 256
+  early_stopping_patience: 10
+  epochs: 200
+  learning_rate: 0.001
+  num_workers: 4
+  persist_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  save_dir: ./models/
+  save_every: 10
+  seed: 42
+  validation_split: 0.2
+vqvae_model_path: ./models/vq_vae/2026-05-31_07-20-47

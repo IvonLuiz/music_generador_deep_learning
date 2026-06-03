@@ -1,14 +1,13 @@
 task:
-  family: "vqvae"
-  variant: "two_level"
-  name: "vq_vae_hierarchical_maestro2011"
-
+  family: vqvae
+  variant: two_level
+  name: vq_vae_hierarchical_maestro2011
 dataset:
-  input_mode: "audio" # "audio" reads raw audio and builds mel specs on GPU; "image" uses saved .npy 2D arrays
+  input_mode: audio
   raw_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/
   metadata_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/maestro-v3.0.0.csv
   processed_path: /home/ivon/code/datasets/processed/maestro/
-  spectrogram_type: "mel"
+  spectrogram_type: mel
   n_mels: 256
   sample_rate: 22050
   hop_length: 256
@@ -20,25 +19,38 @@ dataset:
     examples_per_file: 32
     downmix:
       enabled: true
-      weight_range: [0.0, 1.0]
+      weight_range:
+      - 0.0
+      - 1.0
     pitch_shift:
       enabled: true
-      semitone_choices: [-3, -2, -1, 0, 1, 2, 3]
-      semitone_range: [-3.0, 3.0]
+      semitone_choices:
+      - -3
+      - -2
+      - -1
+      - 0
+      - 1
+      - 2
+      - 3
+      semitone_range:
+      - -3.0
+      - 3.0
     resample_lowpass_filter_width: 64
     resample_chunk_size: 8192
     max_torchaudio_resample_factor: 256
-    extensions: [".wav", ".flac", ".aiff", ".aif"]
-
+    extensions:
+    - .wav
+    - .flac
+    - .aiff
+    - .aif
 model:
-  name: "vq_vae_hierarchical_maestro2011"
+  name: vq_vae_hierarchical_maestro2011
   dim_bottom: 256
   dim_top: 512
   num_residual_layers: 2
   num_embeddings_top: 512
   num_embeddings_bottom: 512
   beta: 0.25
-
 training:
   seed: 42
   batch_size: 32
@@ -47,7 +59,7 @@ training:
   weight_decay: 0.0
   epochs: 300
   validation_split: 0.2
-  save_dir: "./models/vq_vae_hierarchical/"
+  save_dir: ./models/vq_vae_hierarchical/
   num_workers: 4
   pin_memory: true
   persist_workers: true
@@ -55,19 +67,17 @@ training:
   amp: true
   max_grad_norm: 1.0
   data_variance_samples: 1000
-
+  config_path: ./config/config_vqvae_hierarchical.yaml
 resume:
-  enabled: false
-  checkpoint_path: null
+  enabled: true
+  checkpoint_path: models/vq_vae_hierarchical/2026-06-01_01-03-57/model.pth
   reset_optimizer: false
   reset_scheduler: false
-
 callbacks:
   early_stopping_patience: 20
   save_every: 0
   save_samples: true
   sample_count: 4
-
 testing:
   specific_run_dir: 2025-12-24_19-01-19
-  weights_file_choice: "best_model.pth"
+  weights_file_choice: best_model.pth

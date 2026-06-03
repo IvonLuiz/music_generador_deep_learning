@@ -19,7 +19,7 @@ from utils import set_global_seed, load_config, compute_dataset_variance, comput
 from datasets.spectrogram_dataset import LazySpectrogramDataset
 from datasets.raw_audio_dataset import RawAudioWindowDataset, collate_audio_windows, list_audio_files
 from processing.gpu_audio_augmentation import GPUAudioToMelSpectrogram
-from train_scripts.train_vqvae_utils import train_vqvae_jukebox
+from training.jukebox_vqvae import train_vqvae_jukebox
 from train_scripts.jukebox_utils import split_paths_by_maestro_metadata
 from train_scripts.resume_utils import load_resume_artifacts
 
@@ -138,7 +138,7 @@ if __name__ == "__main__":
     print(f"Training parameters: batch_size={batch_size}, grad_accum_steps={grad_accum_steps}, learning_rate={learning_rate}, epochs={epochs}, early_stopping_patience={early_stopping_patience}")
     print(f"Reproducibility seed: {seed}")
     print(f"Data loading parameters: num_workers={num_workers}, pin_memory={pin_memory}, persist_workers={persist_workers}, prefetch_factor={prefetch_factor}")
-    print(f"Dataset target_time_frames={target_time_frames}, input_mode={input_mode}, split_source=maestro_metadata")
+    print(f"Dataset target_time_frames={target_time_frames}, input_mode={input_mode}, split_source=metadata_csv")
     print(f"Audio inversion settings: spectrogram_type={spectrogram_type}, sample_rate={sample_rate}, hop_length={hop_length}, frame_size={frame_size}, n_mels={n_mels}")
 
     # structure: model_save_dir / formatted_time / model.pth

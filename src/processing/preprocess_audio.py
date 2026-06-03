@@ -1,3 +1,4 @@
+import argparse
 import os 
 import pickle
 from pathlib import Path
@@ -333,16 +334,17 @@ class PreprocessingPipeline:
     def visualizer(self, visualizer):
         self._visualizer = visualizer
 
-    def process(self, audio_files_dir, overlapping=0.5):
+    def process(self, audio_files_dir, overlapping=0.5, extensions=(".wav",)):
         """Process all audio files in a directory."""
         if self.saver is None:
             print("Error: Saver not set.")
             return
 
+        extensions = tuple(str(ext).lower() for ext in extensions)
         total_processed = 0
         for root, _, files in os.walk(audio_files_dir):
             for file in files:
-                if file.endswith(".wav"):
+                if file.lower().endswith(extensions):
                     file_path = os.path.join(root, file)
                     # Process the file with overlapping segments option
                     if self._num_expected_samples > 0:
@@ -491,44 +493,58 @@ if __name__ == "__main__":
     # For 1024 time frames: (1024 * 256) / 22050 ≈ 11.9 seconds
     # For 2048 time frames: (2048 * 256) / 22050 ≈ 23.8 seconds
     
-    DURATION = ((TARGET_TIME_FRAMES - 1) * HOP_LENGTH) / SAMPLE_RATE # Duration in seconds for each segment based on target time frames
-    DURATION = None
-    overlapping = 0.0  
-    use_mel_spectrogram = True # Set to True to use LogMelSpectrogramExtractor instead of LogSpectrogramExtractor
+    parser = argparse.ArgumentParser(description="Preprocess audio files into normalized spectrogram .npy files.")
+    parser.add_argument("--files_dir", type=str, default="./data/raw/backing_tracks")
+    parser.add_argument("--spectrograms_save_dir", type=str, default="./data/processed/backing_tracks/")
+    parser.add_argument("--min_max_values_save_dir", type=str, default="./data/processed/backing_tracks/min_max_values/")
+    parser.add_argument("--duration", type=float, default=None, help="Segment duration in seconds. Omit for full-song spectrograms.")
+    parser.add_argument("--target_time_frames", type=int, default=TARGET_TIME_FRAMES)
+    parser.add_argument("--overlap", type=float, default=0.0)
+    parser.add_argument("--sample_rate", type=int, default=SAMPLE_RATE)
+    parser.add_argument("--frame_size", type=int, default=FRAME_SIZE)
+    parser.add_argument("--hop_length", type=int, default=HOP_LENGTH)
+    parser.add_argument("--n_mels", type=int, default=N_MELS)
+    parser.add_argument("--linear", action="store_true", help="Use linear log spectrograms instead of log-mel.")
+    parser.add_argument("--stereo", action="store_true", help="Keep stereo when loading audio.")
+    parser.add_argument("--enable_visualization", action="store_true")
+    parser.add_argument("--extensions", nargs="+", default=[".wav"], help="Audio extensions to process.")
+    args = parser.parse_args()
+
+    if args.duration is None:
+        DURATION = None
+    elif args.duration <= 0:
+        DURATION = ((int(args.target_time_frames) - 1) * int(args.hop_length)) / int(args.sample_rate)
+    else:
+        DURATION = float(args.duration)
+    overlapping = float(args.overlap)
+    use_mel_spectrogram = not bool(args.linear)
 
     if DURATION is not None:
-        print(f"Using {TARGET_TIME_FRAMES} time frames = {DURATION:.2f} seconds per segment")
+        print(f"Using segment duration={DURATION:.2f} seconds")
         print(f"With {overlapping*100:.0f}% overlap, a 3-minute song will generate ~{int(180/DURATION)} segments!")
-        print(f"Expected spectrogram shape per segment: (256, {TARGET_TIME_FRAMES})")
+        print(f"Expected spectrogram shape per segment: ({args.n_mels}, {args.target_time_frames})")
     
-    MONO = True
-
-    # SPECTROGRAMS_SAVE_DIR = "./data/fsdd/spectrograms/"
-    # MIN_MAX_VALUES_SAVE_DIR = "./data/fsdd/"
-    # FILES_DIR = "./data/fsdd/audio/"
-    
-    FILES_DIR = "./data/raw/maestro-v3.0.0"
-    SPECTROGRAMS_SAVE_DIR = "/home/ivon/code/datasets/processed/maestro/"
-    VISUALIZATION_SAVE_DIR = SPECTROGRAMS_SAVE_DIR + "/spectrograms/"
-    MIN_MAX_VALUES_SAVE_DIR = "/home/ivon/code/datasets/processed/min_max_values/"
-    
-    # Enable visualization (set to False to disable)
-    ENABLE_VISUALIZATION = False
+    MONO = not bool(args.stereo)
+    FILES_DIR = args.files_dir
+    SPECTROGRAMS_SAVE_DIR = args.spectrograms_save_dir
+    VISUALIZATION_SAVE_DIR = os.path.join(SPECTROGRAMS_SAVE_DIR, "spectrograms")
+    MIN_MAX_VALUES_SAVE_DIR = args.min_max_values_save_dir
+    ENABLE_VISUALIZATION = bool(args.enable_visualization)
     
     # instantiate all objects
-    loader = Loader(SAMPLE_RATE, DURATION, MONO)
+    loader = Loader(args.sample_rate, DURATION, MONO)
     padder = Padder()
     if use_mel_spectrogram:
         log_spectrogram_extractor = LogMelSpectrogramExtractor(
-            sample_rate=SAMPLE_RATE,
-            frame_size=FRAME_SIZE,
-            hop_length=HOP_LENGTH,
-            n_mels=N_MELS
+            sample_rate=args.sample_rate,
+            frame_size=args.frame_size,
+            hop_length=args.hop_length,
+            n_mels=args.n_mels
         )
     else:
         log_spectrogram_extractor = LogSpectrogramExtractor(
-            frame_size=FRAME_SIZE,
-            hop_length=HOP_LENGTH
+            frame_size=args.frame_size,
+            hop_length=args.hop_length
         )
     # Normalize to [0, 1] range as expected by VQ-VAE
     min_max_normalizer = MinMaxNormalizer(0, 1)
@@ -547,4 +563,4 @@ if __name__ == "__main__":
     preprocessing_pipeline.saver = saver
     preprocessing_pipeline.visualizer = visualizer
 
-    preprocessing_pipeline.process(FILES_DIR, overlapping=overlapping)
+    preprocessing_pipeline.process(FILES_DIR, overlapping=overlapping, extensions=args.extensions)

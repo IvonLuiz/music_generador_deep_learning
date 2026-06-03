@@ -426,7 +426,7 @@ class JukeboxQuantizedDataset(Dataset):
 
     @staticmethod
     def _source_stem(file_path: str) -> str:
-        return os.path.basename(file_path).replace('.npy', '')
+        return os.path.splitext(os.path.basename(file_path))[0]
 
     @staticmethod
     def _pad(arr: np.ndarray, target_t: int) -> np.ndarray:

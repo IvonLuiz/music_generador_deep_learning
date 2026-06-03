@@ -1,18 +1,50 @@
+task:
+  family: "pixelcnn"
+  variant: "single"
+  name: "pixelcnn_maestro_vqvae"
+
 dataset:
-  processed_path: "./data/processed/maestro_spectrograms_test/"
-  target_time_frames: 256
+  input_mode: "quantized"
+  quantized_path: "/home/ivon/code/datasets/processed/maestro_vqvae_quantized"
+  manifest_file: "pixelcnn_quantized_manifest.jsonl"
+  splits:
+    train: ["train"]
+    validation: ["validation"]
+    include_test_in_train: true
+  window_parity:
+    train_mode: "alternate" # "alternate", "random_per_song", or "all"
+    validation: "even"
+  preload: false
 
 model:
-  name: "pixelcnn_maestro2011"
+  name: "pixelcnn_maestro_vqvae"
   hidden_channels: 128
   num_layers: 15
   kernel_size: 5
   dropout_rate: 0.0
 
 training:
-  batch_size: 128
-  quantization_batch_size: 32 # Batch size for computing VQ indices (prevents OOM)
+  seed: 42
+  batch_size: 256
+  gradient_accumulation_steps: 1
   learning_rate: 0.001
-  epochs: 50
+  epochs: 200
   save_dir: "./models/"
   validation_split: 0.2
+  num_workers: 4
+  pin_memory: true
+  persist_workers: true
+  prefetch_factor: 4
+  amp: true
+  max_grad_norm: 1.0
+
+resume:
+  enabled: false
+  checkpoint_path: null
+  reset_optimizer: false
+  reset_scheduler: false
+
+callbacks:
+  early_stopping_patience: 10
+  save_every: 10
+  save_samples: false

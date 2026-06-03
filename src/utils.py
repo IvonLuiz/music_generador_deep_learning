@@ -149,6 +149,10 @@ def initialize_vqvae_model(config_or_path, device=torch.device('cpu')) -> Union[
         config = config_or_path
 
     model_config = config['model'] if 'model' in config else config
+    dataset_config = config.get('dataset', {}) if isinstance(config, dict) else {}
+    input_height = int(dataset_config.get('n_mels', 256))
+    target_time_frames = int(dataset_config.get('target_time_frames', TARGET_TIME_FRAMES))
+    input_shape = (input_height, target_time_frames, 1)
     
     K = model_config['K']
     D = model_config['D']
@@ -161,7 +165,7 @@ def initialize_vqvae_model(config_or_path, device=torch.device('cpu')) -> Union[
     if use_residual:
         print("Initializing Residual VQ-VAE...")
         model = VQ_VAE_Residual(
-            input_shape=(256, TARGET_TIME_FRAMES, 1),
+            input_shape=input_shape,
             conv_filters=conv_filters,
             conv_kernels=conv_kernels,
             conv_strides=conv_strides,
@@ -172,7 +176,7 @@ def initialize_vqvae_model(config_or_path, device=torch.device('cpu')) -> Union[
     else:
         print("Initializing Standard VQ-VAE...")
         model = VQ_VAE(
-            input_shape=(256, TARGET_TIME_FRAMES, 1),
+            input_shape=input_shape,
             conv_filters=conv_filters,
             conv_kernels=conv_kernels,
             conv_strides=conv_strides,
