@@ -1,5 +1,5 @@
 dataset:
-  input_mode: "audio" # "spectrogram" uses saved .npy files; "audio" reads raw MAESTRO audio and builds mel specs on GPU
+  input_mode: "audio" # Jukebox VQ-VAE training reads raw audio and builds mel specs on GPU
   raw_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/
   metadata_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/maestro-v3.0.0.csv
   min_max_values_path: /home/ivon/code/datasets/processed/maestro/min_max_values/min_max_values.pkl

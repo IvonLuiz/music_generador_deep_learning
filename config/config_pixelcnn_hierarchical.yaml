@@ -1,11 +1,11 @@
 task:
   family: "pixelcnn"
   variant: "two_level"
-  name: "pixelcnn_maestro2011"
+  name: "pixelcnn_maestro_hierarchical_vqvae"
 
 dataset:
   input_mode: "quantized"
-  quantized_path: "./data/processed/hierarchical_vqvae_quantized/"
+  quantized_path: "/home/ivon/code/datasets/processed/vqvae_hierarchical_quantized"
   manifest_file: "pixelcnn_quantized_manifest.jsonl"
   splits:
     train: ["train"]
@@ -17,7 +17,7 @@ dataset:
   preload: false
 
 model:
-  name: "pixelcnn_maestro2011"
+  name: "pixelcnn_maestro_hierarchical_vqvae"
   num_prior_levels: 2
   two_level_conditioning_mode: "deconv"
 
@@ -36,7 +36,7 @@ priors:
 training:
   seed: 42
   batch_size: 32
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 8
   learning_rate: 0.0003
   epochs: 50
   save_dir: "./models/"
@@ -55,6 +55,6 @@ resume:
   reset_scheduler: false
 
 callbacks:
-  early_stopping_patience: 10
+  early_stopping_patience: 5
   save_every: 10
   save_samples: false

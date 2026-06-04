@@ -12,13 +12,6 @@ def main():
     parser = argparse.ArgumentParser(description='Train a two-level hierarchical VQ-VAE.')
     parser.add_argument('--config', type=str, default='./config/config_vqvae_hierarchical.yaml')
     parser.add_argument(
-        '--input-mode',
-        type=str,
-        choices=['spectrogram', 'audio'],
-        default=None,
-        help='Override dataset.input_mode.',
-    )
-    parser.add_argument(
         '--resume-checkpoint',
         type=str,
         default=None,
@@ -27,7 +20,6 @@ def main():
     args = parser.parse_args()
     run_dir = run_two_level_vqvae_training(
         config_path=args.config,
-        input_mode_override=args.input_mode,
         resume_checkpoint=args.resume_checkpoint,
     )
     print('Training completed. Artifacts saved to:', run_dir)

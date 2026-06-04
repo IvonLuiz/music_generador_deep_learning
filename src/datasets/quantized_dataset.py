@@ -48,17 +48,20 @@ class PixelCNNQuantizedDataset(Dataset):
             extra = '' if len(missing) <= 10 else f'\n  ... and {len(missing) - 10} more'
             raise FileNotFoundError(f"Missing quantized index files:\n{preview}{extra}")
 
-        first = self._load_payload(0)
-        first_indices = self._extract_indices(first, self.files[0])
-        self.index_shape = tuple(int(x) for x in first_indices.shape)
+        first_sample = self._load_sample(0)
+        self.index_shape = self._sample_shape(first_sample)
         self.num_embeddings = self._resolve_num_embeddings()
+        self.input_size = self._resolve_input_size(first_sample)
 
         self._cache = None
         if self.preload:
-            self._cache = [self._load_indices(i) for i in tqdm(range(len(self.files)), desc=f'Preloading PixelCNN indices [{self.split}]')]
+            self._cache = [
+                self._load_sample(i)
+                for i in tqdm(range(len(self.files)), desc=f'Preloading PixelCNN indices [{self.split}]')
+            ]
 
         print(
-            f"[PixelCNNQuantizedDataset] split={self.split}, files={len(self.files)}, "
+            f"[{self.__class__.__name__}] split={self.split}, files={len(self.files)}, "
             f"index_shape={self.index_shape}, num_embeddings={self.num_embeddings}"
         )
 
@@ -178,6 +181,9 @@ class PixelCNNQuantizedDataset(Dataset):
             return None
         return int(value)
 
+    def _resolve_input_size(self, sample):
+        return tuple(int(x) for x in sample.shape)
+
     def _load_payload(self, idx: int):
         return torch.load(self.files[idx], map_location='cpu', weights_only=False)
 
@@ -192,8 +198,12 @@ class PixelCNNQuantizedDataset(Dataset):
             raise ValueError(f"Expected 2D index grid in {file_path}, got shape {tuple(indices.shape)}")
         return indices.long()
 
-    def _load_indices(self, idx: int):
+    def _load_sample(self, idx: int):
         return self._extract_indices(self._load_payload(idx), self.files[idx])
+
+    @staticmethod
+    def _sample_shape(sample):
+        return tuple(int(x) for x in sample.shape)
 
     def __len__(self):
         return len(self.files)
@@ -201,4 +211,70 @@ class PixelCNNQuantizedDataset(Dataset):
     def __getitem__(self, idx):
         if self._cache is not None:
             return self._cache[idx]
-        return self._load_indices(idx)
+        return self._load_sample(idx)
+
+
+class TwoLevelPixelCNNQuantizedDataset(PixelCNNQuantizedDataset):
+    """
+    Lazy dataset for two-level VQ-VAE PixelCNN training from precomputed index files.
+
+    Expected payload keys are:
+      - "top_indices": 2D tensor for the top prior
+      - "bottom_indices": 2D tensor for the bottom prior
+    """
+
+    @staticmethod
+    def _extract_level_indices(payload, file_path: str):
+        if not isinstance(payload, dict):
+            raise KeyError(f"Quantized payload at {file_path} must be a dictionary.")
+        if 'top_indices' in payload and 'bottom_indices' in payload:
+            top_indices = payload['top_indices']
+            bottom_indices = payload['bottom_indices']
+        elif isinstance(payload.get('indices'), dict):
+            indices = payload['indices']
+            top_indices = indices.get('top')
+            bottom_indices = indices.get('bottom')
+        else:
+            raise KeyError(
+                f"Two-level quantized payload at {file_path} must contain "
+                "'top_indices' and 'bottom_indices'."
+            )
+
+        top_indices = torch.as_tensor(top_indices).long()
+        bottom_indices = torch.as_tensor(bottom_indices).long()
+        if top_indices.ndim != 2:
+            raise ValueError(f"Expected 2D top index grid in {file_path}, got {tuple(top_indices.shape)}")
+        if bottom_indices.ndim != 2:
+            raise ValueError(f"Expected 2D bottom index grid in {file_path}, got {tuple(bottom_indices.shape)}")
+        return top_indices, bottom_indices
+
+    def _load_sample(self, idx: int):
+        return self._extract_level_indices(self._load_payload(idx), self.files[idx])
+
+    @staticmethod
+    def _sample_shape(sample):
+        top_indices, bottom_indices = sample
+        return {
+            'top': tuple(int(x) for x in top_indices.shape),
+            'bottom': tuple(int(x) for x in bottom_indices.shape),
+        }
+
+    def _resolve_num_embeddings(self):
+        value = self.config.get('num_embeddings')
+        if isinstance(value, dict):
+            return [int(value['top']), int(value['bottom'])]
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            return [int(value[0]), int(value[1])]
+
+        top = self.config.get('num_embeddings_top')
+        bottom = self.config.get('num_embeddings_bottom')
+        if top is not None and bottom is not None:
+            return [int(top), int(bottom)]
+        return None
+
+    def _resolve_input_size(self, sample):
+        top_indices, bottom_indices = sample
+        return [
+            tuple(int(x) for x in top_indices.shape),
+            tuple(int(x) for x in bottom_indices.shape),
+        ]

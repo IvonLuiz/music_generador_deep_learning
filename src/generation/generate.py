@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 
 from generation.soundgenerator import SoundGenerator
 from modeling.torch.vq_vae import VQ_VAE
-from train_scripts.train_vq_utils import load_fsdd
 
 
 HOP_LENGTH = 256
@@ -139,23 +138,3 @@ def save_spectrogram_comparisons(original_specs, min_max_values, sound_generator
 
     print(f"\nAll spectrogram comparisons saved to: {save_dir}")
 
-
-if __name__ == "__main__":
-    vae = VQ_VAE.load("model")
-    sound_generator = SoundGenerator(vae, HOP_LENGTH)
-
-    # Load spectrograms + min max values
-    with open(MIN_MAX_VALUES_PATH, "rb") as f:
-        min_max_values = pickle.load(f)
-    specs, file_paths = load_fsdd(SPECTROGRAMS_PATH)
-
-    # Sample spectrograms + min max values
-    sampled_specs, sampled_min_max_values = select_spectrograms(specs, file_paths, min_max_values, 5)
-
-    # Generate audio for sampled spectrograms
-    signals, _ = sound_generator.generate(sampled_specs, sampled_min_max_values)
-
-    original_signals = sound_generator.convert_spectrograms_to_audio(sampled_specs, sampled_min_max_values)
-
-    save_signals(signals, SAVE_DIR_GENERATED)
-    save_signals(original_signals, SAVE_DIR_ORIGINAL)

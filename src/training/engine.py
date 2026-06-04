@@ -86,6 +86,33 @@ class TrainingAdapter:
         """
         return None
 
+    def load_model_state(
+        self,
+        model: torch.nn.Module,
+        checkpoint: dict,
+        config: dict,
+        device: torch.device,
+    ) -> dict:
+        """!
+        @brief Load model weights from a checkpoint.
+
+        @return Dict with optional reset_optimizer/reset_scheduler flags.
+        """
+        model.load_state_dict(checkpoint['model_state'])
+        return {}
+
+    def config_for_save(self, config: dict, data: DataBundle, model: torch.nn.Module) -> dict:
+        """!
+        @brief Return the config payload written to run_dir/config.yaml.
+        """
+        return config
+
+    def autocast_dtype(self, device: torch.device):
+        """!
+        @brief Optional dtype override for AMP autocast.
+        """
+        return None
+
     def prepare_batch(self, batch, data: DataBundle, device: torch.device, training: bool):
         """!
         @brief Move a batch to device and apply the data module preprocessor.
@@ -146,8 +173,11 @@ def _make_scaler(use_amp: bool):
         return GradScaler(enabled=True)
 
 
-def _autocast(device: torch.device, enabled: bool):
-    return torch.amp.autocast(device_type=device.type, enabled=enabled)
+def _autocast(device: torch.device, enabled: bool, dtype=None):
+    kwargs = {'device_type': device.type, 'enabled': enabled}
+    if dtype is not None:
+        kwargs['dtype'] = dtype
+    return torch.amp.autocast(**kwargs)
 
 
 class TrainingEngine:
@@ -208,9 +238,10 @@ class TrainingEngine:
         self.config.setdefault('training', {})['seed'] = seed
         if self.config_path:
             self.config.setdefault('training', {})['config_path'] = self.config_path
-        save_yaml(self.config, os.path.join(run_dir, 'config.yaml'))
 
         model = self.adapter.build_model(self.config, data, device).to(device)
+        self.config = self.adapter.config_for_save(self.config, data, model)
+        save_yaml(self.config, os.path.join(run_dir, 'config.yaml'))
         optimizer = self.adapter.build_optimizer(model, self.config)
 
         epochs = int(training_cfg['epochs'])
@@ -226,10 +257,14 @@ class TrainingEngine:
         )
         print(f'Saving artifacts to: {run_dir}')
 
-        steps_per_epoch = max(1, int(np.ceil(len(data.train_loader) / grad_accum_steps)))
+        steps_per_epoch = int(data.metadata.get(
+            'optimizer_steps_per_epoch',
+            max(1, int(np.ceil(len(data.train_loader) / grad_accum_steps))),
+        ))
         scheduler = self.adapter.build_scheduler(optimizer, self.config, steps_per_epoch)
 
         use_amp = bool(training_cfg.get('amp', True)) and device.type == 'cuda'
+        autocast_dtype = self.adapter.autocast_dtype(device)
         scaler = _make_scaler(use_amp)
         max_grad_norm = training_cfg.get('max_grad_norm', 1.0)
         max_grad_norm = None if max_grad_norm is None else float(max_grad_norm)
@@ -253,7 +288,11 @@ class TrainingEngine:
             checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
             if 'model_state' not in checkpoint:
                 raise KeyError(f"Checkpoint at {resume_checkpoint} does not contain 'model_state'.")
-            model.load_state_dict(checkpoint['model_state'])
+            load_result = self.adapter.load_model_state(model, checkpoint, self.config, device) or {}
+            if load_result.get('reset_optimizer'):
+                reset_optimizer = True
+            if load_result.get('reset_scheduler'):
+                reset_scheduler = True
             if not reset_optimizer and checkpoint.get('optimizer_state') is not None:
                 optimizer.load_state_dict(checkpoint['optimizer_state'])
             if scheduler is not None and not reset_scheduler and checkpoint.get('scheduler_state') is not None:
@@ -322,6 +361,7 @@ class TrainingEngine:
                 scheduler=scheduler,
                 scaler=scaler,
                 use_amp=use_amp,
+                autocast_dtype=autocast_dtype,
                 grad_accum_steps=grad_accum_steps,
                 max_grad_norm=max_grad_norm,
             )
@@ -335,6 +375,7 @@ class TrainingEngine:
                     model=model,
                     data=data,
                     use_amp=use_amp,
+                    autocast_dtype=autocast_dtype,
                 )
 
             self._append_history(history, train_metrics, val_metrics)
@@ -398,6 +439,7 @@ class TrainingEngine:
         scheduler,
         scaler,
         use_amp: bool,
+        autocast_dtype,
         grad_accum_steps: int,
         max_grad_norm: Optional[float],
     ) -> Dict[str, float]:
@@ -426,7 +468,7 @@ class TrainingEngine:
                 if first_remainder_step is not None and step >= first_remainder_step
                 else grad_accum_steps
             )
-            with _autocast(next(model.parameters()).device, use_amp):
+            with _autocast(next(model.parameters()).device, use_amp, autocast_dtype):
                 result = self.adapter.train_step(model, batch, data)
                 loss = result.loss / current_accum_steps
 
@@ -469,7 +511,15 @@ class TrainingEngine:
             raise RuntimeError(f'Epoch {epoch}: no valid training batches.')
         return {key: value / total_samples for key, value in totals.items()}
 
-    def _run_val_epoch(self, epoch: int, epochs: int, model, data: DataBundle, use_amp: bool) -> Dict[str, float]:
+    def _run_val_epoch(
+        self,
+        epoch: int,
+        epochs: int,
+        model,
+        data: DataBundle,
+        use_amp: bool,
+        autocast_dtype=None,
+    ) -> Dict[str, float]:
         """!
         @brief Run one validation epoch and return sample-weighted metric means.
         """
@@ -481,7 +531,7 @@ class TrainingEngine:
             progress = tqdm(data.val_loader, desc=f'Epoch {epoch:03d}/{epochs} [Val]')
             for raw_batch in progress:
                 batch = self.adapter.prepare_batch(raw_batch, data, device, training=False)
-                with _autocast(device, use_amp):
+                with _autocast(device, use_amp, autocast_dtype):
                     result = self.adapter.val_step(model, batch, data)
                 if not torch.isfinite(result.loss):
                     skipped += 1

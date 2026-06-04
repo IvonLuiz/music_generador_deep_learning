@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import matplotlib
 matplotlib.use('Agg')
@@ -35,9 +35,6 @@ class DataBundle:
     data_variance: Optional[float] = None
     batch_preprocessor: Optional[torch.nn.Module] = None
     collate_fn: Any = None
-    min_max_values: Any = None
-    train_file_paths: Optional[List[str]] = None
-    val_file_paths: Optional[List[str]] = None
     num_embeddings: Any = None
     input_size: Any = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -363,6 +360,7 @@ def make_sample_generator(
     sample_source = data_bundle.val_dataset or data_bundle.train_dataset
     if sample_source is None:
         return None
+
     samples, sample_min_max = collect_callback_samples(
         sample_source,
         data_bundle.batch_preprocessor,
@@ -372,6 +370,7 @@ def make_sample_generator(
     )
     if sample_min_max is None:
         sample_min_max = [{'min': 0.0, 'max': 1.0} for _ in range(len(samples))]
+
     return SampleGenerator(
         model,
         samples,
