@@ -6,6 +6,8 @@ train_scripts files can stay small wrappers around model-specific YAML configs.
 """
 
 from .adapters import (
+    JukeboxTransformerPriorAdapter,
+    JukeboxVQVAEAdapter,
     SinglePixelCNNAdapter,
     SingleVQVAEAdapter,
     TwoLevelPixelCNNAdapter,
@@ -13,22 +15,24 @@ from .adapters import (
 )
 from .data_modules import (
     AudioWindowDataModule,
+    JukeboxTransformerPriorDataModule,
+    JukeboxVQVAEDataModule,
     QuantizedPriorDataModule,
-    SpectrogramWindowDataModule,
-    build_vqvae_data_module,
 )
 from .engine import StepResult, TrainingAdapter, TrainingEngine
 
 __all__ = [
     'AudioWindowDataModule',
+    'JukeboxTransformerPriorAdapter',
+    'JukeboxTransformerPriorDataModule',
+    'JukeboxVQVAEAdapter',
+    'JukeboxVQVAEDataModule',
     'QuantizedPriorDataModule',
     'SinglePixelCNNAdapter',
     'SingleVQVAEAdapter',
-    'SpectrogramWindowDataModule',
     'StepResult',
     'TrainingAdapter',
     'TrainingEngine',
     'TwoLevelPixelCNNAdapter',
     'TwoLevelVQVAEAdapter',
-    'build_vqvae_data_module',
 ]

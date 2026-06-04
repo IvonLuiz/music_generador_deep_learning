@@ -4,7 +4,7 @@ task:
   name: "vq_vae_hierarchical_maestro2011"
 
 dataset:
-  input_mode: "audio" # "audio" reads raw audio and builds mel specs on GPU; "image" uses saved .npy 2D arrays
+  input_mode: "audio" # VQ-VAE training reads raw audio and builds mel specs on GPU
   raw_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/
   metadata_path: /home/ivon/code/datasets/raw/maestro-v3.0.0/maestro-v3.0.0.csv
   processed_path: /home/ivon/code/datasets/processed/maestro/

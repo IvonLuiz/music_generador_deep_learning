@@ -45,11 +45,11 @@ Adapters are responsible for the parts that vary by model:
 
 Main responsibilities:
 
-- `SpectrogramWindowDataModule`: loads precomputed image-like `.npy` windows for VQ-VAE training. In configs this is `dataset.input_mode: image`; the older `spectrogram` name is still accepted as an alias.
-- `AudioWindowDataModule`: loads raw audio windows with `RawAudioWindowDataset`, then applies GPU audio-to-mel preprocessing and augmentation.
+- `AudioWindowDataModule`: loads raw audio windows with `RawAudioWindowDataset`, then applies GPU audio-to-mel preprocessing and augmentation for single-level and two-level VQ-VAE training.
+- `JukeboxVQVAEDataModule`: loads level-specific raw audio windows for bottom, middle, or top Jukebox VQ-VAE training.
+- `JukeboxTransformerPriorDataModule`: loads precomputed Jukebox hierarchical code windows for Transformer prior training.
 - `QuantizedPriorDataModule`: loads precomputed single-level or two-level VQ-VAE code datasets for PixelCNN training, including manifest filtering, train/test split merging, fixed validation parity, and even/odd train parity changes per epoch.
 - `WindowParityEpochSampler`: changes the active train subset each epoch, for example alternating even and odd windows.
-- `build_vqvae_data_module`: chooses audio or image VQ-VAE data setup from the config.
 
 Data modules return a `DataBundle`, which is the common object passed into the engine and adapters.
 
@@ -59,7 +59,7 @@ Data modules return a `DataBundle`, which is the common object passed into the e
 
 Main responsibilities:
 
-- `DataBundle`: common container for dataloaders, datasets, preprocessing modules, variance, min/max values, file paths, embedding counts, and metadata.
+- `DataBundle`: common container for dataloaders, datasets, preprocessing modules, variance, embedding counts, input sizes, and metadata.
 - Config helpers: `get_training_cfg`, `get_callbacks_cfg`, and `get_resume_cfg`.
 - Run artifact helpers: `create_run_dir`, `save_yaml`, `save_history`, and `plot_history`.
 - Resume helpers: `normalize_history`, `load_history_file`, `best_metric_from_history`, and `historical_patience_counter`.
@@ -77,7 +77,7 @@ Main responsibilities:
 
 - Load a YAML config.
 - Normalize common config sections.
-- Apply CLI overrides, such as `--input-mode` or `--resume-checkpoint`.
+- Apply CLI overrides, such as `--resume-checkpoint`.
 - Choose the correct data module.
 - Choose the correct adapter.
 - Start `TrainingEngine`.
@@ -88,26 +88,14 @@ The public runner functions are:
 - `run_two_level_vqvae_training`
 - `run_single_pixelcnn_training`
 - `run_two_level_pixelcnn_training`
+- `run_jukebox_vqvae_training`
+- `run_jukebox_transformer_prior_training`
 
 Training scripts should call these functions instead of creating models, datasets, or loops themselves.
-
-### `jukebox_vqvae.py`
-
-`jukebox_vqvae.py` contains the remaining Jukebox VQ-VAE training loop.
-
-It is kept separate because Jukebox training still has more specialized behavior than the shared phase-1 engine, including level-specific model behavior and existing callback/checkpoint expectations. It reuses common helpers where possible, but it is not yet fully migrated to `TrainingEngine`.
-
-This file replaces the old `train_vqvae_utils.py` module. The Jukebox script imports it directly as:
-
-```python
-from training.jukebox_vqvae import train_vqvae_jukebox
-```
 
 ### `__init__.py`
 
 `__init__.py` exposes the main shared engine, adapters, and data modules as package imports.
-
-It intentionally does not export the Jukebox trainer, because importing `training` should stay lightweight and should not load Jukebox-specific dependencies unless they are actually needed.
 
 ## How Training Scripts Use This Directory
 
@@ -117,7 +105,8 @@ The refactored scripts under `src/train_scripts/` are now thin CLI wrappers:
 - `train_vqvae_hierarchical.py` calls `run_two_level_vqvae_training`.
 - `train_pixel_cnn.py` calls `run_single_pixelcnn_training`.
 - `train_pixel_cnn_hierarchical.py` calls `run_two_level_pixelcnn_training`.
-- `train_vqvae_jukebox.py` still calls `train_vqvae_jukebox` from `training/jukebox_vqvae.py`.
+- `train_vqvae_jukebox.py` calls `run_jukebox_vqvae_training`.
+- `train_transformer_prior.py` calls `run_jukebox_transformer_prior_training`.
 
 PixelCNN paths expect indices already precomputed by `src/processing/preprocess_vqvae_quantization.py`. Use `--variant single` for the single VQ-VAE PixelCNN and `--variant two_level` for the hierarchical VQ-VAE PixelCNN. The old PixelCNN path that quantized spectrograms inside the training loop was removed.
 
@@ -137,7 +126,6 @@ The usual flow is:
 - Add shared loop behavior in `engine.py`.
 - Add reusable helpers in `common.py`.
 - Add config/CLI wiring in `runners.py` and the corresponding `src/train_scripts/` wrapper.
-- Keep specialized legacy Jukebox behavior in `jukebox_vqvae.py` until it is migrated to adapters.
 
 ## Config Boundary
 

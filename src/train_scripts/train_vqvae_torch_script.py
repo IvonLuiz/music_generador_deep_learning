@@ -12,13 +12,6 @@ def main():
     parser = argparse.ArgumentParser(description='Train a single-level VQ-VAE.')
     parser.add_argument('--config', type=str, default='./config/config_vqvae.yaml')
     parser.add_argument(
-        '--input-mode',
-        type=str,
-        choices=['audio', 'image', 'spectrogram'],
-        default=None,
-        help="Override dataset.input_mode. 'image' and 'spectrogram' load processed .npy windows.",
-    )
-    parser.add_argument(
         '--resume-checkpoint',
         type=str,
         default=None,
@@ -27,7 +20,6 @@ def main():
     args = parser.parse_args()
     run_dir = run_single_vqvae_training(
         config_path=args.config,
-        input_mode_override=args.input_mode,
         resume_checkpoint=args.resume_checkpoint,
     )
     print('Model training complete. Artifacts saved to:', run_dir)
