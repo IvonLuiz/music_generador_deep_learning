@@ -311,8 +311,9 @@ if __name__ == '__main__':
     parser.add_argument(
         '--audio_method',
         type=str,
-        default='griffinlim',
-        help='Audio inversion: griffinlim or istft',
+        default='gradient',
+        choices=SUPPORTED_AUDIO_METHODS,
+        help='Audio inversion method',
     )
     args = parser.parse_args()
 

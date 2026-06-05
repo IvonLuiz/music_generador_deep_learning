@@ -74,7 +74,7 @@ def main():
     p.add_argument('--top_k', type=int, default=None)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--output_root', default='./samples/middle_bottom_prior_conditioned')
-    p.add_argument('--audio_method', default='griffinlim')
+    p.add_argument('--audio_method', default='gradient')
     p.add_argument('--full_length', action='store_true')
     p.add_argument('--progress_interval', type=int, default=128)
     a = p.parse_args()
