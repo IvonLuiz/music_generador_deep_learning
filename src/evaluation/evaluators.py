@@ -37,8 +37,8 @@ class SingleVQVAEReconstructionConfig:
     spectrograms_path: Optional[str] = None
     n_samples: int = 5
     seed: int = 42
-    min_db: float = -80.0
-    max_db: float = 0.0
+    min_db: float = -40.0
+    max_db: float = 35.0
     min_max_values_path: Optional[str] = None
     save_root: str = "samples/vqvae_reconstruction"
 
@@ -52,8 +52,8 @@ class HierarchicalVQVAEReconstructionConfig:
     model_path: str
     n_samples: int = 5
     seed: int = 42
-    min_db: float = -80.0
-    max_db: float = 0.0
+    min_db: float = -40.0
+    max_db: float = 35.0
     min_max_values_path: Optional[str] = None
     save_root: str = "samples/vq_vae_hierarchical_test"
 
@@ -70,8 +70,8 @@ class JukeboxVQVAEReconstructionConfig:
     n_samples: int = 5
     target_time_frames: Optional[int] = None
     seed: int = 42
-    min_db: float = -80.0
-    max_db: float = 0.0
+    min_db: float = -40.0
+    max_db: float = 35.0
     min_max_values_path: Optional[str] = None
     save_root: str = "samples/jukebox_vqvae_maestro_test"
     audio_method: str = "gradient"
@@ -100,8 +100,8 @@ class HierarchicalPixelCNNSamplingConfig:
     pixelcnn_path: str
     vqvae_path: str
     n_samples: int = 3
-    min_db: float = -80.0
-    max_db: float = 0.0
+    min_db: float = -40.0
+    max_db: float = 35.0
     save_root: str = "samples/pixelcnn_hierarchical_generated"
 
 

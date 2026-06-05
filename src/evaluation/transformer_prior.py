@@ -3,7 +3,6 @@ from typing import Tuple, Optional, List, Dict
 
 import os
 import re
-import json
 from datetime import datetime
 import pickle
 
@@ -21,6 +20,13 @@ from generation.transformer_io_utils import (
     save_indices_with_visualizations,
     save_level_spectrograms,
 )
+from generation.transformer_sampling_utils import (
+    fixed_db_min_max_values as _fixed_db_min_max_values,
+    generate_level_windows as _generate_level_windows,
+    infer_slice_len as _infer_slice_len,
+    load_windowed_quantization_config as _load_windowed_quantization_config,
+    resolve_decode_context_cols as _resolve_decode_context_cols,
+)
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
 from generation.audio_inversion import AudioInversionConfig
 from generation.soundgenerator import SoundGenerator
@@ -30,7 +36,6 @@ from windowed_data_utils import (
     assemble_token_timeline,
     build_timing_schedule_with_offset,
     dynamic_grid_for_tokens,
-    extract_prefix_from_previous_window,
     get_token_slice_for_frame,
     level_grid_info,
     overlapped_subwindow_starts,
@@ -539,122 +544,6 @@ def load_transformer_prior(
 
     return prior_transformer, config, model_path
 
-def _resolve_quantized_path(transformer_config: dict) -> Optional[str]:
-    dataset_cfg = transformer_config.get('dataset', {}) if isinstance(transformer_config, dict) else {}
-    quantized_path = dataset_cfg.get('quantized_data_path')
-    if not quantized_path:
-        return None
-    return os.path.expanduser(str(quantized_path))
-
-def _load_windowed_quantization_config(transformer_config: dict) -> Tuple[Dict, Optional[str]]:
-    quantized_path = _resolve_quantized_path(transformer_config)
-    if not quantized_path:
-        return {}, None
-
-    config_path = os.path.join(quantized_path, 'windowed_quantization_config.json')
-    if not os.path.isfile(config_path):
-        print(f'Warning: windowed_quantization_config.json not found at {config_path}; using transformer config fallbacks.')
-        return {}, quantized_path
-
-    with open(config_path, 'r', encoding='utf-8') as f:
-        return json.load(f), quantized_path
-
-def _resolve_decode_context_cols(requested_context_cols: int, chunk_time_cols: int) -> int:
-    if requested_context_cols < 0:
-        return max(1, int(chunk_time_cols) // 2)
-    return int(requested_context_cols)
-
-def _infer_slice_len(
-    model_cfg: dict,
-    target_seq_len: int,
-    inferred_len_key: str,
-    inferred_stride_key: str,
-) -> int:
-    inferred_len = int(model_cfg.get(inferred_len_key, 0))
-    if inferred_len > 0:
-        return inferred_len
-
-    inferred_stride = _stride_product(model_cfg.get(inferred_stride_key, 0))
-    if inferred_stride > 0:
-        if target_seq_len % inferred_stride != 0:
-            raise ValueError(
-                f'Cannot infer conditioning slice length: target_seq_len={target_seq_len} '
-                f'is not divisible by stride={inferred_stride} ({inferred_stride_key}).'
-            )
-        return target_seq_len // inferred_stride
-
-    raise ValueError(
-        f'Missing both {inferred_len_key} and {inferred_stride_key} in saved model config.'
-    )
-
-def _generate_level_windows(
-    prior,
-    seq_len: int,
-    num_samples: int,
-    start_frames: List[int],
-    device: torch.device,
-    temperature: float,
-    top_k: Optional[int],
-    upper_tokens_list: Optional[List[np.ndarray]] = None,
-    second_upper_tokens_list: Optional[List[np.ndarray]] = None,
-    timing_list: Optional[List[torch.Tensor]] = None,
-    level_name: str = 'level',
-    progress_interval: int = 128,
-    level_time_frames: Optional[int] = None,
-    level_grid: Optional[List[int]] = None,
-    use_overlap_prefixes: bool = False,
-) -> List[np.ndarray]:
-    token_blocks = []
-    previous_tokens = None
-    previous_start_frame = None
-
-    for chunk, start_frame in enumerate(start_frames):
-        upper_indices = None
-        if upper_tokens_list is not None:
-            upper_indices = torch.from_numpy(upper_tokens_list[chunk]).to(device)
-
-        second_upper_indices = None
-        if second_upper_tokens_list is not None:
-            second_upper_indices = torch.from_numpy(second_upper_tokens_list[chunk]).to(device)
-
-        start_tokens = None
-        if use_overlap_prefixes and previous_tokens is not None:
-            if level_time_frames is None or level_grid is None:
-                raise ValueError('level_time_frames and level_grid are required when overlap prefixes are enabled.')
-            prefix = extract_prefix_from_previous_window(
-                previous_tokens=previous_tokens,
-                previous_start_frame=previous_start_frame,
-                current_start_frame=start_frame,
-                level_time_frames=level_time_frames,
-                level_grid=level_grid,
-            )
-            if prefix is not None and prefix.shape[1] > 0:
-                start_tokens = torch.from_numpy(prefix).to(device)
-
-        generate_kwargs = {
-            'batch_size': num_samples,
-            'start_tokens': start_tokens,
-            'upper_indices': upper_indices,
-            'second_upper_indices': second_upper_indices,
-            'seq_len': seq_len,
-            'temperature': temperature,
-            'top_k': top_k,
-            'device': device,
-            'progress_label': f'{level_name} window {chunk + 1}/{len(start_frames)}',
-            'progress_interval': progress_interval,
-        }
-        if timing_list is not None:
-            generate_kwargs['timing'] = timing_list[chunk].to(device=device, dtype=torch.float32)
-
-        with torch.no_grad():
-            tokens = prior.generate(**generate_kwargs).cpu().numpy()
-
-        token_blocks.append(tokens)
-        previous_tokens = tokens
-        previous_start_frame = start_frame
-
-    return token_blocks
-
 def _resolve_level_vqvae_path(level: str, bottom_vqvae_path: Optional[str], vqvae_cfg: dict) -> Optional[str]:
     if level == 'bottom':
         return bottom_vqvae_path or vqvae_cfg.get('bottom_model_dir')
@@ -679,18 +568,6 @@ def _resolve_min_max_values_path(
     if not os.path.exists(min_max_values_path):
         raise FileNotFoundError(f'min_max_values.pkl not found at {min_max_values_path}')
     return min_max_values_path
-
-def _fixed_db_min_max_values(count: int, min_db: float, max_db: float) -> List[Dict[str, float]]:
-    """!
-    @brief Build fixed dB denormalization metadata for generated spectrograms.
-    @param count Number of spectrograms to describe.
-    @param min_db dB value represented by normalized 0.
-    @param max_db dB value represented by normalized 1.
-    @return List of min/max dictionaries.
-    """
-    if max_db <= min_db:
-        raise ValueError(f'fixed max dB must be > min dB, got min={min_db}, max={max_db}')
-    return [{'min': float(min_db), 'max': float(max_db)} for _ in range(count)]
 
 def _decode_tokens_to_audio(
     level: str,
