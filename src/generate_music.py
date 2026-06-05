@@ -16,7 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from utils import load_config, set_global_seed
 from train_scripts.jukebox_utils import load_jukebox_model
-from test_scripts.test_transformer_prior import load_transformer_prior
+from evaluation.transformer_prior import load_transformer_prior
 from generation.audio_inversion import AudioInversionConfig
 from generation.audio_inversion_cli import add_audio_inversion_args
 from generation.generation_config import GenerationConfig
