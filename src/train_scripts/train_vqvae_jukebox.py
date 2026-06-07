@@ -24,7 +24,7 @@ def main():
         dest='resume_checkpoint',
         type=str,
         default=None,
-        help='Resume from a previous model.pth/best_model.pth checkpoint.',
+        help='Resume from a previous latest_model.pth/best_model.pth checkpoint.',
     )
     args = parser.parse_args()
     run_dir = run_jukebox_vqvae_training(
