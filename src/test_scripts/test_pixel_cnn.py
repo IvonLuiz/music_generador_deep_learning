@@ -5,7 +5,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from evaluation import SinglePixelCNNSamplingConfig, SinglePixelCNNSamplingEvaluator
-from generation.audio_inversion import AudioInversionConfig
+from generation.audio_inversion import DEFAULT_FIXED_MAX_DB, DEFAULT_FIXED_MIN_DB, AudioInversionConfig
 from generation.audio_inversion_cli import add_audio_inversion_args
 
 
@@ -39,8 +39,8 @@ def main() -> None:
     parser.add_argument("--pixelcnn_path", type=str, default="models/pixelcnn_maestro2011/2025-11-30_17-57-20", help="Path to PixelCNN model")
     parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to generate")
     parser.add_argument("--n_samples", type=int, default=None, help="Alias for --num_samples")
-    parser.add_argument("--min_db", type=float, default=-40.0, help="Minimum dB value")
-    parser.add_argument("--max_db", type=float, default=40.0, help="Maximum dB value")
+    parser.add_argument("--min_db", type=float, default=DEFAULT_FIXED_MIN_DB, help="Minimum dB value")
+    parser.add_argument("--max_db", type=float, default=DEFAULT_FIXED_MAX_DB, help="Maximum dB value")
     parser.add_argument("--save_root", type=str, default="samples/pixelcnn_generated", help="Root folder for generated artifacts")
     add_audio_inversion_args(parser, include_denormalization=False)
     args = parser.parse_args()

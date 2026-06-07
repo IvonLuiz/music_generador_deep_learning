@@ -5,7 +5,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from evaluation import HierarchicalPixelCNNSamplingConfig, HierarchicalPixelCNNSamplingEvaluator
-from generation.audio_inversion import AudioInversionConfig
+from generation.audio_inversion import DEFAULT_FIXED_MAX_DB, DEFAULT_FIXED_MIN_DB, AudioInversionConfig
 from generation.audio_inversion_cli import add_audio_inversion_args
 
 
@@ -38,8 +38,8 @@ def main() -> None:
     parser.add_argument("--pixelcnn", type=str, required=True, help="Path to hierarchical PixelCNN model directory or .pth")
     parser.add_argument("--vqvae", type=str, required=True, help="Path to hierarchical VQ-VAE model directory or .pth")
     parser.add_argument("--n_samples", type=int, default=3, help="Number of samples to generate")
-    parser.add_argument("--min_db", type=float, default=-80.0)
-    parser.add_argument("--max_db", type=float, default=0.0)
+    parser.add_argument("--min_db", type=float, default=DEFAULT_FIXED_MIN_DB)
+    parser.add_argument("--max_db", type=float, default=DEFAULT_FIXED_MAX_DB)
     parser.add_argument("--save_root", type=str, default="samples/pixelcnn_hierarchical_generated", help="Root folder for generated artifacts")
     add_audio_inversion_args(parser, include_denormalization=False)
     args = parser.parse_args()

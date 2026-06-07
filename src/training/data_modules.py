@@ -100,7 +100,7 @@ class AudioWindowDataModule:
 
     The dataset returns waveform windows. GPUAudioToMelSpectrogram converts those
     windows to normalized Mel spectrograms inside TrainingAdapter.prepare_batch,
-    allowing pitch/downmix augmentation to happen online.
+    allowing pitch/downmix augmentation to happen in real time.
     """
 
     def __init__(self, config: dict):
@@ -147,8 +147,10 @@ class AudioWindowDataModule:
         if not train_file_paths:
             raise ValueError('The audio split produced no training files.')
 
+        # data augmentation parameters
         examples_per_file = int(audio_cfg.get('examples_per_file', 1))
         downmix_cfg = audio_cfg.get('downmix', {})
+        downmix_weight_range = downmix_cfg.get('weight_range', [0.0, 1.0])
         pitch_cfg = audio_cfg.get('pitch_shift', {})
         pitch_enabled = bool(pitch_cfg.get('enabled', True))
         pitch_choices = pitch_cfg.get('semitone_choices')
@@ -158,6 +160,7 @@ class AudioWindowDataModule:
         if not pitch_enabled:
             pitch_range = [0.0, 0.0]
 
+        # datasets
         target_num_samples = max(1, (target_time_frames - 1) * hop_length)
         train_dataset = RawAudioWindowDataset(
             train_file_paths,
@@ -180,7 +183,6 @@ class AudioWindowDataModule:
                 crop_strategy='non_overlapping',
             )
 
-        downmix_weight_range = downmix_cfg.get('weight_range', [0.0, 1.0])
         batch_preprocessor = GPUAudioToMelSpectrogram(
             sample_rate=sample_rate,
             target_time_frames=target_time_frames,
@@ -199,6 +201,7 @@ class AudioWindowDataModule:
             max_torchaudio_resample_factor=int(audio_cfg.get('max_torchaudio_resample_factor', 256)),
         ).to(device)
 
+        # dataloaders
         kwargs = dataloader_kwargs(training_cfg)
         batch_size = int(training_cfg['batch_size'])
         train_loader = DataLoader(
@@ -224,6 +227,7 @@ class AudioWindowDataModule:
             device,
             max_samples=int(training_cfg.get('data_variance_samples', 1000)),
         )
+
         print(
             'Raw audio augmentation: '
             f'train_files={len(train_file_paths)}, val_files={len(val_file_paths)}, '
@@ -233,6 +237,7 @@ class AudioWindowDataModule:
             f'downmix={bool(downmix_cfg.get("enabled", True))}, pitch_enabled={pitch_enabled}, '
             f'pitch_choices={pitch_choices if pitch_choices else "continuous"}, pitch_range={pitch_range}'
         )
+
         return DataBundle(
             train_loader=train_loader,
             val_loader=val_loader,
@@ -339,10 +344,12 @@ class QuantizedPriorDataModule:
                 f'Training window parity mode: {train_window_parity_mode} '
                 f"(all={counts['all']}, even={counts['even']}, odd={counts['odd']})"
             )
+
         print(
             f'Validation window parity: {validation_window_parity} '
             f'(active={len(val_subset)}, full={len(val_dataset)})'
         )
+
         return DataBundle(
             train_loader=train_loader,
             val_loader=val_loader,
@@ -390,6 +397,7 @@ class JukeboxVQVAEDataModule:
         n_mels = int(dataset_cfg.get('n_mels', 256))
         data_variance_samples = int(training_cfg.get('data_variance_samples', 1000))
 
+        # datasets
         train_dataset, val_dataset, train_file_paths, val_file_paths, batch_preprocessor = self._setup_audio(
             dataset_cfg,
             target_time_frames,
@@ -402,6 +410,7 @@ class JukeboxVQVAEDataModule:
         collate_fn = collate_audio_windows
         data_variance = None
 
+        # dataloaders
         kwargs = dataloader_kwargs(training_cfg)
         batch_size = int(training_cfg['batch_size'])
         train_loader = DataLoader(
@@ -465,6 +474,9 @@ class JukeboxVQVAEDataModule:
         n_mels,
         device,
     ):
+        """!
+        @brief Build raw audio datasets and the GPU batch preprocessor for Jukebox VQ-VAE.
+        """
         raw_audio_path = dataset_cfg.get('raw_path')
         if not raw_audio_path:
             raise ValueError('dataset.raw_path is required for Jukebox audio input mode.')
@@ -553,6 +565,14 @@ class JukeboxTransformerPriorDataModule:
         sample_rate = int(dataset_cfg.get('sample_rate', 22050))
         hop_length = int(dataset_cfg.get('hop_length', 256))
         seed = int(training_cfg.get('seed', 42))
+        conditioning_cfg = self.config.get('conditioning', {})
+        key_cfg = conditioning_cfg.get('key', {})
+        timing_cfg = conditioning_cfg.get('timing', {})
+        key_enabled = bool(key_cfg.get('enabled', False))
+        key_dropout_prob = float(key_cfg.get('dropout_prob', 0.0)) if key_enabled else 0.0
+        timing_dropout_prob = float(timing_cfg.get('dropout_prob', 0.0))
+        metadata_path = dataset_cfg.get('metadata_path')
+        key_infer_missing_mode_as = key_cfg.get('infer_missing_mode_as', 'major')
 
         all_file_paths = list_npy_files(dataset_cfg.get('processed_path', ''))
         if not all_file_paths:
@@ -584,6 +604,10 @@ class JukeboxTransformerPriorDataModule:
             selected_level=selected_level,
             sample_rate=sample_rate,
             hop_length=hop_length,
+            metadata_path=metadata_path,
+            key_infer_missing_mode_as=key_infer_missing_mode_as,
+            key_dropout_prob=key_dropout_prob,
+            timing_dropout_prob=timing_dropout_prob,
         )
         val_dataset = JukeboxQuantizedDataset(
             quantized_path=quantized_path,
@@ -593,6 +617,10 @@ class JukeboxTransformerPriorDataModule:
             selected_level=selected_level,
             sample_rate=sample_rate,
             hop_length=hop_length,
+            metadata_path=metadata_path,
+            key_infer_missing_mode_as=key_infer_missing_mode_as,
+            key_dropout_prob=0.0,
+            timing_dropout_prob=0.0,
         ) if val_file_paths else None
 
         train_window_parity_mode = dataset_cfg.get('train_window_parity_mode', 'alternate')
@@ -661,7 +689,7 @@ class JukeboxTransformerPriorDataModule:
         seed,
     ):
         sample = dataset[0]
-        target_indices, cond_indices, second_cond_indices, _timing = sample
+        target_indices, cond_indices, second_cond_indices, _timing = sample[:4]
         top_rows, top_cols = dataset.top_grid
         middle_rows, middle_cols = dataset.middle_grid
         bottom_rows, bottom_cols = dataset.bottom_grid

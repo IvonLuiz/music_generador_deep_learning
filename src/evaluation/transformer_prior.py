@@ -10,7 +10,6 @@ import numpy as np
 import torch
 import soundfile as sf
 
-from evaluation.core import EvaluationResult
 from evaluation.model_loading import ModelLoader
 from utils import load_config, set_global_seed
 from generation.transformer_io_utils import (
@@ -28,8 +27,8 @@ from generation.transformer_sampling_utils import (
     resolve_decode_context_cols as _resolve_decode_context_cols,
 )
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
-from generation.audio_inversion import AudioInversionConfig
-from generation.soundgenerator import SoundGenerator
+from generation.audio_inversion import DEFAULT_FIXED_MAX_DB, DEFAULT_FIXED_MIN_DB, AudioInversionConfig
+from generation.spectrogram_inverter import SpectrogramAudioConverter
 from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH, FRAME_SIZE, N_MELS
 from train_scripts.jukebox_utils import load_jukebox_model
 from windowed_data_utils import (
@@ -349,6 +348,12 @@ def load_transformer_prior(
     use_timing_conditioning = bool(
         prior_cfg.get('use_timing_conditioning', checkpoint_has_learned_timing)
     )
+    checkpoint_has_key_conditioning = 'key_embedding.weight' in state_dict
+    use_key_conditioning = bool(
+        prior_cfg.get('use_key_conditioning', model_cfg.get('use_key_conditioning', checkpoint_has_key_conditioning))
+    )
+    key_num_classes = int(prior_cfg.get('key_num_classes', model_cfg.get('key_num_classes', 25)))
+    key_unknown_id = int(prior_cfg.get('key_unknown_id', model_cfg.get('key_unknown_id', 24)))
 
     inferred_grids = model_cfg.get('inferred_grids', {})
     primary_uses_2d = _checkpoint_uses_2d_conditioner(state_dict, prefix='conditioner')
@@ -498,6 +503,13 @@ def load_transformer_prior(
         timing_max_duration_seconds=float(prior_cfg.get('timing_max_duration_seconds', 3600.0)),
         timing_embedding_init_std=float(prior_cfg.get('timing_embedding_init_std', 0.02)),
         timing_embedding_scale=float(prior_cfg.get('timing_embedding_scale', 1.0)),
+        use_key_conditioning=use_key_conditioning,
+        key_num_classes=key_num_classes,
+        key_unknown_id=key_unknown_id,
+        key_embedding_scale=float(prior_cfg.get('key_embedding_scale', model_cfg.get('key_embedding_scale', 1.0))),
+        key_embedding_init_std=_optional_float(
+            prior_cfg.get('key_embedding_init_std', model_cfg.get('key_embedding_init_std'))
+        ),
         use_2d_conditioner=use_2d_conditioner,
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
         attention_pattern=prior_cfg.get('attention_pattern', model_cfg.get('attention_pattern')),
@@ -659,15 +671,14 @@ def _decode_tokens_to_audio(
             min_max_values = pickle.load(f)
         min_max_list = prepare_min_max_values(min_max_values, decoded_specs.shape[0])
 
-    sound_generator = SoundGenerator(
-        vqvae,
+    audio_converter = SpectrogramAudioConverter(
         hop_length=hop_length,
         sample_rate=sample_rate,
         n_fft=frame_size,
         spectrogram_type=spectrogram_type,
         n_mels=n_mels,
     )
-    audio_signals = sound_generator.convert_spectrograms_to_audio(
+    audio_signals = audio_converter.convert_spectrograms_to_audio(
         decoded_specs,
         min_max_list,
         inversion_config=audio_config,
@@ -701,8 +712,8 @@ def run_transformer_prior_sampling(
     decode_context_cols: int = -1,
     min_max_values_path: Optional[str] = None,
     use_fixed_db_scale: bool = False,
-    fixed_min_db: float = -80.0,
-    fixed_max_db: float = 0.0,
+    fixed_min_db: float = DEFAULT_FIXED_MIN_DB,
+    fixed_max_db: float = DEFAULT_FIXED_MAX_DB,
     audio_config: Optional[AudioInversionConfig] = None,
     full_length_overlap_fraction: float = 0.5,
     timing_duration_seconds: float = 240.0,
@@ -1323,44 +1334,12 @@ class TransformerTokenDecoder:
         )
 
 
-class TransformerPriorSamplingEvaluator:
+def __getattr__(name):
     """!
-    @brief Orchestrates Transformer prior sampling, decoding, and artifact saving.
+    @brief Lazily expose moved evaluator classes for direct legacy imports.
     """
+    if name == "TransformerPriorSamplingEvaluator":
+        from evaluation.transformer_evaluators import TransformerPriorSamplingEvaluator
 
-    def __init__(self, config: TransformerPriorSamplingConfig, audio_config: Optional[AudioInversionConfig] = None):
-        """!
-        @brief Initialize evaluator.
-        @param config Sampling configuration.
-        @param audio_config Audio inversion configuration.
-        """
-        self.config = config
-        self.audio_config = audio_config or AudioInversionConfig(method='gradient', use_fixed_db_scale=True)
-
-    def run(self) -> EvaluationResult:
-        """!
-        @brief Execute Transformer prior evaluation.
-        @return Evaluation artifact paths.
-        """
-        output_dir = run_transformer_prior_sampling(
-            top_prior_path=self.config.top_prior_path,
-            middle_prior_path=self.config.middle_prior_path,
-            bottom_prior_path=self.config.bottom_prior_path,
-            bottom_vqvae_path=self.config.bottom_vqvae_path,
-            audio_method=self.audio_config.method,
-            num_samples=int(self.config.n_samples),
-            temperature=float(self.config.temperature),
-            top_k=self.config.top_k,
-            weights_file=self.config.weights_file,
-            full_length=bool(self.config.full_length),
-            full_length_overlap_fraction=float(self.config.full_length_overlap_fraction),
-            seed=self.config.seed,
-            timing_duration_seconds=float(self.config.timing_duration_seconds),
-            min_max_values_path=self.audio_config.min_max_values_path,
-            use_fixed_db_scale=self.audio_config.use_fixed_db_scale,
-            fixed_min_db=self.audio_config.fixed_min_db,
-            fixed_max_db=self.audio_config.fixed_max_db,
-            audio_config=self.audio_config,
-            output_root=self.config.save_root,
-        )
-        return EvaluationResult(output_dir=output_dir)
+        return TransformerPriorSamplingEvaluator
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

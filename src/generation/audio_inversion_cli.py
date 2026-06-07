@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from generation.audio_inversion import SUPPORTED_AUDIO_METHODS, AudioInversionConfig
+from generation.audio_inversion import (
+    DEFAULT_FIXED_MAX_DB,
+    DEFAULT_FIXED_MIN_DB,
+    SUPPORTED_AUDIO_METHODS,
+    AudioInversionConfig,
+)
 
 
 def add_audio_inversion_args(parser, include_denormalization: bool = True) -> None:
@@ -70,8 +75,18 @@ def add_audio_inversion_args(parser, include_denormalization: bool = True) -> No
             action='store_true',
             help='Force fixed dB denormalization instead of min_max_values.pkl.',
         )
-        parser.add_argument('--fixed_min_db', type=float, default=-80.0, help='Fixed dB value mapped from normalized 0.0.')
-        parser.add_argument('--fixed_max_db', type=float, default=0.0, help='Fixed dB value mapped from normalized 1.0.')
+        parser.add_argument(
+            '--fixed_min_db',
+            type=float,
+            default=DEFAULT_FIXED_MIN_DB,
+            help='Fixed dB value mapped from normalized 0.0.',
+        )
+        parser.add_argument(
+            '--fixed_max_db',
+            type=float,
+            default=DEFAULT_FIXED_MAX_DB,
+            help='Fixed dB value mapped from normalized 1.0.',
+        )
 
 
 def audio_inversion_config_from_args(args) -> AudioInversionConfig:
