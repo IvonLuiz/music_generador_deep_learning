@@ -6,7 +6,6 @@ import soundfile as sf
 import torch
 import matplotlib.pyplot as plt
 
-from generation.soundgenerator import SoundGenerator
 from modeling.torch.vq_vae import VQ_VAE
 
 
@@ -46,7 +45,7 @@ def save_multiple_signals(signals_dict, save_dir, sample_rate=22050):
         save_signals(signals, key_dir, sample_rate)
         print('Saved', key, '->', key_dir)
 
-def save_spectrogram_comparisons(original_specs, min_max_values, sound_generator, save_dir="spectrograms/"):
+def save_spectrogram_comparisons(original_specs, min_max_values, model, save_dir="spectrograms/"):
     """
     Save side-by-side comparisons of original vs VQ-VAE reconstructed spectrograms.
     This visualizes how well the model reconstructs the input spectrograms.
@@ -64,11 +63,11 @@ def save_spectrogram_comparisons(original_specs, min_max_values, sound_generator
             x = torch.from_numpy(np.array(original_specs, dtype=np.float32))
         
         x = x.permute(0, 3, 1, 2)  # (N, 1, H, W)
-        device = next(sound_generator.autoencoder.parameters()).device
+        device = next(model.parameters()).device
         x = x.to(device)
         
         # Get reconstruction directly from VQ-VAE
-        x_hat, z_q = sound_generator.autoencoder.reconstruct(x)
+        x_hat, z_q = model.reconstruct(x)
         reconstructed_specs = x_hat.cpu().permute(0, 2, 3, 1).numpy()  # Back to (N, H, W, 1)
     
     # Create comparison plots

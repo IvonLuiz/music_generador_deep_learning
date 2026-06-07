@@ -1,8 +1,6 @@
-from typing import Any, Optional
+from typing import Optional
 
 import numpy as np
-import torch
-from torch import nn as _nn
 
 from generation.audio_inversion import (
     SUPPORTED_AUDIO_METHODS,
@@ -13,25 +11,20 @@ from generation.audio_inversion import (
 from processing.preprocess_audio import MinMaxNormalizer
 
 
-class SoundGenerator:
+class SpectrogramAudioConverter:
     """!
-    @brief Reconstruct normalized spectrograms and convert them back to audio.
-
-    The class intentionally keeps the old public API, but the inversion
-    algorithms now live in generation.audio_inversion as separate classes.
+    @brief Convert normalized spectrograms back to audio waveforms.
     """
 
-    def __init__(self, autoencoder, hop_length, sample_rate=22050, n_fft=512, spectrogram_type="linear", n_mels=256):
+    def __init__(self, hop_length, sample_rate=22050, n_fft=512, spectrogram_type="linear", n_mels=256):
         """!
-        @brief Create a reconstruction and spectrogram-inversion helper.
-        @param autoencoder Model with `reconstruct` or None when only converting spectrograms.
+        @brief Create a spectrogram inversion helper.
         @param hop_length STFT/Mel hop length in samples.
         @param sample_rate Audio sample rate in Hz.
         @param n_fft FFT frame size.
         @param spectrogram_type Either `linear` or `mel`.
         @param n_mels Number of Mel bands when using Mel spectrograms.
         """
-        self.autoencoder = autoencoder
         self.geometry = AudioGeometry(
             hop_length=hop_length,
             sample_rate=sample_rate,
@@ -45,51 +38,6 @@ class SoundGenerator:
         self.n_mels = self.geometry.n_mels
         self.spectrogram_type = self.geometry.spectrogram_type
         self.__min_max_normalizer = MinMaxNormalizer(0, 1)
-
-    def generate(self, spectrograms, min_max_values, method="gradient", inversion_config=None, **inversion_kwargs):
-        """!
-        @brief Reconstruct normalized spectrograms with the autoencoder and invert them to audio.
-        @param spectrograms Normalized spectrogram batch shaped `(N, H, W, 1)`.
-        @param min_max_values List of denormalization dictionaries with `min` and `max`.
-        @param method Legacy inversion method name used when inversion_config is absent.
-        @param inversion_config Optional structured inversion settings.
-        @param inversion_kwargs Legacy inversion keyword arguments.
-        @return Tuple `(signals, latent_representations)`.
-        """
-        if _nn is not None and isinstance(self.autoencoder, _nn.Module):
-            assert torch is not None, "Torch is required for PyTorch-based generation."
-            x = (
-                torch.from_numpy(spectrograms.astype(np.float32))
-                if isinstance(spectrograms, np.ndarray)
-                else torch.from_numpy(np.asarray(spectrograms, dtype=np.float32))
-            )
-            x = x.permute(0, 3, 1, 2)
-
-            device = next(self.autoencoder.parameters()).device
-            self.autoencoder.eval()
-            with torch.no_grad():
-                x = x.to(device)
-                model: Any = self.autoencoder
-                recon_out = model.reconstruct(x)
-                if isinstance(recon_out, tuple):
-                    x_hat = recon_out[0]
-                    z_q = recon_out[1] if len(recon_out) > 1 else recon_out[0]
-                else:
-                    x_hat = recon_out
-                    z_q = recon_out
-                generated_spectrograms = x_hat.detach().cpu().permute(0, 2, 3, 1).numpy()
-                latent_representations = z_q.detach().cpu().numpy()
-        else:
-            generated_spectrograms, latent_representations = self.autoencoder.reconstruct(spectrograms)
-
-        signals = self.convert_spectrograms_to_audio(
-            generated_spectrograms,
-            min_max_values,
-            method=method,
-            inversion_config=inversion_config,
-            **inversion_kwargs,
-        )
-        return signals, latent_representations
 
     def convert_spectrograms_to_audio(
         self,

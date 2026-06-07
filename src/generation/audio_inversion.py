@@ -10,6 +10,8 @@ import torch.nn.functional as F
 
 
 SUPPORTED_AUDIO_METHODS = ("griffinlim", "istft", "gradient", "decorsiere")
+DEFAULT_FIXED_MIN_DB = -55.0
+DEFAULT_FIXED_MAX_DB = 30.0
 
 
 @dataclass
@@ -56,8 +58,8 @@ class AudioInversionConfig:
     decorsiere_history_size: int = 10
     min_max_values_path: Optional[str] = None
     use_fixed_db_scale: bool = False
-    fixed_min_db: float = -40.0
-    fixed_max_db: float = 30.0
+    fixed_min_db: float = DEFAULT_FIXED_MIN_DB
+    fixed_max_db: float = DEFAULT_FIXED_MAX_DB
 
     def __post_init__(self) -> None:
         """!
@@ -102,8 +104,8 @@ class AudioInversionConfig:
             decorsiere_history_size=getattr(args, "decorsiere_history_size", 10),
             min_max_values_path=getattr(args, "min_max_values_path", None),
             use_fixed_db_scale=getattr(args, "use_fixed_db_scale", False),
-            fixed_min_db=getattr(args, "fixed_min_db", -40.0),
-            fixed_max_db=getattr(args, "fixed_max_db", 30.0),
+            fixed_min_db=getattr(args, "fixed_min_db", DEFAULT_FIXED_MIN_DB),
+            fixed_max_db=getattr(args, "fixed_max_db", DEFAULT_FIXED_MAX_DB),
         )
 
     def validate(self) -> None:
@@ -135,7 +137,7 @@ class AudioInversionConfig:
 
     def to_legacy_kwargs(self) -> dict:
         """!
-        @brief Return kwargs accepted by the previous SoundGenerator API.
+        @brief Return kwargs accepted by the previous spectrogram inversion API.
         @return Dict of legacy keyword arguments.
         """
         return {

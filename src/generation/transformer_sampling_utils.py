@@ -7,7 +7,7 @@ import soundfile as sf
 import torch
 
 from generation.audio_inversion import AudioInversionConfig
-from generation.soundgenerator import SoundGenerator
+from generation.spectrogram_inverter import SpectrogramAudioConverter
 from train_scripts.jukebox_utils import load_jukebox_model
 from windowed_data_utils import extract_prefix_from_previous_window, level_grid_info
 
@@ -521,15 +521,14 @@ def save_audio_from_spectrogram(
 
         min_max_list = prepare_min_max_values(min_max_values, spectrograms.shape[0])
 
-    sound_generator = SoundGenerator(
-        None,
+    audio_converter = SpectrogramAudioConverter(
         hop_length=hop_length,
         sample_rate=sample_rate,
         n_fft=frame_size,
         spectrogram_type=spectrogram_type,
         n_mels=n_mels,
     )
-    audio_signals = sound_generator.convert_spectrograms_to_audio(
+    audio_signals = audio_converter.convert_spectrograms_to_audio(
         spectrograms,
         min_max_list,
         inversion_config=resolved_audio_config,

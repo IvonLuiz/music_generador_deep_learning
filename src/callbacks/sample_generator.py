@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import soundfile as sf
-from generation.soundgenerator import SoundGenerator
+from generation.spectrogram_inverter import SpectrogramAudioConverter
 from processing.preprocess_audio import HOP_LENGTH, SAMPLE_RATE, FRAME_SIZE, N_MELS
 
 class SampleGenerator:
@@ -37,8 +37,7 @@ class SampleGenerator:
         self.save_dir = save_dir
         self.device = device
         self.sample_rate = sample_rate
-        self.sound_generator = SoundGenerator(
-            model,
+        self.audio_converter = SpectrogramAudioConverter(
             hop_length=hop_length,
             sample_rate=sample_rate,
             n_fft=n_fft,
@@ -47,7 +46,7 @@ class SampleGenerator:
         )
 
     def step(self, epoch):
-        epoch_save_dir = os.path.join(self.save_dir, "samples", f"epoch_{epoch+1:03d}")
+        epoch_save_dir = os.path.join(self.save_dir, "samples", f"epoch_{epoch:03d}")
         os.makedirs(epoch_save_dir, exist_ok=True)
         
         self.model.eval()
@@ -79,15 +78,15 @@ class SampleGenerator:
             
         # Convert to audio
         try:
-            original_signals = self.sound_generator.convert_spectrograms_to_audio(safe_original_specs, self.min_max_values)
+            original_signals = self.audio_converter.convert_spectrograms_to_audio(safe_original_specs, self.min_max_values)
         except Exception as e:
-            print(f"Warning: failed to convert original spectrograms to audio at epoch {epoch+1}: {e}")
+            print(f"Warning: failed to convert original spectrograms to audio at epoch {epoch}: {e}")
             original_signals = [np.zeros(self.sample_rate, dtype=np.float32) for _ in range(len(safe_original_specs))]
 
         try:
-            reconstructed_signals = self.sound_generator.convert_spectrograms_to_audio(reconstructed_specs, self.min_max_values)
+            reconstructed_signals = self.audio_converter.convert_spectrograms_to_audio(reconstructed_specs, self.min_max_values)
         except Exception as e:
-            print(f"Warning: failed to convert reconstructed spectrograms to audio at epoch {epoch+1}: {e}")
+            print(f"Warning: failed to convert reconstructed spectrograms to audio at epoch {epoch}: {e}")
             reconstructed_signals = [np.zeros(self.sample_rate, dtype=np.float32) for _ in range(len(reconstructed_specs))]
 
         for i, (orig, recon, orig_sig, recon_sig, min_max_val) in enumerate(zip(safe_original_specs, reconstructed_specs, original_signals, reconstructed_signals, self.min_max_values)):

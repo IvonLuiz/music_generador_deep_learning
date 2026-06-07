@@ -5,8 +5,13 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from generation.audio_inversion import AudioGeometry, AudioInversionConfig
-from generation.soundgenerator import SoundGenerator
+from generation.audio_inversion import (
+    DEFAULT_FIXED_MAX_DB,
+    DEFAULT_FIXED_MIN_DB,
+    AudioGeometry,
+    AudioInversionConfig,
+)
+from generation.spectrogram_inverter import SpectrogramAudioConverter
 
 
 class AudioExporter:
@@ -18,18 +23,15 @@ class AudioExporter:
         self,
         geometry: AudioGeometry,
         audio_config: Optional[AudioInversionConfig] = None,
-        autoencoder=None,
     ):
         """!
         @brief Initialize an audio exporter.
         @param geometry STFT/Mel geometry.
         @param audio_config Spectrogram inversion settings.
-        @param autoencoder Optional model for SoundGenerator compatibility.
         """
         self.geometry = geometry
         self.audio_config = audio_config or AudioInversionConfig(use_fixed_db_scale=True)
-        self.sound_generator = SoundGenerator(
-            autoencoder,
+        self.audio_converter = SpectrogramAudioConverter(
             hop_length=geometry.hop_length,
             sample_rate=geometry.sample_rate,
             n_fft=geometry.n_fft,
@@ -38,7 +40,11 @@ class AudioExporter:
         )
 
     @staticmethod
-    def fixed_min_max(count: int, min_db: float = -80.0, max_db: float = 0.0) -> List[Dict[str, float]]:
+    def fixed_min_max(
+        count: int,
+        min_db: float = DEFAULT_FIXED_MIN_DB,
+        max_db: float = DEFAULT_FIXED_MAX_DB,
+    ) -> List[Dict[str, float]]:
         """!
         @brief Build fixed dB denormalization metadata.
         @param count Number of spectrograms.
@@ -61,7 +67,7 @@ class AudioExporter:
                 self.audio_config.fixed_min_db,
                 self.audio_config.fixed_max_db,
             )
-        return self.sound_generator.convert_spectrograms_to_audio(
+        return self.audio_converter.convert_spectrograms_to_audio(
             specs,
             min_max_values,
             inversion_config=self.audio_config,
