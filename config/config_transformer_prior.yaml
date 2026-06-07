@@ -29,6 +29,19 @@ vqvae:
 model:
   name: "jukebox_maestro"
 
+conditioning:
+  key:
+    enabled: true
+    source: "canonical_title"
+    num_classes: 25
+    unknown_id: 24
+    dropout_prob: 0.05
+    embedding_scale: 1.0
+    embedding_init_std: 0.004
+    infer_missing_mode_as: "major"
+  timing:
+    dropout_prob: 0.5
+
 # Conditioner strides are computed automatically in the training script from the temporal
 # alignment between levels:
 #   Middle primary (Top→Middle):   sliced Top = top_h*(512/2048)*top_w = 8*16=128 tokens → stride 512/128=4

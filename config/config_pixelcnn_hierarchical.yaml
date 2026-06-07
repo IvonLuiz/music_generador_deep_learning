@@ -23,11 +23,13 @@ model:
 
 priors:
   top_prior:
+    num_embeddings: 512
     hidden_channels: 128
     num_layers: 15
     conv_filter_size: 5
     dropout_rate: 0.1
   bottom_prior:
+    num_embeddings: 512
     hidden_channels: 128
     num_layers: 15
     conv_filter_size: 5
@@ -38,7 +40,7 @@ training:
   batch_size: 32
   gradient_accumulation_steps: 8
   learning_rate: 0.0003
-  epochs: 50
+  epochs: 200
   save_dir: "./models/"
   validation_split: 0.2
   num_workers: 4
