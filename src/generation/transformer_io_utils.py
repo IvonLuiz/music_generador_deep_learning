@@ -1,10 +1,10 @@
 import os
 from typing import Callable, List, Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from evaluation.visualization import SpectrogramPlotConfig, SpectrogramVisualizer
 from utils import load_config
 
 
@@ -156,17 +156,16 @@ def save_spectrogram_image(
     @param vmin Optional lower display bound.
     @param vmax Optional upper display bound.
     """
-    img = spec[:, :, 0] if spec.ndim == 3 else spec
-    fig, ax = plt.subplots(figsize=figsize)
-    im = ax.imshow(img, origin='lower', aspect='auto', cmap=cmap, vmin=vmin, vmax=vmax)
-    if colorbar_label:
-        fig.colorbar(im, ax=ax, label=colorbar_label, pad=0.015)
-    else:
-        fig.colorbar(im, ax=ax, pad=0.015)
-    ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=dpi, bbox_inches='tight', pad_inches=0.02)
-    plt.close(fig)
+    visualizer = SpectrogramVisualizer(
+        SpectrogramPlotConfig(
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            colorbar_label=colorbar_label or 'Value',
+            dpi=dpi,
+        )
+    )
+    visualizer.save_spectrogram(spec, out_path, title, figsize=figsize)
 
 
 def save_level_spectrograms(
@@ -239,14 +238,15 @@ def save_indices_with_visualizations(indices: np.ndarray, save_dir: str, name: s
     time_steps, freq_bins = int(grid[0]), int(grid[1])
     vis_dir = os.path.join(save_dir, 'visualizations', name)
     os.makedirs(vis_dir, exist_ok=True)
+    visualizer = SpectrogramVisualizer(SpectrogramPlotConfig(colorbar_label='Code index'))
     for i in range(indices.shape[0]):
         img = indices[i].reshape(time_steps, freq_bins).T
-        plt.figure(figsize=(5, 4))
-        plt.imshow(img, origin='lower', aspect='auto')
-        plt.colorbar()
-        plt.title(f'Generated {name.capitalize()} Codes {i}')
-        plt.savefig(os.path.join(vis_dir, f'sample_{i}.png'))
-        plt.close()
+        visualizer.save_spectrogram(
+            img,
+            os.path.join(vis_dir, f'sample_{i}.png'),
+            f'Generated {name.capitalize()} Codes {i}',
+            figsize=(5, 4),
+        )
 
 
 def decode_jukebox_indices(
