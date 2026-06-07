@@ -349,6 +349,12 @@ def load_transformer_prior(
     use_timing_conditioning = bool(
         prior_cfg.get('use_timing_conditioning', checkpoint_has_learned_timing)
     )
+    checkpoint_has_key_conditioning = 'key_embedding.weight' in state_dict
+    use_key_conditioning = bool(
+        prior_cfg.get('use_key_conditioning', model_cfg.get('use_key_conditioning', checkpoint_has_key_conditioning))
+    )
+    key_num_classes = int(prior_cfg.get('key_num_classes', model_cfg.get('key_num_classes', 25)))
+    key_unknown_id = int(prior_cfg.get('key_unknown_id', model_cfg.get('key_unknown_id', 24)))
 
     inferred_grids = model_cfg.get('inferred_grids', {})
     primary_uses_2d = _checkpoint_uses_2d_conditioner(state_dict, prefix='conditioner')
@@ -498,6 +504,13 @@ def load_transformer_prior(
         timing_max_duration_seconds=float(prior_cfg.get('timing_max_duration_seconds', 3600.0)),
         timing_embedding_init_std=float(prior_cfg.get('timing_embedding_init_std', 0.02)),
         timing_embedding_scale=float(prior_cfg.get('timing_embedding_scale', 1.0)),
+        use_key_conditioning=use_key_conditioning,
+        key_num_classes=key_num_classes,
+        key_unknown_id=key_unknown_id,
+        key_embedding_scale=float(prior_cfg.get('key_embedding_scale', model_cfg.get('key_embedding_scale', 1.0))),
+        key_embedding_init_std=_optional_float(
+            prior_cfg.get('key_embedding_init_std', model_cfg.get('key_embedding_init_std'))
+        ),
         use_2d_conditioner=use_2d_conditioner,
         attention_qkv_ratio=float(prior_cfg.get('attention_qkv_ratio', 1.0)),
         attention_pattern=prior_cfg.get('attention_pattern', model_cfg.get('attention_pattern')),

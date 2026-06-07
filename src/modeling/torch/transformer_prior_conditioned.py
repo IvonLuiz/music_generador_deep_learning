@@ -73,6 +73,11 @@ class TransformerPriorConditioned(nn.Module):
         timing_max_duration_seconds: float = 3600.0,
         timing_embedding_init_std: float = 0.02,
         timing_embedding_scale: float = 1.0,
+        use_key_conditioning: bool = False,
+        key_num_classes: int = 25,
+        key_unknown_id: int = 24,
+        key_embedding_scale: float = 1.0,
+        key_embedding_init_std: Optional[float] = None,
         use_2d_conditioner: bool = True,
         initialization_std: Optional[float] = None,
         position_embedding_init_std: Optional[float] = None,
@@ -145,6 +150,15 @@ class TransformerPriorConditioned(nn.Module):
         self.timing_window_seconds = float(timing_window_seconds) if timing_window_seconds is not None else None
         self.timing_max_duration_seconds = float(timing_max_duration_seconds)
         self.timing_embedding_scale = float(timing_embedding_scale)
+        self.use_key_conditioning = bool(use_key_conditioning)
+        self.key_num_classes = int(key_num_classes)
+        self.key_unknown_id = int(key_unknown_id)
+        self.key_embedding_scale = float(key_embedding_scale)
+        self.key_embedding_init_std = (
+            float(key_embedding_init_std)
+            if key_embedding_init_std is not None
+            else float(timing_embedding_init_std)
+        )
         self.use_2d_conditioner = bool(use_2d_conditioner)
         self.initialization_std = float(initialization_std) if initialization_std is not None else None
         self.position_embedding_init_std = (
@@ -215,6 +229,8 @@ class TransformerPriorConditioned(nn.Module):
         self.absolute_timing_embedding = None
         self.relative_timing_embedding = None
         self.duration_timing_embedding = None
+        self.key_embedding = None
+
         if self.use_timing_conditioning:
             if self.timing_num_bins < 2:
                 raise ValueError(f"timing_num_bins must be >= 2, got {self.timing_num_bins}")
@@ -224,6 +240,16 @@ class TransformerPriorConditioned(nn.Module):
             self.relative_timing_embedding = nn.Embedding(self.timing_num_bins, model_dim)
             self.duration_timing_embedding = nn.Embedding(self.duration_num_bins, model_dim)
             self._init_learned_timing_embeddings(float(timing_embedding_init_std))
+
+        if self.use_key_conditioning:
+            if self.key_num_classes < 2:
+                raise ValueError(f"key_num_classes must be >= 2, got {self.key_num_classes}")
+            if not 0 <= self.key_unknown_id < self.key_num_classes:
+                raise ValueError(
+                    f"key_unknown_id must be in [0, {self.key_num_classes - 1}], got {self.key_unknown_id}"
+                )
+            self.key_embedding = nn.Embedding(self.key_num_classes, model_dim)
+            nn.init.normal_(self.key_embedding.weight, mean=0.0, std=self.key_embedding_init_std)
 
         # Initialize the transformer layers
         self._init_factored_transformer_layers()
@@ -377,6 +403,8 @@ class TransformerPriorConditioned(nn.Module):
         conditioning_emb: Optional[torch.Tensor] = None,
         second_conditioning_emb: Optional[torch.Tensor] = None,
         timing_emb: Optional[torch.Tensor] = None,
+        timing_mask: Optional[torch.Tensor] = None,
+        key_ids: Optional[torch.Tensor] = None,
         prepend_start_embedding: bool = False,
     ) -> torch.Tensor:
         """!
@@ -394,6 +422,8 @@ class TransformerPriorConditioned(nn.Module):
         @param conditioning_emb Optional precomputed conditioning embedding (shape: [batch_size, T, D]).
         @param second_conditioning_emb Optional second conditioning embedding (shape: [batch_size, T, D]).
         @param timing_emb Optional precomputed timing embedding (shape: [batch_size, T, D]).
+        @param timing_mask Optional boolean mask (shape: [batch_size]) controlling which examples receive timing.
+        @param key_ids Optional title-derived key class IDs (shape: [batch_size]).
         @param prepend_start_embedding Whether to prepend the learned start vector before embedded indices.
         Used for Jukebox-style shifted autoregressive training/generation without adding a BOS token ID.
         @return Logits over the vocabulary (shape: [batch_size, seq_len, num_embeddings]).
@@ -423,10 +453,16 @@ class TransformerPriorConditioned(nn.Module):
             token_emb = torch.cat([start_emb, token_emb], dim=1)
         x = token_emb + self.pos_embedding(pos)
 
+        if self.use_key_conditioning:
+            key_ids = self._normalize_key_ids(key_ids, batch_size, device)
+            key_emb = self.key_embedding(key_ids).unsqueeze(1).expand(-1, seq_len, -1)
+            x = x + self.key_embedding_scale * key_emb
+
         # Add learned timing embeddings if provided.
         # timing shape: (B, 3) with [start_time_s, total_duration_s, fraction_elapsed].
         if self.use_timing_conditioning and timing_emb is not None:
             t_emb = self._align_cached_embedding(timing_emb, batch_size, seq_len, device, 'timing_emb')
+            t_emb = self._apply_timing_mask(t_emb, timing_mask, batch_size, device)
             x = x + self.timing_embedding_scale * t_emb
         elif self.use_timing_conditioning and timing is not None:
             timing = timing.to(device=device, dtype=torch.float32)
@@ -439,6 +475,7 @@ class TransformerPriorConditioned(nn.Module):
                     f"timing must have shape (B, 3) or (1, 3), got {tuple(timing.shape)}"
                 )
             t_emb = self._learned_timing_embedding(timing, seq_len, device)
+            t_emb = self._apply_timing_mask(t_emb, timing_mask, batch_size, device)
             x = x + self.timing_embedding_scale * t_emb
 
         if self.is_upsampler:
@@ -488,6 +525,52 @@ class TransformerPriorConditioned(nn.Module):
         logits = self.to_logits(x)
         
         return logits
+
+    def _normalize_key_ids(
+        self,
+        key_ids: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if key_ids is None:
+            return torch.full((batch_size,), self.key_unknown_id, dtype=torch.long, device=device)
+        key_ids = key_ids.to(device=device, dtype=torch.long)
+        if key_ids.ndim == 0:
+            key_ids = key_ids.view(1)
+        if key_ids.ndim > 1:
+            key_ids = key_ids.view(key_ids.shape[0], -1)[:, 0]
+        if key_ids.shape[0] == 1 and batch_size > 1:
+            key_ids = key_ids.expand(batch_size)
+        if key_ids.shape[0] != batch_size:
+            raise ValueError(f"key_ids batch size {key_ids.shape[0]} does not match indices batch size {batch_size}")
+        if torch.any(key_ids < 0) or torch.any(key_ids >= self.key_num_classes):
+            raise ValueError(
+                f"key_ids must be in [0, {self.key_num_classes - 1}], "
+                f"got min={int(key_ids.min())}, max={int(key_ids.max())}"
+            )
+        return key_ids
+
+    @staticmethod
+    def _apply_timing_mask(
+        timing_embedding: torch.Tensor,
+        timing_mask: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if timing_mask is None:
+            return timing_embedding
+        timing_mask = timing_mask.to(device=device, dtype=torch.bool)
+        if timing_mask.ndim == 0:
+            timing_mask = timing_mask.view(1)
+        if timing_mask.ndim > 1:
+            timing_mask = timing_mask.view(timing_mask.shape[0], -1)[:, 0]
+        if timing_mask.shape[0] == 1 and batch_size > 1:
+            timing_mask = timing_mask.expand(batch_size)
+        if timing_mask.shape[0] != batch_size:
+            raise ValueError(
+                f"timing_mask batch size {timing_mask.shape[0]} does not match indices batch size {batch_size}"
+            )
+        return timing_embedding * timing_mask.view(batch_size, 1, 1).to(dtype=timing_embedding.dtype)
 
     def _compute_conditioning_embedding(
         self,
@@ -607,6 +690,8 @@ class TransformerPriorConditioned(nn.Module):
         upper_indices: Optional[torch.Tensor] = None,
         second_upper_indices: Optional[torch.Tensor] = None,
         timing: Optional[torch.Tensor] = None,
+        timing_mask: Optional[torch.Tensor] = None,
+        key_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """!
         @brief Compute next-token cross-entropy on a full sequence tensor (B, T).
@@ -647,6 +732,8 @@ class TransformerPriorConditioned(nn.Module):
             upper_indices=upper_indices,
             second_upper_indices=second_upper_indices,
             timing=timing,
+            timing_mask=timing_mask,
+            key_ids=key_ids,
             prepend_start_embedding=prepend_start_embedding,
         )
         return F.cross_entropy(logits.reshape(-1, self.num_embeddings), target.reshape(-1))

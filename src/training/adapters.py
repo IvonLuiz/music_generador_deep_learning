@@ -31,26 +31,11 @@ class SingleVQVAEAdapter(TrainingAdapter):
     epoch loop, checkpointing and plotting to TrainingEngine.
     """
 
-    latest_filename = 'model.pth'
-    checkpoint_prefix = 'model_epoch'
-    best_filenames = ('best_model.pth',)
-
     def build_model(self, config: dict, data: DataBundle, device: torch.device) -> torch.nn.Module:
         """!
         @brief Build the single VQ-VAE using the existing initialize_vqvae_model helper.
         """
         return initialize_vqvae_model(config, device)
-
-    def build_optimizer(self, model: torch.nn.Module, config: dict) -> torch.optim.Optimizer:
-        """!
-        @brief Build the Adam optimizer with the legacy VQ-VAE weight decay default.
-        """
-        training_cfg = get_training_cfg(config)
-        return torch.optim.Adam(
-            model.parameters(),
-            lr=float(training_cfg['learning_rate']),
-            weight_decay=float(training_cfg.get('weight_decay', 1e-5)),
-        )
 
     def train_step(self, model: torch.nn.Module, batch, data: DataBundle) -> StepResult:
         """!
@@ -145,10 +130,6 @@ class SinglePixelCNNAdapter(TrainingAdapter):
     @brief Adapter for PixelCNN priors trained on one quantized VQ-VAE level.
     """
 
-    latest_filename = 'latest_model.pth'
-    checkpoint_prefix = 'pixelcnn_epoch'
-    best_filenames = ('best_model.pth', 'best_pixelcnn_model.pth')
-
     def run_subdir(self, config: dict):
         """!
         @brief Use the model name as an extra run subdirectory.
@@ -157,10 +138,10 @@ class SinglePixelCNNAdapter(TrainingAdapter):
 
     def build_model(self, config: dict, data: DataBundle, device: torch.device) -> torch.nn.Module:
         """!
-        @brief Build a conditional gated PixelCNN with K inferred from data or config.
+        @brief Build a conditional gated PixelCNN with K from config.
         """
         model_cfg = config['model']
-        num_embeddings = _resolve_num_embeddings(model_cfg, data)
+        num_embeddings = int(model_cfg['K'])
         model_cfg['K'] = int(num_embeddings)
         return ConditionalGatedPixelCNN(
             in_channels=1,
@@ -170,13 +151,6 @@ class SinglePixelCNNAdapter(TrainingAdapter):
             num_classes=int(num_embeddings),
             num_embeddings=int(num_embeddings),
         ).to(device)
-
-    def build_optimizer(self, model: torch.nn.Module, config: dict) -> torch.optim.Optimizer:
-        """!
-        @brief Build the Adam optimizer used by the PixelCNN priors.
-        """
-        training_cfg = get_training_cfg(config)
-        return torch.optim.Adam(model.parameters(), lr=float(training_cfg['learning_rate']))
 
     def train_step(self, model: torch.nn.Module, batch, data: DataBundle) -> StepResult:
         """!
@@ -197,9 +171,6 @@ class TwoLevelPixelCNNAdapter(SinglePixelCNNAdapter):
     @brief Adapter for hierarchical PixelCNN priors over top and bottom codes.
     """
 
-    best_filenames = ('best_model.pth',)
-    checkpoint_prefix = 'model_epoch'
-
     def run_subdir(self, config: dict):
         """!
         @brief Keep hierarchical PixelCNN runs separated from single-level runs.
@@ -215,11 +186,12 @@ class TwoLevelPixelCNNAdapter(SinglePixelCNNAdapter):
         prior_cfg = config.get('priors', {})
         top_cfg = prior_cfg.get('top_prior', config.get('top_prior', {}))
         bottom_cfg = prior_cfg.get('bottom_prior', config.get('bottom_prior', {}))
-        num_embeddings = data.num_embeddings or [
-            int(top_cfg.get('num_embeddings', model_cfg.get('num_embeddings_top', 512))),
-            int(bottom_cfg.get('num_embeddings', model_cfg.get('num_embeddings_bottom', 512))),
+        num_embeddings = [
+            int(top_cfg['num_embeddings']),
+            int(bottom_cfg['num_embeddings']),
         ]
         input_size = data.input_size or [(32, 32), (64, 64)]
+
         return HierarchicalCondGatedPixelCNN(
             num_prior_levels=int(model_cfg.get('num_prior_levels', 2)),
             input_size=input_size,
@@ -241,6 +213,7 @@ class TwoLevelPixelCNNAdapter(SinglePixelCNNAdapter):
         logits_bottom = model(bottom_indices, cond=top_indices, level='bottom').squeeze(2)
         loss_bottom = F.cross_entropy(logits_bottom, bottom_indices.long())
         loss = loss_top + loss_bottom
+
         return StepResult(
             loss=loss,
             batch_size=int(top_indices.shape[0]),
@@ -250,18 +223,6 @@ class TwoLevelPixelCNNAdapter(SinglePixelCNNAdapter):
                 'bottom': loss_bottom,
             },
         )
-
-
-def _resolve_num_embeddings(model_cfg: dict, data: DataBundle) -> int:
-    """!
-    @brief Resolve PixelCNN vocabulary size from config first, then dataset metadata.
-    """
-    for key in ('K', 'num_embeddings'):
-        if model_cfg.get(key) is not None:
-            return int(model_cfg[key])
-    if data.num_embeddings is not None:
-        return int(data.num_embeddings)
-    raise ValueError('Could not determine num_embeddings/K for PixelCNN.')
 
 
 def _as_index_tensor(batch: torch.Tensor) -> torch.Tensor:
@@ -291,10 +252,6 @@ class JukeboxVQVAEAdapter(TrainingAdapter):
     """!
     @brief Adapter for one bottom/middle/top Jukebox VQ-VAE level.
     """
-
-    latest_filename = 'model.pth'
-    best_filenames = ('best_model.pth',)
-    checkpoint_prefix = 'model_epoch'
 
     def run_subdir(self, config: dict):
         model_name = config.get('model', {}).get('name', 'jukebox_vqvae')
@@ -334,10 +291,6 @@ class JukeboxVQVAEAdapter(TrainingAdapter):
             restart_threshold=float(model_cfg['restart_threshold']),
         ).to(device)
 
-    def build_optimizer(self, model: torch.nn.Module, config: dict) -> torch.optim.Optimizer:
-        training_cfg = get_training_cfg(config)
-        return torch.optim.Adam(model.parameters(), lr=float(training_cfg['learning_rate']))
-
     def train_step(self, model: torch.nn.Module, batch, data: DataBundle) -> StepResult:
         reconstructions, total_vq_loss, vq_losses_details = model(batch)
         vq_loss, codebook_loss, commitment_loss = vq_losses_details[0]
@@ -374,12 +327,6 @@ class JukeboxTransformerPriorAdapter(TrainingAdapter):
     @brief Adapter for Jukebox top/middle/bottom Transformer priors.
     """
 
-    latest_filename = 'latest_model.pth'
-    best_filenames = ('best_model.pth',)
-    checkpoint_prefix = 'model_epoch'
-    monitor_key = 'val_loss'
-    train_monitor_key = 'train_loss'
-
     def run_subdir(self, config: dict):
         model_name = config.get('model', {}).get('name', 'jukebox')
         level = config.get('task', {}).get('level', config.get('model', {}).get('selected_level', 'top'))
@@ -388,13 +335,17 @@ class JukeboxTransformerPriorAdapter(TrainingAdapter):
     def build_model(self, config: dict, data: DataBundle, device: torch.device) -> torch.nn.Module:
         selected_level = config.get('task', {}).get('level', config.get('model', {}).get('selected_level', 'top'))
         prior_cfg = _get_prior_cfg(config, LEVEL_TO_PRIOR_CFG[selected_level])
+        conditioning_cfg = config.get('conditioning', {})
+        key_cfg = conditioning_cfg.get('key', {})
         vqvae_cfg = config.get('vqvae', {})
         metadata = data.metadata
         vqvae_codebook_size = int(vqvae_cfg.get('codebook_size', 2048))
         is_upsampler = COND_LEVEL[selected_level] is not None
+
         condition_on_top = bool(prior_cfg.get('condition_on_top', False)) and selected_level == 'bottom'
         second_cond_block_len = metadata.get('second_cond_block_len') if condition_on_top else None
         second_upsample_stride = metadata.get('second_upsample_stride') if condition_on_top else None
+
         prior = TransformerPriorConditioned(
             num_embeddings=vqvae_codebook_size,
             model_dim=int(prior_cfg['model_dim']),
@@ -430,15 +381,16 @@ class JukeboxTransformerPriorAdapter(TrainingAdapter):
             timing_max_duration_seconds=float(prior_cfg.get('timing_max_duration_seconds', 3600.0)),
             timing_embedding_init_std=float(prior_cfg.get('timing_embedding_init_std', 0.02)),
             timing_embedding_scale=float(prior_cfg.get('timing_embedding_scale', 1.0)),
+            use_key_conditioning=bool(key_cfg.get('enabled', False)),
+            key_num_classes=int(key_cfg.get('num_classes', 25)),
+            key_unknown_id=int(key_cfg.get('unknown_id', 24)),
+            key_embedding_scale=float(key_cfg.get('embedding_scale', 1.0)),
+            key_embedding_init_std=_optional_float(key_cfg.get('embedding_init_std')),
             use_2d_conditioner=bool(prior_cfg.get('use_2d_conditioner', True)),
             initialization_std=_optional_float(prior_cfg.get('initialization_std')),
             position_embedding_init_std=_optional_float(prior_cfg.get('position_embedding_init_std')),
             zero_init_biases=bool(prior_cfg.get('zero_init_biases', True)),
         ).to(device)
-        print(
-            f"Timing conditioning: {'enabled' if prior.use_timing_conditioning else 'disabled'} "
-            "(learned absolute/relative/duration embeddings)"
-        )
         return prior
 
     def build_optimizer(self, model: torch.nn.Module, config: dict) -> torch.optim.Optimizer:
@@ -475,8 +427,15 @@ class JukeboxTransformerPriorAdapter(TrainingAdapter):
         return None
 
     def train_step(self, model: torch.nn.Module, batch, data: DataBundle) -> StepResult:
-        target_seq, cond_seq, second_cond_seq, timing = _prepare_transformer_batch(batch)
-        loss = model.loss(target_seq, upper_indices=cond_seq, second_upper_indices=second_cond_seq, timing=timing)
+        target_seq, cond_seq, second_cond_seq, timing, timing_mask, key_ids = _prepare_transformer_batch(batch)
+        loss = model.loss(
+            target_seq,
+            upper_indices=cond_seq,
+            second_upper_indices=second_cond_seq,
+            timing=timing,
+            timing_mask=timing_mask,
+            key_ids=key_ids,
+        )
         return StepResult(loss=loss, batch_size=int(target_seq.shape[0]), metrics={'total': loss})
 
     def load_model_state(self, model: torch.nn.Module, checkpoint: dict, config: dict, device: torch.device) -> dict:
@@ -504,6 +463,13 @@ class JukeboxTransformerPriorAdapter(TrainingAdapter):
         config['model']['position_embedding_init_std'] = _optional_float(prior_cfg.get('position_embedding_init_std'))
         config['model']['zero_init_biases'] = bool(prior_cfg.get('zero_init_biases', True))
         config['model']['use_timing_conditioning'] = bool(prior_cfg.get('use_timing_conditioning', True))
+        config['model']['use_key_conditioning'] = bool(config.get('conditioning', {}).get('key', {}).get('enabled', False))
+        config['model']['key_num_classes'] = int(config.get('conditioning', {}).get('key', {}).get('num_classes', 25))
+        config['model']['key_unknown_id'] = int(config.get('conditioning', {}).get('key', {}).get('unknown_id', 24))
+        if config.get('conditioning', {}).get('key', {}).get('embedding_init_std') is not None:
+            config['model']['key_embedding_init_std'] = float(
+                config.get('conditioning', {}).get('key', {}).get('embedding_init_std')
+            )
         config['model']['use_2d_conditioner'] = bool(prior_cfg.get('use_2d_conditioner', True))
         config['model']['timing_window_seconds'] = float(
             prior_cfg.get('timing_window_seconds', metadata['timing_window_seconds'])
@@ -549,13 +515,20 @@ def _prepare_transformer_batch(batch):
     cond_indices = batch[1].long() if batch[1] is not None and batch[1].numel() > 0 else None
     second_cond_indices = batch[2].long() if batch[2] is not None and batch[2].numel() > 0 else None
     timing = batch[3].float()
+    batch_metadata = batch[4] if len(batch) > 4 and isinstance(batch[4], dict) else {}
+    key_ids = batch_metadata.get('key_id') if batch_metadata else None
+    timing_mask = batch_metadata.get('timing_mask') if batch_metadata else None
+    if key_ids is not None:
+        key_ids = key_ids.long()
+    if timing_mask is not None:
+        timing_mask = timing_mask.bool()
     target_seq = target_indices.view(target_indices.shape[0], -1)
     cond_seq = cond_indices.view(cond_indices.shape[0], -1) if cond_indices is not None else None
     second_cond_seq = (
         second_cond_indices.view(second_cond_indices.shape[0], -1)
         if second_cond_indices is not None else None
     )
-    return target_seq, cond_seq, second_cond_seq, timing
+    return target_seq, cond_seq, second_cond_seq, timing, timing_mask, key_ids
 
 
 def _load_model_state_compatibly(model: nn.Module, state_dict: dict) -> bool:
