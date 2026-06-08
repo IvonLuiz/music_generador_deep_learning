@@ -51,11 +51,10 @@ class TrainingAdapter:
     optimizer selection and the loss computation for a batch.
     """
 
-    latest_filename = 'model.pth'
+    latest_filename = 'latest_model.pth'
     best_filenames = ('best_model.pth',)
     checkpoint_prefix = 'model_epoch'
     monitor_key = 'val_total'
-    train_monitor_key = 'total'
 
     def run_subdir(self, config: dict) -> Optional[str]:
         """!
@@ -186,9 +185,9 @@ class TrainingEngine:
 
     The engine intentionally does not know the model family being trained. It
     receives a TrainingAdapter plus a data module and handles the repeated
-    training concerns that were duplicated across scripts before the refactor:
-    run directory creation, config copy, train/validation progress bars, AMP,
-    gradient accumulation, clipping, checkpointing, resume, loss JSON, plots and
+    training logic shared across implementations. This includes directory
+    creation, config copy, train/validation progress bars, AMP, gradient
+    accumulation, clipping, checkpointing, resume, loss JSON, plots and
     early stopping.
     """
 
@@ -269,78 +268,44 @@ class TrainingEngine:
         max_grad_norm = training_cfg.get('max_grad_norm', 1.0)
         max_grad_norm = None if max_grad_norm is None else float(max_grad_norm)
 
+        # logic to resume training with some parameters options
         resume_checkpoint = resume_cfg.get('checkpoint_path')
         resume_enabled = bool(resume_cfg.get('enabled', False)) or bool(resume_checkpoint)
         reset_optimizer = bool(resume_cfg.get('reset_optimizer', False))
         reset_scheduler = bool(resume_cfg.get('reset_scheduler', reset_optimizer))
-        checkpoint = None
         history = {}
         start_epoch = 1
-        initial_best_metric = None
+        best_metric = float('inf') # default to inf
 
         if resume_enabled:
-            # Resume must restore both model state and historical metrics so
-            # early stopping continues from the previous run instead of reset.
-            if not resume_checkpoint:
-                raise ValueError('resume.enabled is true but resume.checkpoint_path is empty.')
-            if not os.path.isfile(resume_checkpoint):
-                raise FileNotFoundError(f'Resume checkpoint not found: {resume_checkpoint}')
-            checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
-            if 'model_state' not in checkpoint:
-                raise KeyError(f"Checkpoint at {resume_checkpoint} does not contain 'model_state'.")
-            load_result = self.adapter.load_model_state(model, checkpoint, self.config, device) or {}
-            if load_result.get('reset_optimizer'):
-                reset_optimizer = True
-            if load_result.get('reset_scheduler'):
-                reset_scheduler = True
-            if not reset_optimizer and checkpoint.get('optimizer_state') is not None:
-                optimizer.load_state_dict(checkpoint['optimizer_state'])
-            if scheduler is not None and not reset_scheduler and checkpoint.get('scheduler_state') is not None:
-                scheduler.load_state_dict(checkpoint['scheduler_state'])
+            # update parameters to match the checkpoint if resuming
+            history, start_epoch, best_metric = self._resume_training(
+                model, resume_checkpoint, device, optimizer, scheduler, reset_optimizer, reset_scheduler)
 
-            history = normalize_history(checkpoint.get('history', {}))
-            file_history = load_history_file(os.path.dirname(resume_checkpoint))
-            if file_history:
-                history = file_history
-            if 'epoch' in checkpoint:
-                start_epoch = int(checkpoint['epoch']) + 1
-            else:
-                start_epoch = len(history.get(self.adapter.monitor_key, history.get('total', []))) + 1
-            initial_best_metric = best_metric_from_history(
-                history,
-                self.adapter.monitor_key,
-                self.adapter.train_monitor_key,
-            )
-            if initial_best_metric is None and checkpoint.get('metric_value') is not None:
-                initial_best_metric = float(checkpoint['metric_value'])
-            print(f'Resumed from checkpoint: {resume_checkpoint}')
-            print(f'Starting at epoch {start_epoch}; previous best metric: {initial_best_metric}')
+            # skip training if config epochs is less than the checkpoint epoch
+            if start_epoch > epochs:
+                print(f'Checkpoint already completed epoch {start_epoch - 1}; configured epochs={epochs}.')
+                save_history(history, run_dir)
+                plot_history(history, run_dir)
+                return run_dir
 
         history = normalize_history(history)
-        patience = callbacks_cfg.get('early_stopping_patience')
+
+        # early stopping
         early_stopping = None
-        if data.val_loader is not None and patience is not None:
-            counter = historical_patience_counter(history, self.adapter.monitor_key, initial_best_metric)
+        if data.val_loader is not None:
+            counter = historical_patience_counter(history, self.adapter.monitor_key, best_metric)
             early_stopping = EarlyStopping(
-                patience=int(patience),
+                patience=int(callbacks_cfg.get('early_stopping_patience')),
                 verbose=True,
-                best_score=-initial_best_metric if initial_best_metric is not None else None,
+                best_score=-best_metric if best_metric is not None else None,
                 counter=counter,
             )
 
+        # logic to conditionally create a sample callback that generates audio/visuals during training
         sample_callback = None
         if bool(callbacks_cfg.get('save_samples', False)):
             sample_callback = self.adapter.create_sample_callback(model, data, run_dir, device, self.config)
-
-        if start_epoch > epochs:
-            print(f'Checkpoint already completed epoch {start_epoch - 1}; configured epochs={epochs}.')
-            save_history(history, run_dir)
-            plot_history(history, run_dir)
-            return run_dir
-
-        best_metric = initial_best_metric if initial_best_metric is not None else float('inf')
-        if history.get(self.adapter.monitor_key):
-            best_metric = min(best_metric, min(history[self.adapter.monitor_key]))
 
         latest_path = os.path.join(run_dir, self.adapter.latest_filename)
         save_every = int(callbacks_cfg.get('save_every', 0) or 0)
@@ -413,12 +378,9 @@ class TrainingEngine:
             self._print_epoch_summary(epoch, epochs, train_metrics, val_metrics)
 
             if sample_callback is not None:
-                sample_callback.step(epoch - 1)
+                sample_callback.step(epoch)
 
             if early_stopping is not None:
-                if not np.isfinite(metric_value):
-                    print('Validation loss is non-finite. Stopping training.')
-                    break
                 early_stopping(metric_value)
                 if early_stopping.early_stop:
                     print('Early stopping triggered.')
@@ -445,6 +407,9 @@ class TrainingEngine:
     ) -> Dict[str, float]:
         """!
         @brief Run one training epoch and return sample-weighted metric means.
+        
+        Logic handles gradient accumulation and AMP scaling. Metrics returned by the adapter are
+        expected to be per-batch averages, and are weighted by batch size to compute epoch means.
         """
         totals = {}
         total_samples = 0
@@ -469,7 +434,7 @@ class TrainingEngine:
                 else grad_accum_steps
             )
             with _autocast(next(model.parameters()).device, use_amp, autocast_dtype):
-                result = self.adapter.train_step(model, batch, data)
+                result = self.adapter.train_step(model, batch, data)    # this step is implemented by the child classes
                 loss = result.loss / current_accum_steps
 
             if not torch.isfinite(result.loss):
@@ -482,6 +447,7 @@ class TrainingEngine:
             else:
                 loss.backward()
 
+            # optimizer step if we've accumulated enough or if it's the last batch
             should_step = step % grad_accum_steps == 0 or step == num_batches
             if should_step:
                 if scaler is not None:
@@ -571,3 +537,61 @@ class TrainingEngine:
         val_parts = ', '.join(f'val_{key} {value:.6f}' for key, value in val_metrics.items())
         suffix = f'; {val_parts}' if val_parts else ''
         print(f'Epoch {epoch:03d}/{epochs} - {train_parts}{suffix}')
+
+    def _resume_training(
+        self,
+        model: torch.nn.Module,
+        resume_checkpoint: Optional[str] = None,
+        device: torch.device = torch.device('cpu'),
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        scheduler: Optional[object] = None,
+        reset_optimizer: bool = False,
+        reset_scheduler: bool = False,
+    ) -> tuple[dict, int, float]:
+        """!
+        @brief Load model and training state from a checkpoint for resume functionality.
+        """
+        if not resume_checkpoint:
+            raise ValueError('resume.enabled is true but resume.checkpoint_path is empty.')
+        if not os.path.isfile(resume_checkpoint):
+            raise FileNotFoundError(f'Resume checkpoint not found: {resume_checkpoint}')
+
+        # checkpoint should have model_state, optimizer_state, scheduler_state,
+        # epoch, train_loss, val_loss, metric_value, and history keys
+        checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
+
+        # reset optimizer/scheduler if specified by config
+        load_result = self.adapter.load_model_state(model, checkpoint, self.config, device) or {}
+        if load_result.get('reset_optimizer'):
+            reset_optimizer = True
+        if load_result.get('reset_scheduler'):
+            reset_scheduler = True
+        if not reset_optimizer and checkpoint.get('optimizer_state') is not None:
+            optimizer.load_state_dict(checkpoint['optimizer_state'])
+        if scheduler is not None and not reset_scheduler and checkpoint.get('scheduler_state') is not None:
+            scheduler.load_state_dict(checkpoint['scheduler_state'])
+
+        # history
+        history = normalize_history(checkpoint.get('history', {}))
+        file_history = load_history_file(os.path.dirname(resume_checkpoint))
+        if file_history:
+            history = file_history
+        if 'epoch' in checkpoint:
+            start_epoch = int(checkpoint['epoch']) + 1
+        else:
+            start_epoch = len(history.get(self.adapter.monitor_key, [])) + 1
+
+        # best metric to continue track
+        previous_best_metric = best_metric_from_history(
+            history,
+            self.adapter.monitor_key,
+        )
+        if previous_best_metric is None and checkpoint.get('metric_value') is not None:
+            previous_best_metric = float(checkpoint['metric_value'])
+        if previous_best_metric is None:
+            raise ValueError('Failed to determine best metric from checkpoint history or metric_value.')
+
+        print(f'Resumed from checkpoint: {resume_checkpoint}')
+        print(f'Starting at epoch {start_epoch}; previous best metric: {previous_best_metric}')
+
+        return history, start_epoch, previous_best_metric 

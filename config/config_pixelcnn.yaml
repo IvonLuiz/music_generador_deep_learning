@@ -18,6 +18,7 @@ dataset:
 
 model:
   name: "pixelcnn_maestro_vqvae"
+  K: 1024
   hidden_channels: 128
   num_layers: 15
   kernel_size: 5

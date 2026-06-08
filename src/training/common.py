@@ -158,16 +158,13 @@ def load_history_file(run_dir: str) -> dict:
         return normalize_history(json.load(f))
 
 
-def best_metric_from_history(history: dict, monitor_key: str, fallback_key: str = 'total') -> Optional[float]:
+def best_metric_from_history(history: dict, monitor_key: str) -> Optional[float]:
     """!
-    @brief Return the best finite metric available in a resumed history.
+    @brief Return the best finite monitored metric from resumed history.
     """
-    for key in (monitor_key, 'val_loss', fallback_key, 'train_loss'):
-        values = history.get(key, [])
-        finite_values = [float(value) for value in values if np.isfinite(value)]
-        if finite_values:
-            return min(finite_values)
-    return None
+    values = history.get(monitor_key, [])
+    finite_values = [float(value) for value in values if np.isfinite(value)]
+    return min(finite_values) if finite_values else None
 
 
 def historical_patience_counter(history: dict, monitor_key: str, best_metric: Optional[float]) -> int:
@@ -176,7 +173,7 @@ def historical_patience_counter(history: dict, monitor_key: str, best_metric: Op
     """
     if best_metric is None:
         return 0
-    values = history.get(monitor_key, history.get('val_loss', []))
+    values = history.get(monitor_key, [])
     counter = 0
     for value in reversed(values):
         if not np.isfinite(value):
