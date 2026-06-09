@@ -7,6 +7,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from evaluation import TransformerPriorSamplingConfig, TransformerPriorSamplingEvaluator
 from generation.audio_inversion import AudioInversionConfig
 from generation.audio_inversion_cli import add_audio_inversion_args
+from generation.key_conditioning_cli import add_key_conditioning_args, resolve_key_conditioning
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
     parser.add_argument('--bottom_vqvae', type=str, default=None, help='Path to bottom VQ-VAE run directory, config, or .pth')
     add_audio_inversion_args(parser, include_denormalization=True)
+    add_key_conditioning_args(parser)
     parser.add_argument('--weights_file', type=str, default='best_model.pth')
     parser.add_argument('--n_samples', type=int, default=6, help='Number of samples to generate (default: 6)')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (default: 1.0)')
@@ -48,6 +50,7 @@ def _validate_args(args) -> None:
         raise ValueError(f'--full_length_overlap_fraction must be in [0, 1), got {args.full_length_overlap_fraction}')
     if args.timing_duration_seconds <= 0:
         raise ValueError(f'--timing_duration_seconds must be > 0, got {args.timing_duration_seconds}')
+    resolve_key_conditioning(args.key, args.key_id)
 
 
 def main(argv=None) -> str:
@@ -60,6 +63,9 @@ def main(argv=None) -> str:
     args = parser.parse_args(argv)
     _validate_args(args)
     audio_config = AudioInversionConfig.from_args(args)
+    key_config = resolve_key_conditioning(args.key, args.key_id)
+    if key_config is not None:
+        print(f'Using key conditioning: {key_config.key_label} (id={key_config.key_id})')
     evaluator_config = TransformerPriorSamplingConfig(
         top_prior_path=args.top_prior,
         middle_prior_path=args.middle_prior,
@@ -72,6 +78,8 @@ def main(argv=None) -> str:
         full_length=args.full_length,
         full_length_overlap_fraction=args.full_length_overlap_fraction,
         timing_duration_seconds=args.timing_duration_seconds,
+        key_id=None if key_config is None else key_config.key_id,
+        key_label=None if key_config is None else key_config.key_label,
         seed=args.seed,
         save_root=args.save_root,
     )

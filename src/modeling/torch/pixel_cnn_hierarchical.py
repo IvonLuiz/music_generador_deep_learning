@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
 
@@ -122,7 +123,8 @@ class HierarchicalCondGatedPixelCNN(nn.Module):
 
         x = torch.zeros((batch_size, 1, height, width), dtype=torch.long, device=device)
 
-        for i in range(height):
+        desc = f"Sampling {level} PixelCNN rows"
+        for i in tqdm(range(height), desc=desc):
             for j in range(width):
                 logits = self.forward(x, cond=cond, level=level)
                 logits_hw = logits.squeeze(2)[:, :, i, j]

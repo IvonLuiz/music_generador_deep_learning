@@ -746,6 +746,7 @@ class TransformerPriorConditioned(nn.Module):
         upper_indices: Optional[torch.Tensor] = None,
         second_upper_indices: Optional[torch.Tensor] = None,
         timing: Optional[torch.Tensor] = None,
+        key_ids: Optional[torch.Tensor] = None,
         seq_len: int = 64,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
@@ -761,6 +762,8 @@ class TransformerPriorConditioned(nn.Module):
         @param second_upper_indices Second conditioning indices (bottom prior only). Defaults to None.
         @param timing Global timing tensor of shape (batch_size, 3) or (1, 3) with float values
         [start_time_seconds, total_duration_seconds, fraction_elapsed]. Defaults to None (no timing signal).
+        @param key_ids Optional key class IDs of shape (batch_size,) or (1,). Used only when the model
+        was trained with key conditioning.
         @param seq_len The length of the generated sequence. Defaults to 64.
         @param top_k Top-k filtering. If None or <= 0, no filtering is applied. Defaults to None.
         @param temperature Sampling temperature. Must be > 0. Defaults to 1.0.
@@ -844,6 +847,10 @@ class TransformerPriorConditioned(nn.Module):
                 )
             cached_timing_emb = self._learned_timing_embedding(timing_for_cache, self.max_seq_len, device)
 
+        generation_key_ids = None
+        if key_ids is not None:
+            generation_key_ids = key_ids.to(device=device, dtype=torch.long)
+
         while tokens.shape[1] < target_len:
             logits = self.forward(
                 tokens,
@@ -853,6 +860,7 @@ class TransformerPriorConditioned(nn.Module):
                 conditioning_emb=cached_conditioning_emb,
                 second_conditioning_emb=cached_second_conditioning_emb,
                 timing_emb=cached_timing_emb,
+                key_ids=generation_key_ids,
                 prepend_start_embedding=self.use_start_embedding,
             )
             

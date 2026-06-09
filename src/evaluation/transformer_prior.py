@@ -29,6 +29,7 @@ from generation.transformer_sampling_utils import (
 from modeling.torch.transformer_prior_conditioned import TransformerPriorConditioned
 from generation.audio_inversion import DEFAULT_FIXED_MAX_DB, DEFAULT_FIXED_MIN_DB, AudioInversionConfig
 from generation.spectrogram_inverter import SpectrogramAudioConverter
+from metadata.title_key import key_metadata_from_id, key_metadata_from_label
 from processing.preprocess_audio import SAMPLE_RATE, HOP_LENGTH, FRAME_SIZE, N_MELS
 from train_scripts.jukebox_utils import load_jukebox_model
 from windowed_data_utils import (
@@ -60,6 +61,8 @@ class TransformerPriorSamplingConfig:
     full_length: bool = False
     full_length_overlap_fraction: float = 0.5
     timing_duration_seconds: float = 240.0
+    key_id: Optional[int] = None
+    key_label: Optional[str] = None
     seed: Optional[int] = 42
     save_root: str = 'samples/transformer_prior_maestro'
 
@@ -717,6 +720,8 @@ def run_transformer_prior_sampling(
     audio_config: Optional[AudioInversionConfig] = None,
     full_length_overlap_fraction: float = 0.5,
     timing_duration_seconds: float = 240.0,
+    key_id: Optional[int] = None,
+    key_label: Optional[str] = None,
     seed: Optional[int] = 42,
     output_root: str = 'samples/transformer_prior_maestro',
 ):
@@ -742,6 +747,8 @@ def run_transformer_prior_sampling(
     @param audio_config Structured audio inversion settings.
     @param full_length_overlap_fraction Child-window overlap fraction.
     @param timing_duration_seconds Synthetic total duration for timing conditioning.
+    @param key_id Optional key class ID for Transformer key conditioning.
+    @param key_label Optional key label used for run metadata and direct-call parsing.
     @param seed Optional deterministic seed.
     @param output_root Root directory for saved transformer-prior samples.
     @return Output directory containing generated artifacts.
@@ -762,6 +769,16 @@ def run_transformer_prior_sampling(
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     top_k_value = top_k if (top_k is not None and top_k > 0) else None
+    key_metadata = None
+    if key_id is not None:
+        key_metadata = key_metadata_from_id(int(key_id), source='cli_id')
+        if key_label is not None:
+            key_metadata['key_label'] = str(key_label)
+    elif key_label is not None and str(key_label).strip():
+        key_metadata = key_metadata_from_label(str(key_label))
+    key_ids = None
+    if key_metadata is not None:
+        key_ids = torch.tensor([int(key_metadata['key_id'])], dtype=torch.long, device=device)
 
     print(f'Loading top Transformer prior from {top_prior_path}')
     top_prior, top_config, _ = load_transformer_prior(
@@ -794,6 +811,25 @@ def run_transformer_prior_sampling(
     bottom_grid = bottom_config['model'].get('inferred_grids', {}).get('bottom')
     bottom_prior_cfg = bottom_config.get('priors', {}).get('bottom_prior', {}) if isinstance(bottom_config, dict) else {}
     bottom_condition_on_top = bool(bottom_prior_cfg.get('condition_on_top', False)) or getattr(bottom_prior, 'second_conditioner', None) is not None
+
+    key_enabled = {
+        'top': bool(getattr(top_prior, 'use_key_conditioning', False)),
+        'middle': bool(getattr(middle_prior, 'use_key_conditioning', False)),
+        'bottom': bool(getattr(bottom_prior, 'use_key_conditioning', False)),
+    }
+    if key_metadata is not None:
+        print(
+            'Key conditioning requested: '
+            f"{key_metadata['key_label']} (id={int(key_metadata['key_id'])})"
+        )
+        print(
+            'Key conditioning support: '
+            f"top={'enabled' if key_enabled['top'] else 'disabled'}, "
+            f"middle={'enabled' if key_enabled['middle'] else 'disabled'}, "
+            f"bottom={'enabled' if key_enabled['bottom'] else 'disabled'}"
+        )
+        if not any(key_enabled.values()):
+            print('Warning: key conditioning was requested, but these Transformer priors do not use key embeddings.')
 
     vqvae_cfg = bottom_config.get('vqvae', {}) if isinstance(bottom_config, dict) else {}
     effective_bottom_vqvae = bottom_vqvae_path or vqvae_cfg.get('bottom_model_dir')
@@ -945,6 +981,7 @@ def run_transformer_prior_sampling(
             temperature=temperature,
             top_k=top_k_value,
             timing_list=top_timing,
+            key_ids=key_ids,
             level_name='top',
             progress_interval=progress_interval,
         )
@@ -995,6 +1032,7 @@ def run_transformer_prior_sampling(
             top_k=top_k_value,
             upper_tokens_list=top_slices_for_middle,
             timing_list=mid_timing,
+            key_ids=key_ids,
             level_name='middle',
             progress_interval=progress_interval,
             level_time_frames=mid_tf,
@@ -1077,6 +1115,7 @@ def run_transformer_prior_sampling(
             upper_tokens_list=middle_slices_for_bottom,
             second_upper_tokens_list=top_slices_for_bottom,
             timing_list=bot_timing,
+            key_ids=key_ids,
             level_name='bottom',
             progress_interval=progress_interval,
             level_time_frames=bot_tf,
@@ -1161,6 +1200,7 @@ def run_transformer_prior_sampling(
             top_k=top_k_value,
             device=device,
             timing=timing,
+            key_ids=key_ids,
             progress_label='top',
             progress_interval=progress_interval,
         )
@@ -1176,6 +1216,7 @@ def run_transformer_prior_sampling(
             top_k=top_k_value,
             device=device,
             timing=timing,
+            key_ids=key_ids,
             progress_label='middle',
             progress_interval=progress_interval,
         )
@@ -1192,6 +1233,7 @@ def run_transformer_prior_sampling(
             top_k=top_k_value,
             device=device,
             timing=timing,
+            key_ids=key_ids,
             progress_label='bottom',
             progress_interval=progress_interval,
         )

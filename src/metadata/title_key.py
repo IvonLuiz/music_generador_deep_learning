@@ -64,6 +64,27 @@ def key_id_from_pitch_class(pitch_class: int, mode: str) -> int:
     return int(pitch_class) * 2 + (1 if mode == 'minor' else 0)
 
 
+def key_metadata_from_id(key_id: int, source: str = 'cli') -> dict:
+    """!
+    @brief Convert a key class ID into key metadata.
+    @param key_id Integer key class ID, where 24 is unknown.
+    @param source Metadata source label.
+    @return Dictionary containing `key_id`, `key_label`, and `key_source`.
+    """
+    key_id = int(key_id)
+    if key_id == UNKNOWN_KEY_ID:
+        return unknown_key_metadata(source)
+    if key_id < 0 or key_id >= UNKNOWN_KEY_ID:
+        raise ValueError(f"key_id must be in [0, {UNKNOWN_KEY_ID}], got {key_id}")
+    pitch_class = key_id // 2
+    mode = 'minor' if key_id % 2 else 'major'
+    return {
+        'key_id': key_id,
+        'key_label': f'{PITCH_CLASS_TO_LABEL[pitch_class]} {mode}',
+        'key_source': source,
+    }
+
+
 def _normalize_title(title: str) -> str:
     text = str(title or '').replace('♭', ' flat ').replace('♯', ' sharp ')
     text = text.replace('–', '-').replace('—', '-').replace('_', ' ')
@@ -97,6 +118,47 @@ def _key_metadata(root_token: str, mode: str, source: str) -> dict:
         'key_label': label,
         'key_source': source,
     }
+
+
+def key_metadata_from_label(key_label: Optional[str], default_mode: str = 'major') -> dict:
+    """!
+    @brief Parse a user-facing key label into the same key metadata used during training.
+    @param key_label Key label such as `C major`, `A minor`, `F# minor`, `Bb major`, or `unknown`.
+    @param default_mode Mode used when only a root is supplied.
+    @return Dictionary containing `key_id`, `key_label`, and `key_source`.
+    """
+    if key_label is None:
+        return unknown_key_metadata('cli_missing')
+    text = str(key_label).strip()
+    if not text or text.lower() in ('unknown', 'none', 'null'):
+        return unknown_key_metadata('cli_unknown')
+
+    normalized = _normalize_title(text)
+    normalized = re.sub(r'(?i)^([A-G])\s*([#b])\s*(maj(?:or)?|min(?:or)?|m)?$', r'\1\2 \3', normalized)
+    pattern = re.compile(
+        r'(?i)^([A-G])\s*(#|b|flat|sharp)?\s*'
+        r'(major|minor|maj\.?|min\.?|m)?$'
+    )
+    match = pattern.match(normalized)
+    if not match:
+        raise ValueError(
+            f"Could not parse key label {key_label!r}. "
+            "Use forms like 'C major', 'A minor', 'F# minor', 'Bb major', or 'unknown'."
+        )
+
+    root_token = _canonical_root_token(match.group(1), match.group(2))
+    if root_token is None:
+        raise ValueError(f"Unsupported key root in {key_label!r}.")
+
+    raw_mode = match.group(3)
+    mode = default_mode if raw_mode is None or not str(raw_mode).strip() else str(raw_mode).strip().lower()
+    if mode in ('maj', 'maj.'):
+        mode = 'major'
+    elif mode in ('min', 'min.', 'm'):
+        mode = 'minor'
+    if mode not in ('major', 'minor'):
+        raise ValueError(f"Unsupported key mode in {key_label!r}. Expected major or minor.")
+    return _key_metadata(root_token, mode, 'cli')
 
 
 def infer_key_from_title(title: str, infer_missing_mode_as: str = 'major') -> dict:
