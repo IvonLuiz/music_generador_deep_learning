@@ -82,6 +82,7 @@ def generate_level_windows(
     upper_tokens_list: Optional[List[np.ndarray]] = None,
     second_upper_tokens_list: Optional[List[np.ndarray]] = None,
     timing_list: Optional[List[torch.Tensor]] = None,
+    key_ids: Optional[torch.Tensor] = None,
     level_name: str = "level",
     progress_interval: int = 0,
     level_time_frames: Optional[int] = None,
@@ -100,6 +101,7 @@ def generate_level_windows(
     @param upper_tokens_list Optional primary conditioning token windows.
     @param second_upper_tokens_list Optional secondary conditioning token windows.
     @param timing_list Optional timing tensors aligned with `start_frames`.
+    @param key_ids Optional key class IDs passed to key-conditioned Transformer priors.
     @param level_name Label used for progress output.
     @param progress_interval Autoregressive progress interval. Use 0 to disable.
     @param level_time_frames Window size in spectrogram frames.
@@ -149,6 +151,8 @@ def generate_level_windows(
             generate_kwargs["progress_interval"] = int(progress_interval)
         if timing_list is not None:
             generate_kwargs["timing"] = timing_list[chunk].to(device=device, dtype=torch.float32)
+        if key_ids is not None:
+            generate_kwargs["key_ids"] = key_ids.to(device=device, dtype=torch.long)
 
         with torch.no_grad():
             tokens = prior.generate(**generate_kwargs).cpu().numpy()
