@@ -15,6 +15,8 @@ _EXPORT_MODULES = {
     "HierarchicalVQVAEReconstructionEvaluator": ".vae_evaluators",
     "JukeboxVQVAEReconstructionConfig": ".vae_evaluators",
     "JukeboxVQVAEReconstructionEvaluator": ".vae_evaluators",
+    "MaestroVQVAETestSetConfig": ".vqvae_testset_evaluators",
+    "MaestroVQVAETestSetEvaluator": ".vqvae_testset_evaluators",
     "MiddleBottomConditionedPriorConfig": ".conditioned_priors",
     "MiddleBottomConditionedPriorEvaluator": ".conditioned_priors",
     "ModelLoader": ".model_loading",
@@ -34,6 +36,7 @@ _EXPORT_MODULES = {
     "TransformerTokenDecoder": ".transformer_prior",
     "TransformerTokenSampler": ".transformer_prior",
     "VQVAEEvaluator": ".base_evaluators",
+    "VQVAEModelTestSpec": ".vqvae_testset_evaluators",
 }
 
 __all__ = sorted(_EXPORT_MODULES)

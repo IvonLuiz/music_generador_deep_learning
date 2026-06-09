@@ -38,6 +38,7 @@ def main() -> None:
     """
     parser = argparse.ArgumentParser(description="Test hierarchical VQ-VAE reconstruction")
     parser.add_argument("--model_path", type=str, required=True, help="Path to hierarchical VQ-VAE run dir or checkpoint")
+    parser.add_argument("--split", type=str, default="test", choices=["train", "validation", "val", "test", "all"], help="Raw-audio split to sample when the model uses dataset.input_mode=audio")
     parser.add_argument("--n_samples", type=int, default=5, help="Number of samples to reconstruct")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sample selection")
     parser.add_argument("--save_root", type=str, default="samples/vq_vae_hierarchical_test", help="Root folder for generated artifacts")
@@ -54,6 +55,7 @@ def main() -> None:
         min_db=args.fixed_min_db,
         max_db=args.fixed_max_db,
         min_max_values_path=args.min_max_values_path,
+        split=args.split,
         save_root=args.save_root,
     )
     result = HierarchicalVQVAEReconstructionEvaluator(config, _audio_config_from_args(args)).run()

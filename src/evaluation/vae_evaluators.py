@@ -12,7 +12,7 @@ from evaluation.model_loading import ModelLoader
 from generation.audio_inversion import DEFAULT_FIXED_MAX_DB, DEFAULT_FIXED_MIN_DB, AudioInversionConfig
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 from train_scripts.jukebox_utils import parse_level
-from utils import load_config, load_maestro, list_npy_files
+from utils import load_config
 
 
 @dataclass
@@ -29,6 +29,7 @@ class SingleVQVAEReconstructionConfig:
     min_db: float = DEFAULT_FIXED_MIN_DB
     max_db: float = DEFAULT_FIXED_MAX_DB
     min_max_values_path: Optional[str] = None
+    split: str = "validation"
     save_root: str = "samples/vqvae_reconstruction"
 
 
@@ -44,6 +45,7 @@ class HierarchicalVQVAEReconstructionConfig:
     min_db: float = DEFAULT_FIXED_MIN_DB
     max_db: float = DEFAULT_FIXED_MAX_DB
     min_max_values_path: Optional[str] = None
+    split: str = "validation"
     save_root: str = "samples/vq_vae_hierarchical_test"
 
 
@@ -64,6 +66,7 @@ class JukeboxVQVAEReconstructionConfig:
     min_max_values_path: Optional[str] = None
     save_root: str = "samples/jukebox_vqvae_maestro_test"
     audio_method: str = "gradient"
+    split: str = "validation"
 
 
 class SingleVQVAEReconstructionEvaluator(VQVAEEvaluator):
@@ -73,30 +76,27 @@ class SingleVQVAEReconstructionEvaluator(VQVAEEvaluator):
 
     run_name = "single_vqvae"
 
-    def _sample_specs(self, spectrograms_path: str, target_time_frames: int):
-        specs, file_paths = load_maestro(spectrograms_path, target_time_frames)
-        count = min(int(self.config.n_samples), len(specs))
-        if count <= 0:
-            raise ValueError(f"No spectrogram samples found in {spectrograms_path}")
-        rng = np.random.default_rng(int(self.config.seed))
-        indices = rng.choice(len(specs), count, replace=False)
-        return specs[indices], [file_paths[i] for i in indices]
-
     def _evaluate_reconstruction(self, device: torch.device) -> ReconstructionPayload:
         run_config = load_config(self._config_path_for(self.config.model_path))
         dataset_cfg = run_config.get("dataset", {})
-        specs_path = self.config.spectrograms_path or dataset_cfg.get("processed_path")
-        if not specs_path:
-            raise ValueError("A spectrogram path is required for VQ-VAE reconstruction evaluation.")
-        target_frames = int(dataset_cfg.get("target_time_frames", TARGET_TIME_FRAMES))
-        sampled_specs, sampled_paths = self._sample_specs(specs_path, target_frames)
-        sampled_min_max = self._min_max_for_paths(
-            sampled_paths,
-            specs_path,
-            self.config.min_max_values_path,
-            self.config.min_db,
-            self.config.max_db,
-        )
+        input_mode = str(dataset_cfg.get("input_mode", "spectrogram")).strip().lower()
+        if input_mode == "audio" and self.config.spectrograms_path is None:
+            sampled_specs, sampled_min_max, sampled_paths = self._sample_audio_specs(run_config, device)
+            metadata = {"sample_source": "runtime_raw_audio", "split": self.config.split}
+        else:
+            specs_path = self.config.spectrograms_path or dataset_cfg.get("processed_path")
+            if not specs_path:
+                raise ValueError("A spectrogram path is required for VQ-VAE reconstruction evaluation.")
+            target_frames = int(dataset_cfg.get("target_time_frames", TARGET_TIME_FRAMES))
+            sampled_specs, sampled_paths = self._sample_npy_specs(specs_path, target_frames)
+            sampled_min_max = self._min_max_for_paths(
+                sampled_paths,
+                specs_path,
+                self.config.min_max_values_path,
+                self.config.min_db,
+                self.config.max_db,
+            )
+            metadata = {"sample_source": "precomputed_spectrograms"}
 
         model = ModelLoader.load_single_vqvae(self.config.model_path, device, self.config.weights_file)
         model.eval()
@@ -106,7 +106,7 @@ class SingleVQVAEReconstructionEvaluator(VQVAEEvaluator):
             recon = recon_out[0] if isinstance(recon_out, tuple) else recon_out
             recon_specs = recon.detach().cpu().permute(0, 2, 3, 1).numpy()
 
-        return ReconstructionPayload(run_config, sampled_specs, recon_specs, sampled_min_max, sampled_paths)
+        return ReconstructionPayload(run_config, sampled_specs, recon_specs, sampled_min_max, sampled_paths, metadata=metadata)
 
 
 class HierarchicalVQVAEReconstructionEvaluator(VQVAEEvaluator):
@@ -116,28 +116,27 @@ class HierarchicalVQVAEReconstructionEvaluator(VQVAEEvaluator):
 
     run_name = "hierarchical_vqvae"
 
-    def _sample_specs(self, spectrograms_path: str):
-        specs, file_paths = load_maestro(spectrograms_path, TARGET_TIME_FRAMES)
-        count = min(int(self.config.n_samples), len(specs))
-        if count <= 0:
-            raise ValueError(f"No spectrogram samples found in {spectrograms_path}")
-        rng = np.random.default_rng(int(self.config.seed))
-        indices = rng.choice(len(specs), count, replace=False)
-        return specs[indices], [file_paths[i] for i in indices]
-
     def _evaluate_reconstruction(self, device: torch.device) -> ReconstructionPayload:
         run_config = load_config(self._config_path_for(self.config.model_path))
-        specs_path = run_config.get("dataset", {}).get("processed_path")
-        if not specs_path:
-            raise ValueError("dataset.processed_path missing from VQ-VAE config.")
-        sampled_specs, sampled_paths = self._sample_specs(specs_path)
-        sampled_min_max = self._min_max_for_paths(
-            sampled_paths,
-            specs_path,
-            self.config.min_max_values_path,
-            self.config.min_db,
-            self.config.max_db,
-        )
+        dataset_cfg = run_config.get("dataset", {})
+        input_mode = str(dataset_cfg.get("input_mode", "spectrogram")).strip().lower()
+        if input_mode == "audio":
+            sampled_specs, sampled_min_max, sampled_paths = self._sample_audio_specs(run_config, device)
+            metadata = {"sample_source": "runtime_raw_audio", "split": self.config.split}
+        else:
+            specs_path = dataset_cfg.get("processed_path")
+            if not specs_path:
+                raise ValueError("dataset.processed_path missing from VQ-VAE config.")
+            target_frames = int(dataset_cfg.get("target_time_frames", TARGET_TIME_FRAMES))
+            sampled_specs, sampled_paths = self._sample_npy_specs(specs_path, target_frames)
+            sampled_min_max = self._min_max_for_paths(
+                sampled_paths,
+                specs_path,
+                self.config.min_max_values_path,
+                self.config.min_db,
+                self.config.max_db,
+            )
+            metadata = {"sample_source": "precomputed_spectrograms"}
 
         model = ModelLoader.load_hierarchical_vqvae(self.config.model_path, device)
         x = torch.from_numpy(sampled_specs).permute(0, 3, 1, 2).float().to(device)
@@ -146,7 +145,7 @@ class HierarchicalVQVAEReconstructionEvaluator(VQVAEEvaluator):
             x_recon, _, _ = model(x)
         recon_specs = x_recon.detach().cpu().permute(0, 2, 3, 1).numpy()
 
-        return ReconstructionPayload(run_config, sampled_specs, recon_specs, sampled_min_max, sampled_paths)
+        return ReconstructionPayload(run_config, sampled_specs, recon_specs, sampled_min_max, sampled_paths, metadata=metadata)
 
 
 class JukeboxVQVAEReconstructionEvaluator(VQVAEEvaluator):
@@ -164,24 +163,6 @@ class JukeboxVQVAEReconstructionEvaluator(VQVAEEvaluator):
         profile = run_config.get("model", {}).get("level_profiles", {}).get(self.level, {})
         return int(profile.get("target_time_frames", run_config.get("dataset", {}).get("target_time_frames", TARGET_TIME_FRAMES)))
 
-    @staticmethod
-    def _crop_or_pad_spectrogram(spectrogram: np.ndarray, target_time_frames: int) -> np.ndarray:
-        if spectrogram.shape[1] > target_time_frames:
-            return spectrogram[:, :target_time_frames]
-        if spectrogram.shape[1] < target_time_frames:
-            return np.pad(spectrogram, ((0, 0), (0, target_time_frames - spectrogram.shape[1])), mode="constant")
-        return spectrogram
-
-    def _sample_npy_specs(self, spectrograms_path: str, target_time_frames: int):
-        paths = list_npy_files(spectrograms_path)
-        count = min(int(self.config.n_samples), len(paths))
-        if count <= 0:
-            raise ValueError(f"No .npy spectrogram files found in {spectrograms_path}")
-        rng = np.random.default_rng(int(self.config.seed))
-        selected = [paths[i] for i in rng.choice(len(paths), count, replace=False)]
-        specs = [self._crop_or_pad_spectrogram(np.load(path), target_time_frames) for path in selected]
-        return np.stack(specs, axis=0).astype(np.float32)[..., np.newaxis], selected
-
     def _reconstruction_audio_groups(self, original_signals, reconstructed_signals):
         return {"original": original_signals, "reconstructed": reconstructed_signals}
 
@@ -193,17 +174,32 @@ class JukeboxVQVAEReconstructionEvaluator(VQVAEEvaluator):
         run_config = load_config(os.path.join(model_ref, "config.yaml"))
         target_frames = self._target_frames(run_config)
 
-        specs_path = run_config.get("dataset", {}).get("processed_path")
-        if not specs_path:
-            raise ValueError("dataset.processed_path missing from Jukebox VQ-VAE config.")
-        sampled_specs, sampled_paths = self._sample_npy_specs(specs_path, target_frames)
-        sampled_min_max = self._min_max_for_paths(
-            sampled_paths,
-            specs_path,
-            self.config.min_max_values_path,
-            self.config.min_db,
-            self.config.max_db,
-        )
+        dataset_cfg = run_config.get("dataset", {})
+        input_mode = str(dataset_cfg.get("input_mode", "spectrogram")).strip().lower()
+        if input_mode == "audio":
+            sampled_specs, sampled_min_max, sampled_paths = self._sample_audio_specs(
+                run_config,
+                device,
+                target_time_frames=target_frames,
+            )
+            metadata = {
+                "target_time_frames": target_frames,
+                "sample_source": "runtime_raw_audio",
+                "split": self.config.split,
+            }
+        else:
+            specs_path = dataset_cfg.get("processed_path")
+            if not specs_path:
+                raise ValueError("dataset.processed_path missing from Jukebox VQ-VAE config.")
+            sampled_specs, sampled_paths = self._sample_npy_specs(specs_path, target_frames)
+            sampled_min_max = self._min_max_for_paths(
+                sampled_paths,
+                specs_path,
+                self.config.min_max_values_path,
+                self.config.min_db,
+                self.config.max_db,
+            )
+            metadata = {"target_time_frames": target_frames, "sample_source": "precomputed_spectrograms"}
 
         model = ModelLoader.load_jukebox_vqvae(model_ref, self.level, device, self.config.weights_file)
         x = torch.from_numpy(sampled_specs).permute(0, 3, 1, 2).float().to(device)
@@ -219,7 +215,7 @@ class JukeboxVQVAEReconstructionEvaluator(VQVAEEvaluator):
             reconstructed_specs=recon_specs,
             min_max_values=sampled_min_max,
             sampled_paths=sampled_paths,
-            metadata={"target_time_frames": target_frames},
+            metadata=metadata,
             codebook_indices=indices.detach().cpu().numpy().astype(np.int64),
             codebook_num_embeddings=int(model.vq.num_embeddings),
             save_sampled_paths_array=True,
