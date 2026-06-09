@@ -9,7 +9,6 @@ import torch
 from modeling.torch.vq_vae import VQ_VAE
 from modeling.torch.vq_vae_residual import VQ_VAE as VQ_VAE_Residual
 from modeling.torch.vq_vae_hierarchical import VQ_VAE_Hierarchical
-from modeling.torch.pixel_cnn import ConditionalGatedPixelCNN
 from processing.preprocess_audio import TARGET_TIME_FRAMES
 
 
@@ -272,69 +271,6 @@ def load_vqvae_model(model_path: str, device: torch.device, weights_file: str = 
     model.eval()
     
     return model
-
-def load_pixelcnn_model(model_path: str, device: torch.device, weights_file: str = None, num_embeddings: int = None):
-    """
-    Loads a PixelCNN model from a given path.
-    
-    Args:
-        model_path (str): Path to the model file (.pth) or the directory containing it.
-                          If a directory is provided, it looks for 'best_pixelcnn_model.pth' and 'config.yaml'.
-        device (torch.device): Device to load the model onto.
-        weights_file (str, optional): Specific weights file name.
-        num_embeddings (int, optional): Number of embeddings (K). If provided, overrides config.
-        
-    Returns:
-        torch.nn.Module: The loaded PixelCNN model.
-    """
-    if os.path.isdir(model_path):
-        config_path = os.path.join(model_path, "config.yaml")
-        # Prefer best model
-        if os.path.exists(os.path.join(model_path, "best_pixelcnn_model.pth")):
-            model_file = os.path.join(model_path, "best_pixelcnn_model.pth")
-        else:
-            # Fallback to any .pth file or specific name
-            model_file = os.path.join(model_path, "pixelcnn_model.pth")
-    else:
-        config_path = os.path.join(os.path.dirname(model_path), "config.yaml")
-        model_file = model_path
-
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found at {config_path}")
-
-    config = load_config(config_path)
-    model_config = config['model']
-    
-    hidden_channels = model_config['hidden_channels']
-    num_layers = model_config['num_layers']
-    kernel_size = model_config['kernel_size']
-    
-    # K (num_embeddings) must be in the config or provided. 
-    if num_embeddings is not None:
-        K = num_embeddings
-    elif 'K' in model_config:
-        K = model_config['K']
-    elif 'num_embeddings' in model_config:
-        K = model_config['num_embeddings']
-    else:
-        raise ValueError("Model config must contain 'K' or 'num_embeddings' to initialize PixelCNN, or it must be passed as an argument.")
-
-    pixel_cnn = ConditionalGatedPixelCNN(
-        in_channels=1,
-        hidden_channels=hidden_channels,
-        num_layers=num_layers,
-        kernel_size=kernel_size,
-        num_classes=K,
-        num_embeddings=K,
-    ).to(device)
-    
-    print(f"Loading PixelCNN weights from {model_file}")
-    checkpoint = torch.load(model_file, map_location=device, weights_only=False)
-    pixel_cnn.load_state_dict(checkpoint['model_state'])
-    pixel_cnn.eval()
-    
-    return pixel_cnn
-
 
 def load_vqvae_hierarchical_model_wrapper(model_path: str, device: torch.device):
     """
