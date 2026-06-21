@@ -1,11 +1,12 @@
 import argparse
 import json
+import math
 import os
 import sys
-from glob import glob
 from typing import Dict, Iterable, List, Optional
 
 import numpy as np
+import soundfile as sf
 import torch
 from tqdm import tqdm
 
@@ -13,16 +14,58 @@ from tqdm import tqdm
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from train_scripts.jukebox_utils import load_jukebox_model
-from windowed_data_utils import (
-    build_level_starts,
-    build_timing_tensor,
-    extract_window,
-    source_stem,
+from processing.gpu_audio_augmentation import GPUAudioToMelSpectrogram
+from metadata.title_key import (
+    build_title_key_metadata_by_source,
+    key_metadata_counts,
+    key_metadata_for_path,
 )
+from windowed_data_utils import build_level_starts, build_timing_tensor, source_stem
 
 
 WINDOWED_MANIFEST = 'windowed_manifest.jsonl'
+SOURCE_METADATA = 'source_metadata.json'
 DEFAULT_WINDOW_OVERLAP_FRACTION = 0.50
+DEFAULT_AUDIO_EXTENSIONS = ('.wav', '.flac', '.aiff', '.aif')
+
+
+def _require_metadata_path(metadata_path: Optional[str]) -> str:
+    if not metadata_path:
+        raise ValueError(
+            'metadata_path is required for quantization preprocessing. '
+            'Pass --metadata_path pointing to the MAESTRO CSV/JSON metadata file.'
+        )
+    resolved = os.path.abspath(os.path.expanduser(metadata_path))
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f'MAESTRO metadata file not found: {resolved}')
+    return resolved
+
+
+def _build_key_metadata_lookup(metadata_path: Optional[str], infer_missing_mode_as: str) -> Dict[str, dict]:
+    metadata_path = _require_metadata_path(metadata_path)
+    metadata_by_source = build_title_key_metadata_by_source(
+        metadata_path,
+        infer_missing_mode_as=infer_missing_mode_as,
+    )
+    if not metadata_by_source:
+        raise ValueError(
+            f'No title-key metadata entries could be built from {metadata_path}. '
+            'Check that the file is a MAESTRO CSV/JSON with audio_filename or midi_filename columns.'
+        )
+    counts = key_metadata_counts(metadata_by_source)
+    print(
+        f'Title-key metadata: loaded {len(metadata_by_source)} lookup aliases from {metadata_path}; '
+        f'key_counts={counts}'
+    )
+    return metadata_by_source
+
+
+def _write_source_metadata(output_dir: str, source_metadata: Dict[str, dict]) -> None:
+    if not source_metadata:
+        return
+    path = os.path.join(output_dir, SOURCE_METADATA)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(source_metadata, f, indent=2, sort_keys=True)
 
 
 def _step_from_overlap(window_size: int, overlap_fraction: float, level_name: str) -> int:
@@ -78,6 +121,117 @@ def _encode_level_windows(model, batch_windows: np.ndarray, device: torch.device
     return indices.transpose(1, 2).contiguous().cpu().to(torch.int32)
 
 
+def _list_audio_files(source_path: str, extensions: Iterable[str]) -> List[str]:
+    extensions = tuple(str(ext).lower() for ext in extensions)
+    files = []
+    for root, _, names in os.walk(source_path):
+        for name in names:
+            if name.lower().endswith(extensions):
+                files.append(os.path.join(root, name))
+    return sorted(files)
+
+
+def _build_audio_preprocessor(
+    target_time_frames: int,
+    sample_rate: int,
+    frame_size: int,
+    hop_length: int,
+    n_mels: int,
+    device: torch.device,
+) -> GPUAudioToMelSpectrogram:
+    preprocessor = GPUAudioToMelSpectrogram(
+        sample_rate=sample_rate,
+        target_time_frames=target_time_frames,
+        n_fft=frame_size,
+        hop_length=hop_length,
+        n_mels=n_mels,
+        random_downmix=False,
+        pitch_shift_enabled=False,
+    ).to(device)
+    preprocessor.eval()
+    return preprocessor
+
+
+def _read_audio_window(
+    file_path: str,
+    start_frame: int,
+    window_time_frames: int,
+    target_sample_rate: int,
+    hop_length: int,
+) -> dict:
+    info = sf.info(file_path)
+    source_sample_rate = int(info.samplerate)
+    target_num_samples = max(1, (int(window_time_frames) - 1) * int(hop_length))
+    start_sample = int(round(int(start_frame) * int(hop_length) * source_sample_rate / target_sample_rate))
+    read_frames = max(1, int(math.ceil(target_num_samples * source_sample_rate / target_sample_rate)))
+
+    audio, _ = sf.read(
+        file_path,
+        start=max(0, start_sample),
+        frames=read_frames,
+        dtype='float32',
+        always_2d=True,
+    )
+    if audio.shape[0] < read_frames:
+        audio = np.pad(audio, ((0, read_frames - audio.shape[0]), (0, 0)), mode='constant')
+    if audio.shape[1] == 1:
+        audio = np.repeat(audio, repeats=2, axis=1)
+    elif audio.shape[1] > 2:
+        audio = audio[:, :2]
+
+    return {
+        'waveform': torch.from_numpy(np.ascontiguousarray(audio.T)),
+        'source_sample_rate': torch.tensor(source_sample_rate, dtype=torch.float32),
+        'valid_samples': torch.tensor(audio.shape[0], dtype=torch.long),
+        'path': file_path,
+    }
+
+
+def _collate_audio_window_dicts(items: List[dict]) -> dict:
+    max_len = max(item['waveform'].shape[-1] for item in items)
+    waveforms = []
+    for item in items:
+        waveform = item['waveform']
+        if waveform.shape[-1] < max_len:
+            waveform = torch.nn.functional.pad(waveform, (0, max_len - waveform.shape[-1]))
+        waveforms.append(waveform)
+    return {
+        'waveform': torch.stack(waveforms, dim=0),
+        'source_sample_rate': torch.stack([item['source_sample_rate'] for item in items]),
+        'valid_samples': torch.stack([item['valid_samples'] for item in items]),
+        'path': [item['path'] for item in items],
+    }
+
+
+def _audio_windows_to_specs(
+    file_path: str,
+    starts: List[int],
+    window_time_frames: int,
+    preprocessor: GPUAudioToMelSpectrogram,
+    sample_rate: int,
+    hop_length: int,
+    device: torch.device,
+) -> np.ndarray:
+    items = [
+        _read_audio_window(
+            file_path=file_path,
+            start_frame=start_frame,
+            window_time_frames=window_time_frames,
+            target_sample_rate=sample_rate,
+            hop_length=hop_length,
+        )
+        for start_frame in starts
+    ]
+    batch = _collate_audio_window_dicts(items)
+    batch = {
+        key: value.to(device) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
+    with torch.no_grad():
+        specs = preprocessor(batch, augment=False)
+    return specs.squeeze(1).detach().cpu().numpy().astype(np.float32, copy=False)
+
+
 def _build_anchor_schedule(
     total_frames: int,
     top_time_frames: int,
@@ -119,86 +273,9 @@ def _build_anchor_schedule(
     return anchor_to_levels
 
 
-def precompute_full_songs(
+def precompute_windowed_audio_examples(
     vqvae_dirs,
-    source_npy_path,
-    output_dir,
-    chunk_size=2048,  # Process in 2048-frame chunks to manage memory
-    device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-    weights_file="best_model.pth"
-):
-    """!
-    @brief Quantize whole songs chunk-by-chunk and save one stitched latent file per source spectrogram.
-    @param vqvae_dirs Mapping with the trained VQ-VAE directory for the top, middle, and bottom levels.
-    @param source_npy_path Directory containing source spectrogram `.npy` files.
-    @param output_dir Directory where stitched quantized `.pt` files will be saved.
-    @param chunk_size Raw spectrogram time frames processed at once to stay within GPU memory limits.
-    @param device Torch device used for quantization.
-    @param weights_file Checkpoint filename to load from each VQ-VAE directory.
-    @return None. Quantized latent files are written to `output_dir`.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    models = {lvl: load_jukebox_model(vqvae_dirs[lvl], lvl, device, weights_file).eval() 
-              for lvl in ['top', 'middle', 'bottom']}
-    
-    files = sorted(glob(os.path.join(source_npy_path, "*.npy")))
-
-    with torch.no_grad():
-        for f in tqdm(files, desc="Quantizing in Chunks"):
-            spec = np.load(f)  # [Freq, Total_Time]
-            total_frames = spec.shape[1]
-            
-            # Collect latent index chunks on CPU before stitching the full-song timeline.
-            all_indices = {'top': [], 'middle': [], 'bottom': []}
-
-            for start in range(0, total_frames, chunk_size):
-                end = min(start + chunk_size, total_frames)
-                
-                # Pad the last chunk temporarily so the deepest top encoder can downsample cleanly.
-                chunk = spec[:, start:end]
-                actual_len = chunk.shape[1]
-                
-                pad_val = 0
-                if actual_len % 32 != 0:
-                    pad_val = 32 - (actual_len % 32)
-                    chunk = np.pad(chunk, ((0, 0), (0, pad_val)), mode='constant')
-
-                x_chunk = torch.from_numpy(chunk).unsqueeze(0).unsqueeze(0).float().to(device)
-
-                for lvl in ['top', 'middle', 'bottom']:
-                    m = models[lvl]
-                    idx = m.encode_to_indices(x_chunk)
-                    
-                    # Convert to [Time, Freq] and drop latent columns introduced only by padding.
-                    ratio = 32 if lvl == 'top' else 16 if lvl == 'middle' else 8
-                    tokens_to_keep = actual_len // ratio
-                    
-                    idx_np = idx.squeeze(0).transpose(0, 1).cpu().numpy()
-                    all_indices[lvl].append(idx_np[:tokens_to_keep, :])
-
-            # Stitch the per-chunk latent timelines on CPU once the whole song has been encoded.
-            full_latents = {
-                lvl: np.concatenate(all_indices[lvl], axis=0) 
-                for lvl in ['top', 'middle', 'bottom']
-            }
-
-            save_data = {
-                'top': full_latents['top'],
-                'middle': full_latents['middle'],
-                'bottom': full_latents['bottom'],
-                'total_frames': total_frames
-            }
-            
-            out_name = os.path.basename(f).replace(".npy", "_full_quantized.pt")
-            torch.save(save_data, os.path.join(output_dir, out_name))
-            
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-
-
-def precompute_windowed_examples(
-    vqvae_dirs,
-    source_npy_path,
+    source_audio_path,
     output_dir,
     top_time_frames=2048,
     middle_time_frames=512,
@@ -210,29 +287,18 @@ def precompute_windowed_examples(
     batch_size=8,
     sample_rate=22050,
     hop_length=256,
+    frame_size=2048,
+    n_mels=256,
+    audio_extensions=DEFAULT_AUDIO_EXTENSIONS,
     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     weights_file='best_model.pth',
+    metadata_path: Optional[str] = None,
+    infer_missing_mode_as: str = 'major',
 ):
-    """!
-    @brief Quantize aligned top, middle, and bottom windows into seam-free training examples for transformer priors.
-    @param vqvae_dirs Mapping with the trained VQ-VAE directory for the top, middle, and bottom levels.
-    @param source_npy_path Directory containing source spectrogram `.npy` files.
-    @param output_dir Directory where windowed quantized `.pt` files and metadata will be saved.
-    @param top_time_frames Raw spectrogram window size for the top prior examples.
-    @param middle_time_frames Raw spectrogram window size for the middle prior examples.
-    @param bottom_time_frames Raw spectrogram window size for the bottom prior examples.
-    @param top_step_frames Optional explicit raw-frame hop for top windows. If omitted, it is derived from `overlap_fraction`.
-    @param middle_step_frames Optional explicit raw-frame hop for middle windows. If omitted, it is derived from `overlap_fraction`.
-    @param bottom_step_frames Optional explicit raw-frame hop for bottom windows. If omitted, it is derived from `overlap_fraction`.
-    @param overlap_fraction Requested window overlap fraction used to derive step sizes when explicit hops are not provided.
-    @param batch_size Number of anchor positions quantized together per forward pass.
-    @param sample_rate Audio sample rate used to convert start frames into seconds.
-    @param hop_length Spectrogram hop length used to convert start frames into seconds.
-    @param device Torch device used for quantization.
-    @param weights_file Checkpoint filename to load from each VQ-VAE directory.
-    @return None. Quantized examples plus manifest/config metadata are written to `output_dir`.
-    """
+    """Quantize raw-audio files into windowed hierarchical VQ indices."""
     os.makedirs(output_dir, exist_ok=True)
+    metadata_by_source = _build_key_metadata_lookup(metadata_path, infer_missing_mode_as)
+    source_metadata = {}
     top_step_frames = _resolve_step_frames(top_step_frames, top_time_frames, overlap_fraction, 'top')
     middle_step_frames = _resolve_step_frames(middle_step_frames, middle_time_frames, overlap_fraction, 'middle')
     bottom_step_frames = _resolve_step_frames(bottom_step_frames, bottom_time_frames, overlap_fraction, 'bottom')
@@ -246,14 +312,22 @@ def precompute_windowed_examples(
         lvl: load_jukebox_model(vqvae_dirs[lvl], lvl, device, weights_file).eval()
         for lvl in ['top', 'middle', 'bottom']
     }
+    preprocessors = {
+        'top': _build_audio_preprocessor(top_time_frames, sample_rate, frame_size, hop_length, n_mels, device),
+        'middle': _build_audio_preprocessor(middle_time_frames, sample_rate, frame_size, hop_length, n_mels, device),
+        'bottom': _build_audio_preprocessor(bottom_time_frames, sample_rate, frame_size, hop_length, n_mels, device),
+    }
 
-    files = sorted(glob(os.path.join(source_npy_path, '*.npy')))
+    files = _list_audio_files(source_audio_path, audio_extensions)
+    if not files:
+        raise FileNotFoundError(f'No audio files found in {source_audio_path} with extensions={audio_extensions}')
+
     manifest_path = os.path.join(output_dir, WINDOWED_MANIFEST)
     config_path = os.path.join(output_dir, 'windowed_quantization_config.json')
-
     config_payload = {
         'format': 'windowed_v1',
-        'source_path': source_npy_path,
+        'source_mode': 'audio',
+        'source_path': source_audio_path,
         'top_time_frames': int(top_time_frames),
         'middle_time_frames': int(middle_time_frames),
         'bottom_time_frames': int(bottom_time_frames),
@@ -265,15 +339,23 @@ def precompute_windowed_examples(
         'batch_size': int(batch_size),
         'sample_rate': int(sample_rate),
         'hop_length': int(hop_length),
+        'frame_size': int(frame_size),
+        'n_mels': int(n_mels),
+        'audio_extensions': list(audio_extensions),
         'weights_file': weights_file,
         'vqvae_dirs': dict(vqvae_dirs),
+        'metadata_path': metadata_path,
+        'key_infer_missing_mode_as': infer_missing_mode_as,
     }
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config_payload, f, indent=2)
 
     total_examples = 0
+    file_frame_counts = {}
     for file_path in files:
-        total_frames = int(np.load(file_path, mmap_mode='r').shape[1])
+        info = sf.info(file_path)
+        total_frames = max(1, int(math.floor(int(info.frames) * sample_rate / int(info.samplerate) / hop_length)) + 1)
+        file_frame_counts[file_path] = total_frames
         total_examples += len(
             _build_anchor_schedule(
                 total_frames=total_frames,
@@ -287,21 +369,21 @@ def precompute_windowed_examples(
         )
 
     print(
-        'Precomputing windowed hierarchical indices '
-        f'(examples={total_examples}, top_step={top_step_frames}, '
+        'Precomputing raw-audio windowed hierarchical indices '
+        f'(files={len(files)}, examples={total_examples}, top_step={top_step_frames}, '
         f'middle_step={middle_step_frames}, bottom_step={bottom_step_frames}, batch_size={batch_size})...'
     )
 
     with open(manifest_path, 'w', encoding='utf-8') as manifest_file, torch.no_grad():
-        progress = tqdm(total=total_examples, desc='Quantizing Windowed Examples')
+        progress = tqdm(total=total_examples, desc='Quantizing Raw-Audio Windowed Examples')
         current_batch_size = max(1, int(batch_size))
 
         for file_path in files:
-            spec = np.load(file_path)
-            total_frames = int(spec.shape[1])
+            total_frames = int(file_frame_counts[file_path])
             source_file_stem = source_stem(file_path)
             source_basename = os.path.basename(file_path)
-
+            key_metadata = key_metadata_for_path(file_path, metadata_by_source)
+            source_metadata[source_file_stem] = dict(key_metadata)
             anchor_to_levels = _build_anchor_schedule(
                 total_frames=total_frames,
                 top_time_frames=top_time_frames,
@@ -318,17 +400,14 @@ def precompute_windowed_examples(
                 end = min(i + current_batch_size, len(starts))
                 batch_starts = starts[i:end]
                 try:
-                    top_batch = np.stack(
-                        [extract_window(spec, start_frame=s, window_size=top_time_frames) for s in batch_starts],
-                        axis=0,
+                    top_batch = _audio_windows_to_specs(
+                        file_path, batch_starts, top_time_frames, preprocessors['top'], sample_rate, hop_length, device
                     )
-                    middle_batch = np.stack(
-                        [extract_window(spec, start_frame=s, window_size=middle_time_frames) for s in batch_starts],
-                        axis=0,
+                    middle_batch = _audio_windows_to_specs(
+                        file_path, batch_starts, middle_time_frames, preprocessors['middle'], sample_rate, hop_length, device
                     )
-                    bottom_batch = np.stack(
-                        [extract_window(spec, start_frame=s, window_size=bottom_time_frames) for s in batch_starts],
-                        axis=0,
+                    bottom_batch = _audio_windows_to_specs(
+                        file_path, batch_starts, bottom_time_frames, preprocessors['bottom'], sample_rate, hop_length, device
                     )
 
                     top_indices = _encode_level_windows(models['top'], top_batch, device)
@@ -340,6 +419,7 @@ def precompute_windowed_examples(
                         filename = f'{source_file_stem}__start_{int(start_frame):08d}_window_quantized.pt'
                         payload = {
                             'format': 'windowed_v1',
+                            'source_mode': 'audio',
                             'source_basename': source_basename,
                             'source_stem': source_file_stem,
                             'start_frame': int(start_frame),
@@ -350,6 +430,7 @@ def precompute_windowed_examples(
                                 sample_rate=sample_rate,
                                 hop_length=hop_length,
                             ),
+                            'metadata': dict(key_metadata),
                             'eligible_levels': list(eligible_levels),
                             'top': top_indices[batch_idx].clone(),
                             'middle': middle_indices[batch_idx].clone(),
@@ -365,18 +446,20 @@ def precompute_windowed_examples(
                                     'start_frame': int(start_frame),
                                     'total_frames': total_frames,
                                     'eligible_levels': list(eligible_levels),
+                                    'key_id': int(key_metadata.get('key_id', 24)),
+                                    'key_label': key_metadata.get('key_label', 'unknown'),
+                                    'key_source': key_metadata.get('key_source', 'unknown'),
                                 }
                             ) + '\n'
                         )
 
                     progress.update(end - i)
                     i = end
-
                 except RuntimeError as exc:
                     if 'out of memory' in str(exc).lower() and device.type == 'cuda' and current_batch_size > 1:
                         new_batch_size = max(1, current_batch_size // 2)
                         print(
-                            f'CUDA OOM while window-quantizing {source_basename} at batch_size={current_batch_size}. '
+                            f'CUDA OOM while raw-audio quantizing {source_basename} at batch_size={current_batch_size}. '
                             f'Retrying with batch_size={new_batch_size}.'
                         )
                         current_batch_size = new_batch_size
@@ -390,27 +473,28 @@ def precompute_windowed_examples(
 
         progress.close()
 
+    _write_source_metadata(output_dir, source_metadata)
+
 
 def main():
     """!
-    @brief Parse CLI arguments and run quantization preprocessing in either windowed or legacy full-song mode.
-    @param None
-    @return None. The selected quantized dataset is written to disk and progress is printed to stdout.
+    @brief Parse CLI arguments and run windowed quantization preprocessing.
+    The selected quantized dataset is written to disk and progress is printed to stdout.
     """
     parser = argparse.ArgumentParser(
-        description='Preprocess and quantize spectrograms for hierarchical transformer prior training.'
+        description='Preprocess raw audio and quantize it for hierarchical transformer prior training.'
     )
     
     parser.add_argument(
         '--source_path',
         type=str,
-        default='/home/ivon/code/datasets/processed/maestro/',
-        help='Path to directory containing .npy spectrogram files'
+        default='./data/code/datasets/raw/maestro-v3.0.0/',
+        help='Path to directory containing source raw audio files'
     )
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='/home/ivon/code/datasets/processed/maestro_quantized_dataset/',
+        default='./data/processed/backing_tracks_quantized_dataset/',
         help='Output directory for quantized .pt files'
     )
     parser.add_argument(
@@ -471,14 +555,28 @@ def main():
         help='Bottom-level anchor step. Omit to derive from --overlap_fraction; with defaults this is 64.',
     )
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for windowed quantization.')
-    parser.add_argument('--sample_rate', type=int, default=22050, help='Sample rate used in preprocess_audio')
-    parser.add_argument('--hop_length', type=int, default=256, help='Hop length used in preprocess_audio')
+    parser.add_argument('--sample_rate', type=int, default=22050, help='Target sample rate used for raw-audio mel spectrograms')
+    parser.add_argument('--hop_length', type=int, default=256, help='Hop length used for raw-audio mel spectrograms')
+    parser.add_argument('--frame_size', type=int, default=2048, help='FFT/window size used for raw-audio mel spectrograms')
+    parser.add_argument('--n_mels', type=int, default=256, help='Mel bin count used for raw-audio mel spectrograms')
     parser.add_argument(
-        '--mode',
+        '--audio_extensions',
+        nargs='+',
+        default=list(DEFAULT_AUDIO_EXTENSIONS),
+        help='Audio extensions to quantize.',
+    )
+    parser.add_argument(
+        '--metadata_path',
         type=str,
-        default='windowed',
-        choices=['windowed', 'full_song_legacy'],
-        help='Quantization format to generate. `windowed` is the seam-free training format.',
+        required=True,
+        help='Required MAESTRO CSV/JSON metadata path used to infer title-derived key labels.',
+    )
+    parser.add_argument(
+        '--key_infer_missing_mode_as',
+        type=str,
+        default='major',
+        choices=['major', 'minor', 'unknown'],
+        help='Mode assigned to title keys without an explicit major/minor marker, e.g. "Sonata Bb".',
     )
     
     args = parser.parse_args()
@@ -534,32 +632,28 @@ def main():
     )
     print()
 
-    if args.mode == 'windowed':
-        precompute_windowed_examples(
-            vqvae_dirs=vqvae_dirs,
-            source_npy_path=args.source_path,
-            output_dir=args.output_dir,
-            top_time_frames=args.top_time_frames,
-            middle_time_frames=args.middle_time_frames,
-            bottom_time_frames=args.bottom_time_frames,
-            top_step_frames=top_step_frames,
-            middle_step_frames=middle_step_frames,
-            bottom_step_frames=bottom_step_frames,
-            overlap_fraction=args.overlap_fraction,
-            batch_size=args.batch_size,
-            sample_rate=args.sample_rate,
-            hop_length=args.hop_length,
-            device=device,
-            weights_file=args.weights_file,
-        )
-    else:
-        precompute_full_songs(
-            vqvae_dirs=vqvae_dirs,
-            source_npy_path=args.source_path,
-            output_dir=args.output_dir,
-            device=device,
-            weights_file=args.weights_file
-        )
+    precompute_windowed_audio_examples(
+        vqvae_dirs=vqvae_dirs,
+        source_audio_path=args.source_path,
+        output_dir=args.output_dir,
+        top_time_frames=args.top_time_frames,
+        middle_time_frames=args.middle_time_frames,
+        bottom_time_frames=args.bottom_time_frames,
+        top_step_frames=top_step_frames,
+        middle_step_frames=middle_step_frames,
+        bottom_step_frames=bottom_step_frames,
+        overlap_fraction=args.overlap_fraction,
+        batch_size=args.batch_size,
+        sample_rate=args.sample_rate,
+        hop_length=args.hop_length,
+        frame_size=args.frame_size,
+        n_mels=args.n_mels,
+        audio_extensions=args.audio_extensions,
+        device=device,
+        weights_file=args.weights_file,
+        metadata_path=args.metadata_path,
+        infer_missing_mode_as=args.key_infer_missing_mode_as,
+    )
     
     print(f'\n✓ Quantization preprocessing complete!')
     print(f'Quantized files saved to: {args.output_dir}')

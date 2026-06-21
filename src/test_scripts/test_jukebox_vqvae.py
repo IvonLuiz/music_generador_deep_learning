@@ -43,6 +43,7 @@ def main() -> None:
     parser.add_argument("--weights_file", type=str, default="best_model.pth", help="Weights file name if model_path is a dir")
     parser.add_argument("--n_samples", type=int, default=5, help="Number of samples to test")
     parser.add_argument("--target_time_frames", type=int, default=None, help="Optional time-frame override")
+    parser.add_argument("--split", type=str, default="test", choices=["train", "validation", "val", "test", "all"], help="Raw-audio split to sample when the model uses dataset.input_mode=audio")
     parser.add_argument("--min_max_values", type=str, default=None, help="Legacy alias for --min_max_values_path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sample selection")
     parser.add_argument("--save_root", type=str, default="samples/jukebox_vqvae_maestro_test", help="Root folder for generated artifacts")
@@ -65,6 +66,7 @@ def main() -> None:
         min_max_values_path=min_max_path,
         save_root=args.save_root,
         audio_method=args.audio_method,
+        split=args.split,
     )
     result = JukeboxVQVAEReconstructionEvaluator(config, _audio_config_from_args(args)).run()
     print(f"Saved Jukebox VQ-VAE outputs to {result.output_dir}")

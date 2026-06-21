@@ -1,23 +1,28 @@
 import json
 import os
 import sys
-import tempfile
-from glob import glob
 from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 # Add 'src' to sys.path so the script can be run directly from the project root.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from metadata.title_key import (
+    UNKNOWN_KEY_ID,
+    build_title_key_metadata_by_source,
+    key_metadata_for_path,
+    unknown_key_metadata,
+)
 
 
 class JukeboxQuantizedDataset(Dataset):
     """
     Dataset for hierarchical transformer prior training.
 
-    Returns (target, cond, second_cond, timing) for every level:
+    Returns (target, cond, second_cond, timing, metadata) for every level:
       - top:    target=top,    cond=None,              second_cond=None
       - middle: target=middle, cond=aligned_top_slice, second_cond=None
       - bottom: target=bottom, cond=aligned_mid_slice, second_cond=aligned_top_slice
@@ -36,11 +41,15 @@ class JukeboxQuantizedDataset(Dataset):
         sample_rate: int = 22050,
         hop_length: int = 256,
         window_parity: str = 'all',
+        metadata_path: Optional[str] = None,
+        key_infer_missing_mode_as: str = 'major',
+        key_dropout_prob: float = 0.0,
+        timing_dropout_prob: float = 0.0,
     ):
         """
         Args:
-            quantized_path:           Directory containing *_full_quantized.pt files.
-            file_paths:               Optional list of source .npy paths; mapped to .pt names.
+            quantized_path:           Directory containing windowed quantized files and windowed_manifest.jsonl.
+            file_paths:               Optional list of source paths used to filter manifest source stems.
             target_time_frames:       Top-level window size in raw spectrogram frames.
             level_target_time_frames: Dict with per-level window sizes, e.g.
                                       {'top': 2048, 'middle': 512, 'bottom': 128}.
@@ -53,29 +62,41 @@ class JukeboxQuantizedDataset(Dataset):
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.quantized_path = quantized_path
-        self.mode = 'legacy_full_song'
+        self.mode = 'windowed'
         self.window_entries = []
         self.window_parity = self._normalize_window_parity(window_parity)
+        self.key_unknown_id = UNKNOWN_KEY_ID
+        self.key_dropout_prob = float(key_dropout_prob)
+        self.timing_dropout_prob = float(timing_dropout_prob)
+        self.title_key_metadata_by_source = build_title_key_metadata_by_source(
+            metadata_path,
+            infer_missing_mode_as=key_infer_missing_mode_as,
+        )
+        self.sidecar_metadata_by_source = self._load_sidecar_metadata()
 
         lvl = level_target_time_frames or {}
         self.top_tf    = int(lvl.get('top',    target_time_frames))
         self.middle_tf = int(lvl.get('middle', target_time_frames))
         self.bottom_tf = int(lvl.get('bottom', target_time_frames))
 
-        if self._init_windowed_files(file_paths=file_paths):
-            self.set_window_parity(self.window_parity)
-        else:
-            if file_paths:
-                self.files = [
-                    os.path.join(quantized_path, os.path.basename(f).replace('.npy', '_full_quantized.pt'))
-                    for f in file_paths
-                ]
-            else:
-                self.files = sorted(glob(os.path.join(quantized_path, "*.pt")))
+        if not self._init_windowed_files(file_paths=file_paths):
+            raise FileNotFoundError(
+                f"No windowed quantized entries found in {quantized_path}. "
+                "Expected windowed_manifest.jsonl produced by preprocess_quantization.py."
+            )
+        self.set_window_parity(self.window_parity)
 
         # Peek at the first file to learn the actual token grid shapes.
         # This replaces all hardcoded ratio constants.
         self._init_grids()
+
+    def _load_sidecar_metadata(self) -> Dict[str, dict]:
+        sidecar_path = os.path.join(self.quantized_path, 'source_metadata.json')
+        if not os.path.isfile(sidecar_path):
+            return {}
+        with open(sidecar_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
 
     def _init_windowed_files(self, file_paths: Optional[List[str]]) -> bool:
         manifest_path = os.path.join(self.quantized_path, 'windowed_manifest.jsonl')
@@ -153,8 +174,6 @@ class JukeboxQuantizedDataset(Dataset):
         the non-overlapping 0, 2, 4... anchors; odd windows are the shifted view.
         """
         self.window_parity = self._normalize_window_parity(window_parity)
-        if self.mode != 'windowed':
-            return
 
         if self.window_parity == 'all':
             active_entries = list(self.window_entries)
@@ -173,7 +192,7 @@ class JukeboxQuantizedDataset(Dataset):
     def indices_for_window_parity(self, window_parity: str) -> List[int]:
         """Return dataset indices for a fixed overlap parity without mutating the dataset."""
         parity = self._normalize_window_parity(window_parity)
-        if self.mode != 'windowed' or parity == 'all':
+        if parity == 'all':
             return list(range(len(self.files)))
         return [
             idx for idx, entry in enumerate(self.window_entries)
@@ -182,9 +201,6 @@ class JukeboxQuantizedDataset(Dataset):
 
     def indices_for_random_window_parity_per_song(self, seed: int) -> List[int]:
         """Choose even or odd windows independently for each song."""
-        if self.mode != 'windowed':
-            return list(range(len(self.files)))
-
         rng = np.random.default_rng(seed)
         available_parities = {}
         for entry in self.window_entries:
@@ -200,22 +216,21 @@ class JukeboxQuantizedDataset(Dataset):
         ]
 
     def window_parity_counts(self) -> Dict[str, int]:
-        if self.mode != 'windowed':
-            return {'all': len(self.files), 'even': len(self.files), 'odd': len(self.files)}
         even = sum(1 for entry in self.window_entries if entry.get('window_parity') == 'even')
         odd = sum(1 for entry in self.window_entries if entry.get('window_parity') == 'odd')
         return {'all': len(self.window_entries), 'even': even, 'odd': odd}
 
     def _init_grids(self):
-        """Read one payload to discover both full-song and fixed-window token grids."""
+        """Read one payload to discover fixed-window token grids."""
         if not self.files:
             raise ValueError("No quantized .pt files found.")
         payload = torch.load(self.files[0], weights_only=False)
-        if payload.get('format') == 'windowed_v1':
-            self._init_windowed_grids(payload)
-            return
-
-        self._init_legacy_grids(payload)
+        if payload.get('format') != 'windowed_v1':
+            raise ValueError(
+                f"Unsupported quantized payload format {payload.get('format')!r}. "
+                "JukeboxQuantizedDataset now requires windowed_v1 payloads."
+            )
+        self._init_windowed_grids(payload)
 
     def _init_windowed_grids(self, payload: dict):
         self.mode = 'windowed'
@@ -244,54 +259,11 @@ class JukeboxQuantizedDataset(Dataset):
             f"ratios={self.ratios} | files={len(self.files)}"
         )
 
-    def _init_legacy_grids(self, payload: dict):
-        # Each level array in the precomputed payload has shape [Total_Time_Steps, Freq_Bins].
-        # We keep those full-song shapes for diagnostics, but training uses fixed-size windows.
-        self.top_full_grid    = (int(payload['top'].shape[0]),    int(payload['top'].shape[1]))
-        self.middle_full_grid = (int(payload['middle'].shape[0]), int(payload['middle'].shape[1]))
-        self.bottom_full_grid = (int(payload['bottom'].shape[0]), int(payload['bottom'].shape[1]))
-
-        total_frames = int(payload['total_frames'])
-        # Derive downsampling ratios from actual data instead of hardcoding.
-        # ratio = raw_frames / token_time_steps
-        self.ratios = {
-            'top':    total_frames // self.top_full_grid[0],
-            'middle': total_frames // self.middle_full_grid[0],
-            'bottom': total_frames // self.bottom_full_grid[0],
-        }
-
-        # Precompute how many token time-cols each level window occupies.
-        # These are used to pick the right-sized conditioning slices.
-        self._top_window_cols    = self.top_tf    // self.ratios['top']
-        self._middle_window_cols = self.middle_tf // self.ratios['middle']
-        self._bottom_window_cols = self.bottom_tf // self.ratios['bottom']
-
-        # Expose the fixed-size training-window grids that the prior actually sees.
-        self.top_grid    = (self._top_window_cols, self.top_full_grid[1])
-        self.middle_grid = (self._middle_window_cols, self.middle_full_grid[1])
-        self.bottom_grid = (self._bottom_window_cols, self.bottom_full_grid[1])
-        print(
-            f"[JukeboxQuantizedDataset] Full grids — "
-            f"top={self.top_full_grid}, middle={self.middle_full_grid}, bottom={self.bottom_full_grid} | "
-            f"window_grids=top={self.top_grid}, middle={self.middle_grid}, bottom={self.bottom_grid} | "
-            f"ratios={self.ratios}"
-        )
-
-        # Aligned conditioning slice sizes
-        # For middle trained on a middle-window, only the TOP tokens covering
-        # the same audio span are used as conditioning (not the full top window).
-        self._top_cols_for_middle = max(1, round(self._top_window_cols * self.middle_tf / self.top_tf))
-        self._top_cols_for_bottom = max(1, round(self._top_window_cols * self.bottom_tf / self.top_tf))
-        self._mid_cols_for_bottom = max(1, round(self._middle_window_cols * self.bottom_tf / self.middle_tf))
-
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
-        if self.mode == 'windowed':
-            return self._getitem_windowed(idx)
-
-        return self._getitem_legacy(idx)
+        return self._getitem_windowed(idx)
 
     def _getitem_windowed(self, idx):
         payload = torch.load(self.files[idx % len(self.files)], weights_only=False)
@@ -328,82 +300,71 @@ class JukeboxQuantizedDataset(Dataset):
         else:
             raise ValueError(f'Unsupported selected_level: {self.selected_level}')
 
-        return target, cond, second_cond, timing
+        metadata = self._sample_metadata(payload, self.files[idx % len(self.files)])
+        return target, cond, second_cond, timing, metadata
 
-    def _getitem_legacy(self, idx):
-        payload = torch.load(self.files[idx % len(self.files)], weights_only=False)
-        total_frames = int(payload['total_frames'])
+    def _sample_metadata(self, payload: dict, file_path: str) -> dict:
+        metadata = self._resolve_key_metadata(payload, file_path)
+        key_id = int(metadata.get('key_id', self.key_unknown_id))
+        if self.key_dropout_prob > 0.0 and np.random.random() < self.key_dropout_prob:
+            key_id = self.key_unknown_id
+            metadata = {
+                **metadata,
+                'key_id': key_id,
+                'key_source': 'dropout',
+            }
+        timing_mask = True
+        if self.timing_dropout_prob > 0.0 and np.random.random() < self.timing_dropout_prob:
+            timing_mask = False
+        return {
+            'key_id': torch.tensor(key_id, dtype=torch.long),
+            'timing_mask': torch.tensor(timing_mask, dtype=torch.bool),
+            'key_label': metadata.get('key_label', 'unknown'),
+            'key_source': metadata.get('key_source', 'unknown'),
+        }
 
-        top_arr    = payload['top']     # [T_top, F_top]
-        middle_arr = payload['middle']  # [T_mid, F_mid]
-        bottom_arr = payload['bottom']  # [T_bot, F_bot]
+    def _resolve_key_metadata(self, payload: dict, file_path: str) -> dict:
+        payload_metadata = payload.get('metadata')
+        if isinstance(payload_metadata, dict) and 'key_id' in payload_metadata:
+            return dict(payload_metadata)
 
-        # ── Random crop anchored at the TOP level ──────────────────────────────
-        # We choose a random top-token start, then derive aligned starts for
-        # middle and bottom using the ratio relationships.
-        max_top_start = max(0, top_arr.shape[0] - self._top_window_cols)
-        t_start = int(np.random.randint(0, max_top_start + 1)) if max_top_start > 0 else 0
+        for source_key in self._metadata_lookup_keys(payload, file_path):
+            if source_key in self.sidecar_metadata_by_source:
+                value = self.sidecar_metadata_by_source[source_key]
+                if isinstance(value, dict) and 'key_id' in value:
+                    return dict(value)
 
-        # Scale to middle and bottom token indices
-        top_to_mid_ratio = self.ratios['top'] // self.ratios['middle']   # e.g. 32//16 = 2
-        top_to_bot_ratio = self.ratios['top'] // self.ratios['bottom']   # e.g. 32//8  = 4
-        m_start = t_start * top_to_mid_ratio
-        b_start = t_start * top_to_bot_ratio
+        title_metadata = key_metadata_for_path(file_path, self.title_key_metadata_by_source)
+        if int(title_metadata.get('key_id', self.key_unknown_id)) != self.key_unknown_id:
+            return title_metadata
+        for source_key in self._metadata_lookup_keys(payload, file_path):
+            title_metadata = key_metadata_for_path(source_key, self.title_key_metadata_by_source)
+            if int(title_metadata.get('key_id', self.key_unknown_id)) != self.key_unknown_id:
+                return title_metadata
 
-        # ── Slice target window ────────────────────────────────────────────────
-        top_slice    = top_arr[t_start : t_start + self._top_window_cols]
-        middle_slice = middle_arr[m_start : m_start + self._middle_window_cols]
-        bottom_slice = bottom_arr[b_start : b_start + self._bottom_window_cols]
+        return unknown_key_metadata()
 
-        # Pad if the song is shorter than the requested window
-        top_slice    = self._pad(top_slice,    self._top_window_cols)
-        middle_slice = self._pad(middle_slice, self._middle_window_cols)
-        bottom_slice = self._pad(bottom_slice, self._bottom_window_cols)
-
-        # ── Aligned conditioning slices ──────────────────────────────────
-        # Each conditioning slice covers the SAME audio span as the target window.
-        # For middle prior: use only the top tokens aligned to the middle window span.
-        # For bottom prior: use only the middle/top tokens aligned to the bottom window span.
-        top_for_middle = top_arr[t_start : t_start + self._top_cols_for_middle]
-        top_for_middle = self._pad(top_for_middle, self._top_cols_for_middle)
-
-        top_for_bottom = top_arr[t_start : t_start + self._top_cols_for_bottom]
-        top_for_bottom = self._pad(top_for_bottom, self._top_cols_for_bottom)
-
-        mid_for_bottom = middle_arr[m_start : m_start + self._mid_cols_for_bottom]
-        mid_for_bottom = self._pad(mid_for_bottom, self._mid_cols_for_bottom)
-
-        # ── Timing metadata ────────────────────────────────────────────────────
-        actual_start_frame = t_start * self.ratios['top']
-        start_time_s    = (actual_start_frame * self.hop_length) / self.sample_rate
-        total_duration_s = (total_frames * self.hop_length) / self.sample_rate
-        fraction         = start_time_s / max(total_duration_s, 1e-6)
-        timing = torch.tensor([start_time_s, total_duration_s, fraction], dtype=torch.float32)
-
-        # ── Return (target, cond, second_cond, timing) for the selected level ─
-        target    = torch.from_numpy(top_slice).long()
-        cond      = None
-        second_cond = None
-
-        if self.selected_level == 'top':
-            target = torch.from_numpy(top_slice).long()
-            # cond and second_cond remain None
-
-        elif self.selected_level == 'middle':
-            target = torch.from_numpy(middle_slice).long()
-            cond   = torch.from_numpy(top_for_middle).long()  # aligned top slice
-
-        elif self.selected_level == 'bottom':
-            target      = torch.from_numpy(bottom_slice).long()
-            cond        = torch.from_numpy(mid_for_bottom).long()  # aligned middle slice
-            second_cond = torch.from_numpy(top_for_bottom).long()  # aligned top slice
-
-        # Use empty tensors instead of None so DataLoader can collate cleanly.
-        # The trainer checks .numel() == 0 or shape to detect "no conditioning".
-        cond        = cond        if cond        is not None else torch.empty(0, dtype=torch.long)
-        second_cond = second_cond if second_cond is not None else torch.empty(0, dtype=torch.long)
-
-        return target, cond, second_cond, timing
+    @staticmethod
+    def _metadata_lookup_keys(payload: dict, file_path: str) -> List[str]:
+        keys = []
+        for key in ('source_stem', 'source_basename', 'source_path'):
+            value = payload.get(key)
+            if value:
+                keys.append(str(value))
+        basename = os.path.basename(file_path)
+        stem = os.path.splitext(basename)[0]
+        keys.extend([
+            basename,
+            stem,
+            stem.split('__start_')[0],
+        ])
+        deduped = []
+        seen = set()
+        for key in keys:
+            if key not in seen:
+                seen.add(key)
+                deduped.append(key)
+        return deduped
 
     @staticmethod
     def _shape_2d(arr) -> Tuple[int, int]:
@@ -427,141 +388,3 @@ class JukeboxQuantizedDataset(Dataset):
     @staticmethod
     def _source_stem(file_path: str) -> str:
         return os.path.splitext(os.path.basename(file_path))[0]
-
-    @staticmethod
-    def _pad(arr: np.ndarray, target_t: int) -> np.ndarray:
-        """Pad or truncate along axis=0 (time) to exactly target_t rows."""
-        if arr.shape[0] < target_t:
-            diff = target_t - arr.shape[0]
-            arr = np.pad(arr, ((0, diff), (0, 0)), mode='constant')
-        return arr[:target_t]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Tests
-# ──────────────────────────────────────────────────────────────────────────────
-
-def test_dataset_alignment_and_logic():
-    print("🚀 Starting JukeboxQuantizedDataset tests...")
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # Mock payload: ratios top=32, mid=16, bot=8
-        # 1000 top time-steps × 32 = 32000 raw frames
-        total_raw_frames = 32000
-
-        mock_top = np.arange(1000, dtype=np.int64)[:, None].repeat(8, axis=1)   # [1000, 8]
-        mock_mid = np.arange(2000, dtype=np.int64)[:, None].repeat(16, axis=1)  # [2000, 16]
-        mock_bot = np.arange(4000, dtype=np.int64)[:, None].repeat(32, axis=1)  # [4000, 32]
-
-        quantized_file = os.path.join(tmp_dir, 'test_song_full_quantized.pt')
-        torch.save({
-            'top': mock_top, 'middle': mock_mid, 'bottom': mock_bot,
-            'total_frames': total_raw_frames,
-        }, quantized_file)
-
-        level_tfs = {'top': 2048, 'middle': 512, 'bottom': 128}
-
-        # ── Top level ─────────────────────────────────────────────────────────
-        ds_top = JukeboxQuantizedDataset(
-            tmp_dir, target_time_frames=2048,
-            level_target_time_frames=level_tfs, selected_level='top',
-        )
-        target, cond, second_cond, timing = ds_top[0]
-        assert target.shape == (64, 8),   f"Top target shape: {target.shape}"
-        assert cond.numel() == 0,         "Top cond should be empty"
-        assert second_cond.numel() == 0,  "Top second_cond should be empty"
-        print(f"  [Pass] Top level — target={tuple(target.shape)}, cond=empty, second_cond=empty")
-
-        # ── Middle level ──────────────────────────────────────────────────────
-        ds_mid = JukeboxQuantizedDataset(
-            tmp_dir, target_time_frames=2048,
-            level_target_time_frames=level_tfs, selected_level='middle',
-        )
-        target, cond, second_cond, timing = ds_mid[0]
-        # middle window = 512 frames / 16 ratio = 32 time-cols
-        # top slice for middle = 32 * (512/2048) = 8 time-cols
-        assert target.shape == (32, 16), f"Middle target shape: {target.shape}"
-        assert cond.shape[1] == 8,       f"Middle cond freq_bins: {cond.shape}"
-        assert second_cond.numel() == 0, "Middle second_cond should be empty"
-        # Alignment: cond time-col 0 should match top value at same t_start
-        t_val = target[0, 0].item()  # which middle token we started at
-        # middle token t_val → top token t_val // 2
-        expected_top_start = (t_val * ds_mid.ratios['middle']) // ds_mid.ratios['top']
-        assert cond[0, 0].item() == expected_top_start, (
-            f"Middle cond misaligned: cond[0,0]={cond[0,0].item()} vs expected={expected_top_start}"
-        )
-        print(f"  [Pass] Middle level — target={tuple(target.shape)}, cond={tuple(cond.shape)}, aligned ✓")
-
-        # ── Bottom level ──────────────────────────────────────────────────────
-        ds_bot = JukeboxQuantizedDataset(
-            tmp_dir, target_time_frames=2048,
-            level_target_time_frames=level_tfs, selected_level='bottom',
-        )
-        for i in range(5):
-            target, cond, second_cond, timing = ds_bot[0]
-            # bottom window = 128 frames / 8 ratio = 16 time-cols
-            # mid slice for bottom = 16 * (128/512) = 4 time-cols
-            # top slice for bottom = 64 * (128/2048) = 4 time-cols
-            assert target.shape[1] == 32,      f"Bottom target freq_bins: {target.shape}"
-            assert target.shape[0] == 16,      f"Bottom target time-cols: {target.shape}"
-            assert cond.shape[0] == ds_bot._mid_cols_for_bottom
-            assert second_cond.shape[0] == ds_bot._top_cols_for_bottom
-
-            # Alignment check using the mock gradient values
-            b_val = target[0, 0].item()   # bottom token index
-            m_val = cond[0, 0].item()     # middle token index
-            t_val = second_cond[0, 0].item()  # top token index
-
-            expected_m = (b_val * ds_bot.ratios['bottom']) // ds_bot.ratios['middle']
-            expected_t = (b_val * ds_bot.ratios['bottom']) // ds_bot.ratios['top']
-            assert m_val == expected_m, f"Bot→Mid misaligned: m_val={m_val} expected={expected_m}"
-            assert t_val == expected_t, f"Bot→Top misaligned: t_val={t_val} expected={expected_t}"
-
-            start_s, total_s, fraction = timing.tolist()
-            expected_start_s = (b_val * ds_bot.ratios['bottom'] * ds_bot.hop_length) / ds_bot.sample_rate
-            assert abs(start_s - expected_start_s) < 1e-3, f"Timing mismatch: {start_s} vs {expected_start_s}"
-
-            print(f"  [Pass] Bottom crop {i}: B={b_val}, M={m_val}, T={t_val} — all aligned ✓")
-
-        # ── Short song padding ─────────────────────────────────────────────────
-        short_file = os.path.join(tmp_dir, 'short_song_full_quantized.pt')
-        torch.save({
-            'top':    np.zeros((10, 8),  dtype=np.int64),
-            'middle': np.zeros((20, 16), dtype=np.int64),
-            'bottom': np.zeros((40, 32), dtype=np.int64),
-            'total_frames': 320,
-        }, short_file)
-
-        ds_short = JukeboxQuantizedDataset(
-            tmp_dir,
-            file_paths=[short_file.replace('_full_quantized.pt', '.npy')
-                        .replace(tmp_dir + '/', '')],  # simulate npy path
-            target_time_frames=2048,
-            level_target_time_frames=level_tfs,
-            selected_level='bottom',
-        )
-        # Re-init pointing directly at the pt file
-        ds_short.files = [short_file]
-        ds_short._init_grids()
-
-        target, cond, second_cond, timing = ds_short[0]
-        assert target.shape[0] == ds_short._bottom_window_cols, "Short bottom should be padded"
-        assert torch.all(target[40:] == 0), "Padded area should be zeros"
-        print("  [Pass] Short song padding verified ✓")
-
-        # ── DataLoader collation ───────────────────────────────────────────────
-        ds_dl = JukeboxQuantizedDataset(
-            tmp_dir, target_time_frames=2048,
-            level_target_time_frames=level_tfs, selected_level='bottom',
-        )
-        loader = DataLoader(ds_dl, batch_size=2, shuffle=False)
-        batch = next(iter(loader))
-        assert len(batch) == 4, f"Expected 4-tuple, got {len(batch)}"
-        print(f"  [Pass] DataLoader batch shapes: target={tuple(batch[0].shape)}, "
-              f"cond={tuple(batch[1].shape)}, second_cond={tuple(batch[2].shape)}, timing={tuple(batch[3].shape)}")
-
-    print("\nAll tests passed successfully!")
-
-
-if __name__ == '__main__':
-    test_dataset_alignment_and_logic()

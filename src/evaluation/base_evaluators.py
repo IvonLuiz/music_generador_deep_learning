@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from datasets.raw_audio_dataset import RawAudioWindowDataset, collate_audio_windows, list_audio_files
 from evaluation.audio import AudioExporter
 from evaluation.core import EvaluationOutputConfig, EvaluationResult, EvaluationRun
 from evaluation.visualization import SpectrogramPlotConfig, SpectrogramVisualizer
@@ -18,8 +19,10 @@ from generation.audio_inversion import (
     AudioGeometry,
     AudioInversionConfig,
 )
+from processing.gpu_audio_augmentation import GPUAudioToMelSpectrogram
 from processing.preprocess_audio import FRAME_SIZE, HOP_LENGTH, N_MELS, SAMPLE_RATE
-from utils import find_min_max_for_path
+from train_scripts.jukebox_utils import split_paths_by_maestro_metadata, split_train_val_paths
+from utils import find_min_max_for_path, list_npy_files
 
 
 @dataclass
@@ -187,6 +190,173 @@ class VQVAEEvaluator(BaseEvaluator):
     """!
     @brief Shared run flow for reconstruction evaluators.
     """
+
+    @staticmethod
+    def _crop_or_pad_spectrogram(spectrogram: np.ndarray, target_time_frames: int) -> np.ndarray:
+        """!
+        @brief Crop or right-pad one normalized spectrogram to the model time dimension.
+        @param spectrogram Input spectrogram with shape `(freq, time)` or `(freq, time, 1)`.
+        @param target_time_frames Required time-frame count.
+        @return Spectrogram shaped `(freq, target_time_frames)`.
+        """
+        if spectrogram.ndim == 3 and spectrogram.shape[-1] == 1:
+            spectrogram = spectrogram[..., 0]
+        if spectrogram.ndim != 2:
+            raise ValueError(f"Expected a 2D spectrogram, got shape {spectrogram.shape}.")
+        if spectrogram.shape[1] > target_time_frames:
+            return spectrogram[:, :target_time_frames]
+        if spectrogram.shape[1] < target_time_frames:
+            return np.pad(spectrogram, ((0, 0), (0, target_time_frames - spectrogram.shape[1])), mode="constant")
+        return spectrogram
+
+    def _sample_npy_specs(self, spectrograms_path: str, target_time_frames: int):
+        """!
+        @brief Lazily sample precomputed spectrogram files without loading the full dataset.
+        @param spectrograms_path Root folder containing normalized `.npy` spectrograms.
+        @param target_time_frames Required model time-frame count.
+        @return Tuple `(spectrogram_batch, selected_paths)`.
+        """
+        paths = list_npy_files(spectrograms_path)
+        count = min(int(self.config.n_samples), len(paths))
+        if count <= 0:
+            raise ValueError(f"No .npy spectrogram files found in {spectrograms_path}")
+        rng = np.random.default_rng(int(getattr(self.config, "seed", 42)))
+        selected_paths = [paths[i] for i in rng.choice(len(paths), count, replace=False)]
+        specs = [
+            self._crop_or_pad_spectrogram(np.load(path), target_time_frames)
+            for path in selected_paths
+        ]
+        return np.stack(specs, axis=0).astype(np.float32)[..., np.newaxis], selected_paths
+
+    @staticmethod
+    def _split_audio_paths(all_file_paths: list, dataset_cfg: dict, validation_split: float, seed: int) -> dict:
+        """!
+        @brief Split raw audio paths using MAESTRO metadata when available.
+        @param all_file_paths Raw audio paths.
+        @param dataset_cfg Dataset configuration.
+        @param validation_split Fallback validation split when metadata is unavailable.
+        @param seed Deterministic split seed.
+        @return Dictionary keyed by `train`, `validation`, `test`, and `all`.
+        """
+        metadata_path = dataset_cfg.get("metadata_path")
+        if metadata_path and os.path.isfile(os.path.expanduser(metadata_path)):
+            train_paths, val_paths, test_paths = split_paths_by_maestro_metadata(all_file_paths, dataset_cfg)
+        else:
+            train_paths, val_paths = split_train_val_paths(
+                all_file_paths,
+                dataset_cfg,
+                validation_split=validation_split,
+                seed=seed,
+            )
+            val_paths = val_paths or []
+            test_paths = []
+        return {
+            "train": train_paths,
+            "validation": val_paths,
+            "test": test_paths,
+            "all": sorted(all_file_paths),
+        }
+
+    def _sample_raw_audio_paths(self, run_config: dict) -> list:
+        """!
+        @brief Select raw audio files for runtime spectrogram extraction.
+        @param run_config Parsed VQ-VAE run config.
+        @return Selected raw audio paths.
+        """
+        dataset_cfg = run_config.get("dataset", {})
+        raw_path = dataset_cfg.get("raw_path")
+        if not raw_path:
+            raise ValueError("dataset.raw_path is required when dataset.input_mode='audio'.")
+
+        audio_cfg = dataset_cfg.get("audio", {})
+        all_paths = list_audio_files(raw_path, extensions=audio_cfg.get("extensions"))
+        if not all_paths:
+            raise FileNotFoundError(f"No raw audio files found in {raw_path}")
+
+        training_cfg = run_config.get("training", {})
+        split = str(getattr(self.config, "split", "validation") or "validation").strip().lower()
+        split = {"val": "validation", "valid": "validation"}.get(split, split)
+        split_paths = self._split_audio_paths(
+            all_paths,
+            dataset_cfg,
+            validation_split=float(training_cfg.get("validation_split", 0.0)),
+            seed=int(training_cfg.get("seed", getattr(self.config, "seed", 42))),
+        )
+        candidate_paths = split_paths.get(split)
+        if not candidate_paths:
+            fallback = "all" if split == "all" else "validation"
+            candidate_paths = split_paths.get(fallback) or split_paths["all"]
+            print(f"Warning: split={split!r} has no raw audio files. Sampling from {fallback!r} instead.")
+
+        count = min(int(self.config.n_samples), len(candidate_paths))
+        if count <= 0:
+            raise ValueError("No raw audio samples are available for VQ-VAE reconstruction.")
+        rng = np.random.default_rng(int(getattr(self.config, "seed", 42)))
+        return [candidate_paths[i] for i in rng.choice(len(candidate_paths), count, replace=False)]
+
+    def _sample_audio_specs(
+        self,
+        run_config: dict,
+        device: torch.device,
+        target_time_frames: Optional[int] = None,
+    ):
+        """!
+        @brief Build normalized spectrograms from raw audio at evaluation time.
+        @param run_config Parsed VQ-VAE run config.
+        @param device Torch device used for the runtime spectrogram pipeline.
+        @param target_time_frames Optional level-specific time-frame count.
+        @return Tuple `(specs, min_max_values, sampled_paths)`.
+        """
+        dataset_cfg = run_config.get("dataset", {})
+        audio_cfg = dataset_cfg.get("audio", {})
+        selected_paths = self._sample_raw_audio_paths(run_config)
+
+        target_frames = int(target_time_frames or dataset_cfg.get("target_time_frames", 256))
+        sample_rate = int(dataset_cfg.get("sample_rate", SAMPLE_RATE))
+        hop_length = int(dataset_cfg.get("hop_length", HOP_LENGTH))
+        frame_size = int(dataset_cfg.get("frame_size", FRAME_SIZE))
+        n_mels = int(dataset_cfg.get("n_mels", N_MELS))
+        target_num_samples = max(1, (target_frames - 1) * hop_length)
+
+        dataset = RawAudioWindowDataset(
+            selected_paths,
+            target_sample_rate=sample_rate,
+            target_num_samples=target_num_samples,
+            min_pitch_shift_semitones=0.0,
+            max_pitch_shift_semitones=0.0,
+            examples_per_file=1,
+            random_crop=False,
+            crop_strategy="center",
+        )
+        raw_batch = collate_audio_windows([dataset[i] for i in range(len(dataset))])
+        raw_batch = {
+            key: value.to(device) if torch.is_tensor(value) else value
+            for key, value in raw_batch.items()
+        }
+
+        downmix_cfg = audio_cfg.get("downmix", {})
+        preprocessor = GPUAudioToMelSpectrogram(
+            sample_rate=sample_rate,
+            target_time_frames=target_frames,
+            n_fft=frame_size,
+            hop_length=hop_length,
+            n_mels=n_mels,
+            random_downmix=bool(downmix_cfg.get("enabled", True)),
+            downmix_weight_min=0.5,
+            downmix_weight_max=0.5,
+            pitch_shift_enabled=False,
+            min_pitch_shift_semitones=0.0,
+            max_pitch_shift_semitones=0.0,
+            pitch_shift_choices=None,
+            resample_lowpass_filter_width=int(audio_cfg.get("resample_lowpass_filter_width", 64)),
+            resample_chunk_size=int(audio_cfg.get("resample_chunk_size", 8192)),
+            max_torchaudio_resample_factor=int(audio_cfg.get("max_torchaudio_resample_factor", 256)),
+        ).to(device)
+        preprocessor.eval()
+        with torch.no_grad():
+            specs, min_max_values = preprocessor(raw_batch, augment=False, return_min_max=True)
+        specs_np = specs.detach().cpu().permute(0, 2, 3, 1).numpy().astype(np.float32)
+        return specs_np, min_max_values, selected_paths
 
     @abstractmethod
     def _evaluate_reconstruction(self, device: torch.device) -> ReconstructionPayload:

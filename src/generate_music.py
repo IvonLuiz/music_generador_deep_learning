@@ -17,6 +17,7 @@ from train_scripts.jukebox_utils import load_jukebox_model
 from evaluation.transformer_prior import load_transformer_prior
 from generation.audio_inversion_cli import add_audio_inversion_args
 from generation.generation_config import GenerationConfig
+from generation.key_conditioning_cli import add_key_conditioning_args, resolve_key_conditioning
 from generation.transformer_io_utils import (
     resolve_min_max_values_path,
     resolve_vqvae_config_path,
@@ -125,6 +126,7 @@ def main():
     )
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible generation (set to negative to disable)')
     add_audio_inversion_args(parser, include_denormalization=True)
+    add_key_conditioning_args(parser)
     parser.add_argument(
         '--save_middle_audio',
         action='store_true',
@@ -133,6 +135,7 @@ def main():
     )
     parser.add_argument('--save_root', type=str, default='samples/generate_music_maestro', help='Root directory for generated outputs')
     args = parser.parse_args()
+    resolve_key_conditioning(args.key, args.key_id)
 
     generation_config = GenerationConfig.from_args(args)
     generation_config.apply_to_args(args)
@@ -173,6 +176,26 @@ def generate_hierarchical_music(args) -> str:
     top_prior, top_config, top_prior_model_path = load_transformer_prior('top', top_transformer_prior_config_path, device, weights_file=args.weights_file)
     middle_prior, middle_config, middle_prior_model_path = load_transformer_prior('middle', middle_transformer_prior_config_path, device, weights_file=args.weights_file)
     bottom_prior, bottom_config, bottom_prior_model_path = load_transformer_prior('bottom', bottom_transformer_prior_config_path, device, weights_file=args.weights_file)
+    key_config = resolve_key_conditioning(getattr(args, 'key', None), getattr(args, 'key_id', None))
+    key_ids = None
+    key_conditioning_metadata = None
+    key_enabled = {
+        'top': bool(getattr(top_prior, 'use_key_conditioning', False)),
+        'middle': bool(getattr(middle_prior, 'use_key_conditioning', False)),
+        'bottom': bool(getattr(bottom_prior, 'use_key_conditioning', False)),
+    }
+    if key_config is not None:
+        key_ids = torch.tensor([int(key_config.key_id)], dtype=torch.long, device=device)
+        key_conditioning_metadata = key_config.to_dict()
+        print(f'Key conditioning requested: {key_config.key_label} (id={key_config.key_id})')
+        print(
+            'Key conditioning support: '
+            f"top={'enabled' if key_enabled['top'] else 'disabled'}, "
+            f"middle={'enabled' if key_enabled['middle'] else 'disabled'}, "
+            f"bottom={'enabled' if key_enabled['bottom'] else 'disabled'}"
+        )
+        if not any(key_enabled.values()):
+            print('Warning: key conditioning was requested, but these Transformer priors do not use key embeddings.')
     print(
         'Timing conditioning: '
         f"top={'enabled' if top_prior.use_timing_conditioning else 'disabled'}, "
@@ -399,6 +422,7 @@ def generate_hierarchical_music(args) -> str:
         top_k=args.top_k,
         upper_tokens_list=None,
         timing_list=top_timing,
+        key_ids=key_ids,
         level_name='top',
         level_time_frames=top_tf,
         level_grid=top_grid,
@@ -438,6 +462,7 @@ def generate_hierarchical_music(args) -> str:
         top_k=args.top_k,
         upper_tokens_list=top_slices_for_middle,
         timing_list=mid_timing,
+        key_ids=key_ids,
         level_name='middle',
         level_time_frames=mid_tf,
         level_grid=middle_grid,
@@ -493,6 +518,7 @@ def generate_hierarchical_music(args) -> str:
         upper_tokens_list=middle_slices_for_bottom,
         second_upper_tokens_list=top_slices_for_bottom,
         timing_list=bot_timing,
+        key_ids=key_ids,
         level_name='bottom',
         level_time_frames=bot_tf,
         level_grid=bottom_grid,
@@ -525,6 +551,8 @@ def generate_hierarchical_music(args) -> str:
     timing_metadata = {
         'timing_source': timing_source,
         'timing_conditioning_enabled': dict(timing_enabled),
+        'key_conditioning': key_conditioning_metadata,
+        'key_conditioning_enabled': dict(key_enabled),
         'sampling_mode': args.sampling_mode,
         'windowed_prefix_levels': args.windowed_prefix_levels,
         'spectrogram_assembly': 'full_token_timeline' if args.bottom_decode_mode == 'timeline' else 'linear_crossfade',
@@ -607,6 +635,7 @@ def generate_hierarchical_music(args) -> str:
             'bottom_decode_mode': args.bottom_decode_mode,
             'bottom_decode_context_cols': int(bottom_decode_context_cols),
             'audio_inversion': audio_config.to_dict(),
+            'key_conditioning': key_conditioning_metadata,
             'seed': args.seed,
         },
         'resolved_audio_settings': {

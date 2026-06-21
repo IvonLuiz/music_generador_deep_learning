@@ -54,8 +54,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Test single-level VQ-VAE reconstruction")
     parser.add_argument("--config", type=str, default="./config/config_vqvae.yaml", help="Training config used to resolve defaults")
     parser.add_argument("--model_path", type=str, default=None, help="Path to VQ-VAE run dir, config.yaml, or checkpoint")
-    parser.add_argument("--weights_file", type=str, default=None, help="Checkpoint filename when --model_path is a directory")
+    parser.add_argument("--weights_file", type=str, default="best_model.pth", help="Checkpoint filename when --model_path is a directory")
     parser.add_argument("--spectrograms_path", type=str, default=None, help="Optional spectrogram dataset override")
+    parser.add_argument("--split", type=str, default="test", choices=["train", "validation", "val", "test", "all"], help="Raw-audio split to sample when the model uses dataset.input_mode=audio")
     parser.add_argument("--n_samples", type=int, default=5, help="Number of samples to reconstruct")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sample selection")
     parser.add_argument("--save_root", type=str, default="samples/vqvae_reconstruction", help="Root folder for generated artifacts")
@@ -78,6 +79,7 @@ def main() -> None:
         min_db=args.fixed_min_db,
         max_db=args.fixed_max_db,
         min_max_values_path=args.min_max_values_path,
+        split=args.split,
         save_root=args.save_root,
     )
     result = SingleVQVAEReconstructionEvaluator(eval_config, _audio_config_from_args(args)).run()

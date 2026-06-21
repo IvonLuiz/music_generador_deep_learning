@@ -1,5 +1,9 @@
 import math
+import os
+import tempfile
 from typing import Optional, Sequence
+
+os.environ.setdefault("NUMBA_CACHE_DIR", os.path.join(tempfile.gettempdir(), "numba_cache"))
 
 import librosa
 import numpy as np

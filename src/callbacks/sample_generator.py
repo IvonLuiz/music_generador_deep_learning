@@ -97,14 +97,14 @@ class SampleGenerator:
             fig, axes = plt.subplots(1, 3, figsize=(18, 6))
             
             # Original
-            im1 = axes[0].imshow(orig_2d, origin='lower', aspect='auto', cmap='viridis', vmin=0, vmax=1)
+            im1 = axes[0].imshow(orig_2d, origin='lower', aspect='auto', cmap='magma', vmin=0, vmax=1)
             axes[0].set_title(f'Original Spectrogram\n(Sample {i+1})')
             axes[0].set_xlabel('Time Frames')
             axes[0].set_ylabel('Frequency Bins')
             plt.colorbar(im1, ax=axes[0], label='Normalized Magnitude')
             
             # Recon
-            im2 = axes[1].imshow(recon_2d, origin='lower', aspect='auto', cmap='viridis', vmin=0, vmax=1)
+            im2 = axes[1].imshow(recon_2d, origin='lower', aspect='auto', cmap='magma', vmin=0, vmax=1)
             axes[1].set_title(f'VQ-VAE Reconstructed\n(Sample {i+1})')
             axes[1].set_xlabel('Time Frames')
             axes[1].set_ylabel('Frequency Bins')

@@ -175,7 +175,7 @@ class SpectrogramVisualizer:
             spectrogram, 
             aspect='auto', 
             origin='lower',
-            cmap='viridis',
+            cmap='magma',
             interpolation='nearest'
         )
         plt.colorbar(label='Magnitude (dB)')
@@ -207,14 +207,14 @@ class SpectrogramVisualizer:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
         
         # Original spectrogram
-        im1 = ax1.imshow(original_spec, aspect='auto', origin='lower', cmap='viridis')
+        im1 = ax1.imshow(original_spec, aspect='auto', origin='lower', cmap='magma')
         ax1.set_title(f'Original Log Spectrogram\n{file_name}')
         ax1.set_xlabel('Time Frames')
         ax1.set_ylabel('Frequency Bins')
         plt.colorbar(im1, ax=ax1, label='Magnitude (dB)')
         
         # Normalized spectrogram
-        im2 = ax2.imshow(normalized_spec, aspect='auto', origin='lower', cmap='viridis', vmin=0, vmax=1)
+        im2 = ax2.imshow(normalized_spec, aspect='auto', origin='lower', cmap='magma', vmin=0, vmax=1)
         ax2.set_title(f'Normalized Spectrogram [0,1]\n{file_name}')
         ax2.set_xlabel('Time Frames')
         ax2.set_ylabel('Frequency Bins')

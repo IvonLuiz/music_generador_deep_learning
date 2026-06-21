@@ -35,8 +35,8 @@ def main() -> None:
     @brief CLI entry point for single-level PixelCNN sampling evaluation.
     """
     parser = argparse.ArgumentParser(description="Test PixelCNN model")
-    parser.add_argument("--vqvae_path", type=str, default="models/vq_vae/2025-11-24_00-17-34", help="Path to VQ-VAE model")
-    parser.add_argument("--pixelcnn_path", type=str, default="models/pixelcnn_maestro2011/2025-11-30_17-57-20", help="Path to PixelCNN model")
+    parser.add_argument("--vqvae_path", type=str, help="Path to VQ-VAE model")
+    parser.add_argument("--pixelcnn_path", type=str, help="Path to PixelCNN model")
     parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to generate")
     parser.add_argument("--n_samples", type=int, default=None, help="Alias for --num_samples")
     parser.add_argument("--min_db", type=float, default=DEFAULT_FIXED_MIN_DB, help="Minimum dB value")

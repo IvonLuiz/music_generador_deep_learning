@@ -40,6 +40,8 @@ class TransformerPriorSamplingEvaluator(PriorEvaluator):
             weights_file=self.config.weights_file,
             full_length=bool(self.config.full_length),
             full_length_overlap_fraction=float(self.config.full_length_overlap_fraction),
+            key_id=self.config.key_id,
+            key_label=self.config.key_label,
             seed=self.config.seed,
             timing_duration_seconds=float(self.config.timing_duration_seconds),
             min_max_values_path=self.audio_config.min_max_values_path,

@@ -10,7 +10,7 @@ from tqdm import tqdm
 from evaluation.base_evaluators import GenerationPayload, PriorEvaluator
 from evaluation.model_loading import ModelLoader
 from generation.audio_inversion import DEFAULT_FIXED_MAX_DB, DEFAULT_FIXED_MIN_DB
-from processing.preprocess_audio import TARGET_TIME_FRAMES
+from processing.preprocess_audio import N_MELS, TARGET_TIME_FRAMES
 from utils import load_config
 
 
@@ -83,14 +83,17 @@ class SinglePixelCNNSamplingEvaluator(PriorEvaluator):
     def _produce_generation(self, device: torch.device) -> GenerationPayload:
         vqvae = ModelLoader.load_single_vqvae(self.config.vqvae_path, device)
         pixelcnn = ModelLoader.load_single_pixelcnn(self.config.pixelcnn_path, device, int(vqvae.vq.num_embeddings))
-        dummy = torch.zeros((1, 1, 256, TARGET_TIME_FRAMES), device=device)
+        run_config = load_config(self._config_path_for(self.config.vqvae_path))
+        dataset_cfg = run_config.get("dataset", {})
+        n_mels = int(dataset_cfg.get("n_mels", N_MELS))
+        target_frames = int(dataset_cfg.get("target_time_frames", TARGET_TIME_FRAMES))
+        dummy = torch.zeros((1, 1, n_mels, target_frames), device=device)
 
         with torch.no_grad():
             latent_shape = tuple(vqvae.encoder(dummy).shape[2:])
         indices = self.generate_samples(pixelcnn, int(self.config.n_samples), latent_shape, device)
 
         specs = self.decode_indices(indices, vqvae)
-        run_config = load_config(self._config_path_for(self.config.vqvae_path))
 
         return GenerationPayload(
             run_config=run_config,
@@ -125,13 +128,22 @@ class HierarchicalPixelCNNSamplingEvaluator(PriorEvaluator):
     def _produce_generation(self, device: torch.device) -> GenerationPayload:
         vqvae = ModelLoader.load_hierarchical_vqvae(self.config.vqvae_path, device)
         pixelcnn, _ = ModelLoader.load_hierarchical_pixelcnn_model(self.config.pixelcnn_path, device)
-        dummy = torch.zeros((1, 1, TARGET_TIME_FRAMES, TARGET_TIME_FRAMES), device=device)
+        run_config = load_config(self._config_path_for(self.config.vqvae_path))
+        dataset_cfg = run_config.get("dataset", {})
+        n_mels = int(dataset_cfg.get("n_mels", N_MELS))
+        target_frames = int(dataset_cfg.get("target_time_frames", TARGET_TIME_FRAMES))
+        dummy = torch.zeros((1, 1, n_mels, target_frames), device=device)
 
         with torch.no_grad():
             enc_bottom = vqvae.encoder_bottom(dummy)
             enc_top = vqvae.encoder_top(enc_bottom)
             top_shape = tuple(vqvae.pre_vq_conv_top(enc_top).shape[2:])
             bottom_shape = tuple(vqvae.pre_vq_conv_bottom(enc_bottom).shape[2:])
+            print(
+                "Sampling hierarchical PixelCNN tokens: "
+                f"top_shape={top_shape}, bottom_shape={bottom_shape}, n_samples={self.config.n_samples}",
+                flush=True,
+            )
             top_indices = pixelcnn.generate(shape=(self.config.n_samples, 1, top_shape[0], top_shape[1]), level="top").squeeze(1)
             bottom_indices = pixelcnn.generate(
                 shape=(self.config.n_samples, 1, bottom_shape[0], bottom_shape[1]),
@@ -140,7 +152,6 @@ class HierarchicalPixelCNNSamplingEvaluator(PriorEvaluator):
             ).squeeze(1)
 
         specs = self.decode_hierarchical(top_indices, bottom_indices, vqvae)
-        run_config = load_config(self._config_path_for(self.config.vqvae_path))
 
         return GenerationPayload(
             run_config=run_config,
